@@ -1,0 +1,13 @@
+[package]
+name = "kaonic-pki"
+version = "0.1.0"
+description = "Admin-issued X.509 certificates bound to Kaonic Reticulum identities"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+sha2.workspace = true
+x509-cert.workspace = true
