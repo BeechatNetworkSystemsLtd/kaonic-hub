@@ -1,0 +1,12 @@
+[package]
+name = "kaonic-trust"
+version = "0.1.0"
+description = "Kaonic peer trust: admin-signed allowlist and peer verification"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+kaonic-pki = { path = "../kaonic-pki" }
