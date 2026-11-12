@@ -1,0 +1,10 @@
+[package]
+name = "kaonic-wifi"
+version = "0.1.0"
+description = "Wi-Fi client management for kaonic-hub: auto-connect policy and the wpa_supplicant/hostapd control protocol."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
