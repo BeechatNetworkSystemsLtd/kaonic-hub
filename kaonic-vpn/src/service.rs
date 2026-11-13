@@ -581,17 +581,28 @@ impl Vpn {
                                 }
                             }
                         };
-                        if accepted.is_some() && let Err(error) = self.tun.write(frame.payload).await {
-                            self.packet_error(format!("writing {}: {error}", self.config.interface));
-                        }
                         // Also to client networks if a rule says so. Never to another peer.
-                        if accepted == Some(true) {
+                        let emitted_broadcast = accepted == Some(true) && {
                             let mut forward = self.forward.lock().expect("vpn forward lock");
-                            if let Some(emit) = forward.from_mesh(frame.payload, Instant::now())
-                                && let Err(mpsc::error::TrySendError::Full(emit) | mpsc::error::TrySendError::Closed(emit)) = self.emits.try_send(emit)
-                            {
-                                forward.emit_failed(&emit.rule);
+                            match forward.from_mesh(frame.payload, Instant::now()) {
+                                Some(emit) => {
+                                    let broadcast = emit.address.is_broadcast();
+                                    match self.emits.try_send(emit) {
+                                        Ok(()) => broadcast,
+                                        Err(mpsc::error::TrySendError::Full(emit) | mpsc::error::TrySendError::Closed(emit)) => {
+                                            forward.emit_failed(&emit.rule);
+                                            false
+                                        }
+                                    }
+                                }
+                                None => false,
                             }
+                        };
+                        // The kernel hands a broadcast sent on a LAN to this node's own sockets
+                        // too (unlike multicast, which is sent with loopback off), so a broadcast
+                        // re-sent on a client network skips the tunnel: local apps would get it twice.
+                        if accepted.is_some() && !emitted_broadcast && let Err(error) = self.tun.write(frame.payload).await {
+                            self.packet_error(format!("writing {}: {error}", self.config.interface));
                         }
                     }
                     (Kind::Control, STREAM_CONTROL) if frame.payload.starts_with(b"KVG1") => {
