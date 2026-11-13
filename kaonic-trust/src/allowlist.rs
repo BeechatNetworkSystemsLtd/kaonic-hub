@@ -103,6 +103,12 @@ impl Allowlist {
         (len <= bytes.len()).then_some(len)
     }
 
+    /// The `seq` in the header at the start of `bytes`. Says nothing about the signature.
+    pub fn seq_of(bytes: &[u8]) -> Option<u64> {
+        let header = bytes.get(..HEADER_LEN)?;
+        (&header[..4] == MAGIC).then(|| u64::from_be_bytes(header[5..13].try_into().unwrap()))
+    }
+
     /// Parse a list and check that `admin_key` signed it.
     pub fn from_bytes(bytes: &[u8], admin_key: &[u8; 32]) -> Result<Self> {
         let (body, signature) = bytes
