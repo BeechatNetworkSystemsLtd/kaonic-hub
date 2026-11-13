@@ -1,0 +1,37 @@
+[package]
+name = "kaonic-mesh"
+version = "0.1.0"
+description = "kaonic-hub's mesh: Reticulum over the Kaonic radios (kernel driver), announces and the peer table."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# kaonic-frame is a local checkout for now; pinned by git rev before the first release.
+reticulum = { workspace = true }
+kaonic-frame = { path = "../../kaonic-radio-ks/kaonic-frame" }
+kaonic-handshake = { path = "../kaonic-handshake" }
+kaonic-mux = { path = "../kaonic-mux" }
+kaonic-trust = { path = "../kaonic-trust" }
+libc = { workspace = true }
+log = { workspace = true }
+# kaonic-net pins rand =0.8.5 for its LDPC padding; the same one here.
+rand = { version = "=0.8.5", default-features = false, features = ["std", "std_rng", "getrandom"] }
+tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
+# The emulated radio channel, for meshes of several nodes in one test.
+kaonic-air = { path = "../kaonic-air" }
+# Certificates and keys for the secure-link tests.
+ed25519-dalek = { workspace = true }
+kaonic-pki = { path = "../kaonic-pki" }
+x25519-dalek = { workspace = true }
+
+# The board's CRC goes through the kernel's crypto API (AF_ALG); elsewhere the same CRC in software.
+[target.'cfg(target_os = "linux")'.dependencies]
+kaonic-net = { path = "../../kaonic-radio-ks/kaonic-net" }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+kaonic-net = { path = "../../kaonic-radio-ks/kaonic-net", default-features = false, features = ["machine-host"] }
