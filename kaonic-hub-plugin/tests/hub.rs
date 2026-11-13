@@ -129,6 +129,7 @@ async fn bench_without_sockets(name: &str, plugins: &[(&str, &str)]) -> Bench {
         vpn_error: Default::default(),
         vpn_config: None,
         plugins: Default::default(),
+        commd: None,
     });
     Bench { installer, app }
 }

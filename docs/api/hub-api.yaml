@@ -877,6 +877,39 @@ paths:
         '422': { $ref: '#/components/responses/Validation' }
         '502': { $ref: '#/components/responses/Upstream' }
         '503': { $ref: '#/components/responses/Unavailable' }
+  /radio/bands/{band}/filter:
+    put:
+      tags: [radio]
+      operationId: putRadioBandFilter
+      summary: Choose a band's sub-GHz filter.
+      description: >-
+        `auto` (the narrowest of the board's filters that passes the channel centre, else the wide
+        one) or a filter's `index` in the band's `filters`. Any filter the board has may be chosen,
+        whatever the frequency. Saved per band and handed to kaonic-commd, which drives the front
+        end; applied again at every start and after every change of the band. While commd cannot
+        be reached the choice is saved and `filter_state` is `unavailable`. A saved index the
+        board does not have is applied as auto. Not part of a `scope=network` change: the filter
+        belongs to each node's board.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/Band'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [filter]
+              properties:
+                filter: { $ref: '#/components/schemas/FilterChoice' }
+      responses:
+        '200':
+          description: Saved and, when commd answers, applied.
+          content: { application/json: { schema: { $ref: '#/components/schemas/RadioBand' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
   /radio/bands/{band}/test:
     post:
       tags: [radio]
@@ -3230,6 +3263,30 @@ components:
                 at_ts_ms: { $ref: '#/components/schemas/TimestampMs' }
                 switched: { type: boolean, description: Switched and waiting (up to 60 s) to hear a node; it goes back if none is heard. }
                 config: { $ref: '#/components/schemas/RadioConfig' }
+        min_mhz: { type: [number, 'null'], example: 863, description: 'The range this board''s front end is built for on this band, from kaonic-commd (for display: a frequency outside is still applied). Null when commd cannot be asked.' }
+        max_mhz: { type: [number, 'null'], example: 928 }
+        filter: { $ref: '#/components/schemas/FilterChoice' }
+        filters:
+          type: array
+          description: 'The board''s sub-GHz filters for this band, in a fixed order (a filter is known by its index). Empty on the 2.4 GHz bands and when commd cannot be asked.'
+          items: { $ref: '#/components/schemas/RadioFilter' }
+        active_filter: { type: [integer, 'null'], description: The index of the filter in use now. }
+        filter_state:
+          type: string
+          enum: [ok, unavailable, none]
+          description: '`unavailable`: commd cannot be asked (the choice is kept). `none`: the band has no filter to choose.'
+    RadioFilter:
+      type: object
+      required: [index, label, min_mhz, max_mhz]
+      properties:
+        index: { type: integer, minimum: 0, maximum: 255 }
+        label: { type: string, example: 868 MHz }
+        min_mhz: { type: number, example: 862, description: The passband. }
+        max_mhz: { type: number, example: 876 }
+    FilterChoice:
+      oneOf:
+        - { type: string, enum: [auto] }
+        - { type: integer, minimum: 0, maximum: 255, description: A filter's index in the band's filters. }
     RadioConfig:
       type: object
       additionalProperties: false
@@ -3261,6 +3318,7 @@ components:
             agc_map: { type: integer, minimum: 0, maximum: 2 }
             agc_target: { type: integer, minimum: 0, maximum: 7 }
             lna_bypass: { type: boolean }
+        filter: { $ref: '#/components/schemas/FilterChoice', description: 'Input only, as PUT /radio/bands/{band}/filter. Left out: unchanged. Refused with scope=network.' }
     Modulation:
       oneOf:
         - $ref: '#/components/schemas/ModulationOff'

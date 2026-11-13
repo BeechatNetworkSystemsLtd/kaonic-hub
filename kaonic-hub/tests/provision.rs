@@ -62,6 +62,7 @@ fn app(name: &str) -> (App, std::path::PathBuf) {
         vpn_error: Default::default(),
         vpn_config: None,
         plugins: Default::default(),
+        commd: None,
     });
     (app, dir)
 }

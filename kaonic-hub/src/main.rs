@@ -45,6 +45,9 @@ struct Args {
     vpn: Option<kaonic_vpn::VpnConfig>,
     /// The plugin installer's socket and the plugin API's sockets.
     plugins: kaonic_hub::plugins::Settings,
+    /// kaonic-commd's control port; by default on this device, none in `--dev`.
+    commd: Option<SocketAddr>,
+    no_commd: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -63,6 +66,8 @@ fn args() -> Result<Args, String> {
         no_wifi: false,
         vpn: None,
         plugins: Default::default(),
+        commd: None,
+        no_commd: false,
     };
     // On by default: a provisioned node shares the mesh with its clients.
     let mut vpn_on = true;
@@ -92,6 +97,8 @@ fn args() -> Result<Args, String> {
             "--radio" => args.radio = value()?,
             "--setup-interface" => args.setup_interfaces.push(value()?),
             "--no-wifi" => args.no_wifi = true,
+            "--commd" => args.commd = Some(value()?.parse().map_err(|_| "--commd: not an address")?),
+            "--no-commd" => args.no_commd = true,
             "--installer-socket" => args.plugins.installer = value()?.into(),
             "--plugin-api-dir" => args.plugins.api_dir = value()?.into(),
             // Log the A/B boot commands instead of running them (always so off Linux).
@@ -134,6 +141,14 @@ fn args() -> Result<Args, String> {
     vpn.limits.protected_udp = vec![args.ptt_udp_port];
     args.vpn = vpn_on.then_some(vpn);
     Ok(args)
+}
+
+/// Where kaonic-commd listens: `--commd`, else this device's own unless `--dev` or `--no-commd`.
+fn commd_addr(args: &Args, dev: bool) -> Option<SocketAddr> {
+    if args.no_commd {
+        return None;
+    }
+    args.commd.or_else(|| (!dev).then(|| kaonic_mesh::commd::DEFAULT_ADDR.parse().expect("valid address")))
 }
 
 /// Logs to stderr, which journald keeps. `KAONIC_HUB_LOG=debug` for more.
@@ -297,6 +312,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         vpn_error: Default::default(),
         vpn_config: args.vpn.clone(),
         plugins: Default::default(),
+        commd: commd_addr(&args, dev).map(|addr| std::sync::Arc::new(kaonic_mesh::commd::Commd::new(addr))),
     });
     let app = match (dev, node_identity) {
         (false, Some(identity)) => start_mesh(app, identity, &args).await,

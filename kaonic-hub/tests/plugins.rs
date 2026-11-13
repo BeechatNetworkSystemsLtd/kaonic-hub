@@ -150,6 +150,7 @@ fn hub(bench: &Bench) -> Hub {
         vpn_error: Default::default(),
         vpn_config: None,
         plugins: Default::default(),
+        commd: None,
     });
     Hub { router: kaonic_hub::router(app.clone()), app, cookie: None, csrf: None }
 }

@@ -6,6 +6,9 @@
 //! change it on every node at once (`?scope=network`): the new configuration goes to every
 //! authenticated node over its link (mux control stream 4, `KRC1`), all switch at the same
 //! moment, and a node that hears nobody within a minute of switching goes back.
+//!
+//! The sub-GHz filter is set through commd. The hub saves the choice per band (`auto` or a
+//! filter index) and gives it to commd at start and after each band change.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -96,8 +99,8 @@ fn ip_link(interface: &str, up: bool) -> std::io::Result<()> {
     if status.success() { Ok(()) } else { Err(std::io::Error::other(format!("ip link set {interface} failed"))) }
 }
 
-/// Validates, applies to the driver (unless emulated), saves, and tells the mesh.
-async fn apply(app: &App, band: &'static Band, config: BandConfig) -> ApiResult<()> {
+/// Validates, applies, saves and tells the mesh and commd.
+async fn apply(app: &App, band: &'static Band, config: BandConfig, filter: Option<FilterChoice>) -> ApiResult<()> {
     let problems = config.validate(ranges(band));
     if !problems.is_empty() {
         return Err(ApiError::invalid(problems));
@@ -128,9 +131,13 @@ async fn apply(app: &App, band: &'static Band, config: BandConfig) -> ApiResult<
     let key = store_key(band);
     let text = config.encode();
     app.store.call(move |c| kaonic_store::settings::set(c, &key, &text)).await?;
+    if let Some(filter) = filter {
+        store_filter(app, band, filter).await?;
+    }
     if is_mesh && let Some(mesh) = &app.mesh {
         mesh.set_radio_settings(config.to_settings());
     }
+    push_filter(app, band).await;
     Ok(())
 }
 
@@ -145,6 +152,7 @@ pub async fn restore_mesh_band(app: &App, interface: &str) -> Option<kaonic_mesh
             return None;
         }
     }
+    push_filter(app, band).await;
     config.to_settings()
 }
 
@@ -155,9 +163,185 @@ pub async fn restore_other_bands(app: &App) {
             continue;
         }
         if let Some(config) = stored(app, band).await
-            && let Err(error) = apply(app, band, config).await
+            && let Err(error) = apply(app, band, config, None).await
         {
             log::warn!("radio {}: saved settings not applied: {}", band.interface, error.message);
+        }
+    }
+}
+
+/* ── the sub-GHz filter and the board's ranges (kaonic-commd) ── */
+
+/// How often a fixed filter choice is re-checked with commd (after a commd restart).
+const FILTER_RECONCILE_SECS: u64 = 60;
+
+/// `auto` or a filter index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterChoice {
+    Auto,
+    Index(u8),
+}
+
+impl FilterChoice {
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "auto" => Some(Self::Auto),
+            index => index.parse().ok().map(Self::Index),
+        }
+    }
+
+    fn text(self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::Index(index) => index.to_string(),
+        }
+    }
+
+    fn index(self) -> Option<u8> {
+        match self {
+            Self::Auto => None,
+            Self::Index(index) => Some(index),
+        }
+    }
+
+    fn json(self) -> Value {
+        match self {
+            Self::Auto => json!("auto"),
+            Self::Index(index) => json!(index),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FilterChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::String(text) if text == "auto" => Ok(Self::Auto),
+            Value::Number(number) => number.as_u64().and_then(|index| u8::try_from(index).ok()).map(Self::Index).ok_or_else(|| serde::de::Error::custom("use auto or a filter number")),
+            _ => Err(serde::de::Error::custom("use auto or a filter number")),
+        }
+    }
+}
+
+fn filter_key(band: &Band) -> String {
+    format!("radio.filter.{}", band.interface)
+}
+
+/// The saved filter choice (auto if none).
+async fn stored_filter(app: &App, band: &Band) -> FilterChoice {
+    let key = filter_key(band);
+    let text = app.store.call(move |c| kaonic_store::settings::get(c, &key)).await.ok().flatten();
+    text.as_deref().and_then(FilterChoice::parse).unwrap_or(FilterChoice::Auto)
+}
+
+async fn store_filter(app: &App, band: &Band, choice: FilterChoice) -> ApiResult<()> {
+    let key = filter_key(band);
+    let text = choice.text();
+    app.store.call(move |c| kaonic_store::settings::set(c, &key, &text)).await?;
+    Ok(())
+}
+
+/// An index the board does not have is auto.
+fn effective(choice: FilterChoice, filters: &kaonic_mesh::commd::Filters) -> FilterChoice {
+    match choice {
+        FilterChoice::Index(index) if usize::from(index) >= filters.filters.len() => FilterChoice::Auto,
+        choice => choice,
+    }
+}
+
+/// Gives the saved choice to commd.
+async fn push_filter(app: &App, band: &Band) {
+    let Some(commd) = app.commd.as_ref().filter(|_| band.sub_ghz) else { return };
+    let module = usize::from(band.module);
+    let choice = stored_filter(app, band).await;
+    match commd.set_filter(module, choice.index()).await {
+        Ok(()) => log::debug!("radio {}: filter {}", band.interface, choice.text()),
+        Err(kaonic_mesh::commd::Error::Unreachable) => log::debug!("radio {}: commd not reachable, filter {} kept", band.interface, choice.text()),
+        Err(kaonic_mesh::commd::Error::Refused) if choice != FilterChoice::Auto => {
+            log::warn!("radio {}: this board has no filter {}, using auto", band.interface, choice.text());
+            let _ = commd.set_filter(module, None).await;
+        }
+        Err(error) => log::warn!("radio {}: commd refused filter {}: {error:?}", band.interface, choice.text()),
+    }
+}
+
+fn mhz(khz: u32) -> f64 {
+    f64::from(khz) / 1000.0
+}
+
+/// The band's filters, choice, active filter and range, from commd.
+async fn filter_view(app: &App, band: &Band) -> Value {
+    let choice = stored_filter(app, band).await;
+    let none = |state: &str, range: Option<(u32, u32)>| {
+        json!({
+            "filter": choice.json(),
+            "filters": [],
+            "active_filter": null,
+            "filter_state": state,
+            "min_mhz": range.map(|range| mhz(range.0)),
+            "max_mhz": range.map(|range| mhz(range.1)),
+        })
+    };
+    let Some(commd) = &app.commd else { return none("unavailable", None) };
+    let module = usize::from(band.module);
+    let mut filters = match commd.filters(module).await {
+        Ok(filters) => filters,
+        Err(kaonic_mesh::commd::Error::Refused) => return none("none", None),
+        Err(_) => return none("unavailable", None),
+    };
+    let range = if band.sub_ghz { filters.sub_ghz } else { filters.band_24 };
+    if !band.sub_ghz || filters.filters.is_empty() {
+        return none("none", range);
+    }
+    let choice = effective(choice, &filters);
+    if filters.selected != choice.index() {
+        push_filter(app, band).await;
+        if let Ok(again) = commd.filters(module).await {
+            filters = again;
+        }
+    }
+    json!({
+        "filter": choice.json(),
+        "filters": filters.filters.iter().enumerate().map(|(index, filter)| json!({
+            "index": index,
+            "label": filter.label,
+            "min_mhz": mhz(filter.min_khz),
+            "max_mhz": mhz(filter.max_khz),
+        })).collect::<Vec<_>>(),
+        "active_filter": filters.active,
+        "filter_state": "ok",
+        "min_mhz": range.map(|range| mhz(range.0)),
+        "max_mhz": range.map(|range| mhz(range.1)),
+    })
+}
+
+/// Whether the board has this filter. Without commd, any index is kept.
+async fn check_filter(app: &App, band: &Band, choice: FilterChoice) -> ApiResult<()> {
+    let FilterChoice::Index(index) = choice else { return Ok(()) };
+    if !band.sub_ghz {
+        return Err(ApiError::field("filter", "This band has no filter to choose; use auto."));
+    }
+    let Some(commd) = &app.commd else { return Ok(()) };
+    let Ok(filters) = commd.filters(usize::from(band.module)).await else { return Ok(()) };
+    let count = filters.filters.len();
+    if usize::from(index) >= count {
+        let known = if count == 0 { "This radio has no filters to choose; use auto.".to_owned() } else { format!("This radio has filters 0 to {}, or auto.", count - 1) };
+        return Err(ApiError::field("filter", known));
+    }
+    Ok(())
+}
+
+/// Gives commd back a fixed choice it lost on restart.
+pub(crate) async fn reconcile_filters(app: &App) {
+    let Some(commd) = &app.commd else { return };
+    for band in BANDS.iter().filter(|band| band.sub_ghz) {
+        let choice = stored_filter(app, band).await;
+        if choice == FilterChoice::Auto {
+            continue;
+        }
+        if let Ok(filters) = commd.filters(usize::from(band.module)).await
+            && filters.selected != effective(choice, &filters).index()
+        {
+            push_filter(app, band).await;
         }
     }
 }
@@ -234,7 +418,7 @@ async fn band_view(app: &App, band: &'static Band) -> Value {
     let pending = PENDING.lock().expect("radio pending lock").as_ref().filter(|pending| std::ptr::eq(pending.band, band)).map(|pending| {
         json!({ "at_ts_ms": pending.at_ts_ms, "switched": pending.switched_unix.is_some(), "config": config_view(&pending.switch.next) })
     });
-    json!({
+    let mut view = json!({
         "id": band.id,
         "module": band.module,
         "range": if band.sub_ghz { "sub_ghz" } else { "2g4" },
@@ -248,7 +432,11 @@ async fn band_view(app: &App, band: &'static Band) -> Value {
         "last_rssi": if is_mesh { app.mesh.as_ref().and_then(|mesh| mesh.counters().last_rssi) } else { None },
         "capabilities": ["fcs", "cca", "frontend", "fsk", "qpsk", "off"],
         "pending_switch": pending,
-    })
+    });
+    if let (Value::Object(view), Value::Object(filter)) = (&mut view, filter_view(app, band).await) {
+        view.extend(filter);
+    }
+    view
 }
 
 /// `GET /radio/bands`
@@ -311,6 +499,8 @@ pub struct ConfigInput {
     fcs: Option<bool>,
     cca: Option<CcaInput>,
     frontend: Option<FrontendInput>,
+    /// `auto` or a filter's index; left out: unchanged.
+    filter: Option<FilterChoice>,
 }
 
 fn index_of<T: PartialEq + Copy>(table: &[T], value: Option<T>, current: u8, field: &'static str) -> ApiResult<u8> {
@@ -382,10 +572,14 @@ struct SwitchView {
 pub async fn put(State(app): State<App>, Admin(_): Admin, Path(id): Path<String>, Query(query): Query<ScopeQuery>, Json(input): Json<ConfigInput>) -> ApiResult<Response> {
     let band = band(&id)?;
     let now = current(&app, band).await;
+    let filter = input.filter;
     let config = merge(input, &now)?;
     match query.scope.as_deref() {
-        None | Some("node") => Ok(no_store(axum::Json(apply_here(&app, band, now, config).await?))),
+        None | Some("node") => Ok(no_store(axum::Json(apply_here(&app, band, now, config, filter).await?))),
         Some("network") => {
+            if filter.is_some() {
+                return Err(ApiError::field("filter", "The filter belongs to each node's board; set it per node."));
+            }
             if !mesh_band(&app).is_some_and(|mesh| std::ptr::eq(mesh, band)) {
                 return Err(ApiError::field("scope", "Only the mesh band is changed on every node; set other bands per node."));
             }
@@ -422,12 +616,15 @@ pub async fn put(State(app): State<App>, Admin(_): Admin, Path(id): Path<String>
 }
 
 /// Applies a configuration on this node only and returns the band as the API shows it.
-async fn apply_here(app: &App, band: &'static Band, now: BandConfig, config: BandConfig) -> ApiResult<Value> {
+async fn apply_here(app: &App, band: &'static Band, now: BandConfig, config: BandConfig, filter: Option<FilterChoice>) -> ApiResult<Value> {
+    if let Some(choice) = filter {
+        check_filter(app, band, choice).await?;
+    }
     // Moving only this node off the mesh band cuts it off from nodes it could hear: like a
     // network switch, it goes back if no node is heard on the new band within a minute.
     let is_mesh = mesh_band(app).is_some_and(|mesh| std::ptr::eq(mesh, band));
     let had_peers = app.mesh.as_ref().is_some_and(|mesh| mesh.peers().iter().any(|peer| mesh.is_online(peer)));
-    apply(app, band, config).await?;
+    apply(app, band, config, filter).await?;
     if is_mesh && had_peers && config != now {
         let switch = Switch::applied(now, config, Instant::now());
         *PENDING.lock().expect("radio pending lock") = Some(Pending { band, switch, at_ts_ms: crate::clock::now_ms(), switched_unix: Some(crate::clock::now()) });
@@ -441,8 +638,24 @@ pub(crate) async fn apply_remote(app: &App, band_id: &str, input: serde_json::Va
     let band = band(band_id)?;
     let input: ConfigInput = serde_json::from_value(input).map_err(|error| ApiError::bad_request(format!("The radio settings are not valid: {error}.")))?;
     let now = current(app, band).await;
+    let filter = input.filter;
     let config = merge(input, &now)?;
-    apply_here(app, band, now, config).await
+    apply_here(app, band, now, config, filter).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilterInput {
+    filter: FilterChoice,
+}
+
+/// `PUT /radio/bands/{band}/filter`
+pub async fn put_filter(State(app): State<App>, Admin(_): Admin, Path(id): Path<String>, Json(input): Json<FilterInput>) -> ApiResult<Response> {
+    let band = band(&id)?;
+    check_filter(&app, band, input.filter).await?;
+    store_filter(&app, band, input.filter).await?;
+    push_filter(&app, band).await;
+    Ok(no_store(axum::Json(band_view(&app, band).await)))
 }
 
 /// Every band as the API shows it (for the admin's view of a remote node).
@@ -461,11 +674,12 @@ fn schedule(band: &'static Band, previous: BandConfig, next: BandConfig) -> i64 
     at_ts_ms
 }
 
-/// Network-wide changes arriving from the admin, and the pending change's clock.
+/// Network-wide changes arriving from the admin, the pending change's clock, and the filter check.
 pub fn spawn(app: App) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut received = app.links.get().map(|links| links.subscribe());
+        let mut ticks: u64 = 0;
         loop {
             tokio::select! {
                 message = async {
@@ -483,6 +697,10 @@ pub fn spawn(app: App) {
                         received = app.links.get().map(|links| links.subscribe());
                     }
                     step(&app).await;
+                    ticks += 1;
+                    if ticks % FILTER_RECONCILE_SECS == 0 {
+                        reconcile_filters(&app).await;
+                    }
                 }
             }
         }
@@ -546,13 +764,13 @@ async fn step(app: &App) {
         }
         SwitchStep::Apply(config) => {
             log::info!("radio: switching the mesh band now");
-            if let Err(error) = apply(app, band, config).await {
+            if let Err(error) = apply(app, band, config, None).await {
                 log::warn!("radio: switching failed: {}", error.message);
             }
         }
         SwitchStep::Revert(config) => {
             log::warn!("radio: nobody heard on the new mesh band within a minute, going back");
-            if let Err(error) = apply(app, band, config).await {
+            if let Err(error) = apply(app, band, config, None).await {
                 log::warn!("radio: going back failed: {}", error.message);
             }
         }
@@ -592,5 +810,24 @@ mod tests {
         assert_eq!(view["bt"], 2.0);
         assert_eq!(modulation_view(Modulation::Ofdm { mcs: 6, opt: 0 })["option"], 1);
         assert_eq!(modulation_view(Modulation::Qpsk { fchip: 3, mode: 1 })["chip_rate_khz"], 2000);
+    }
+
+    #[test]
+    fn a_filter_is_auto_or_an_index_and_stored_as_text() {
+        assert_eq!(serde_json::from_str::<FilterChoice>("\"auto\"").unwrap(), FilterChoice::Auto);
+        assert_eq!(serde_json::from_str::<FilterChoice>("2").unwrap(), FilterChoice::Index(2));
+        for bad in ["\"wide\"", "-1", "256", "1.5", "null"] {
+            assert!(serde_json::from_str::<FilterChoice>(bad).is_err(), "{bad}");
+        }
+        for choice in [FilterChoice::Auto, FilterChoice::Index(0), FilterChoice::Index(2)] {
+            assert_eq!(FilterChoice::parse(&choice.text()), Some(choice));
+        }
+        assert_eq!(FilterChoice::parse("saw868"), None);
+        let with_filter = input(r#"{"frequency_hz":868000000,"channel_spacing_hz":200000,"channel":0,"modulation":{"kind":"off"},"tx_power":1,"filter":1}"#);
+        assert_eq!(with_filter.filter, Some(FilterChoice::Index(1)));
+        // A saved index the board does not have is auto.
+        let filters = kaonic_mesh::commd::Filters { filters: vec![kaonic_mesh::commd::Filter { label: "Wide".into(), min_khz: 1, max_khz: 2 }], ..Default::default() };
+        assert_eq!(effective(FilterChoice::Index(3), &filters), FilterChoice::Auto);
+        assert_eq!(effective(FilterChoice::Index(0), &filters), FilterChoice::Index(0));
     }
 }

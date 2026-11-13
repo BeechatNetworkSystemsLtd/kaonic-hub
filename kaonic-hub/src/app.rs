@@ -65,6 +65,8 @@ pub struct Inner {
     pub vpn_config: Option<kaonic_vpn::VpnConfig>,
     /// Plugins, made from `config.plugins` when first used ([`App::plugins`]).
     pub plugins: std::sync::OnceLock<Arc<crate::plugins::Plugins>>,
+    /// The radio daemon, which drives the radio front-ends (the sub-GHz filter); None without one.
+    pub commd: Option<Arc<kaonic_mesh::commd::Commd>>,
 }
 
 #[derive(Clone)]

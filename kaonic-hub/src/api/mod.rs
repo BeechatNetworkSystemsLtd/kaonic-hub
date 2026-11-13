@@ -108,6 +108,7 @@ pub fn router(app: App) -> Router {
         .route("/bearers", get(peers::bearers))
         .route("/radio/bands", get(radio_bands::list))
         .route("/radio/bands/{band}", get(radio_bands::get).put(radio_bands::put))
+        .route("/radio/bands/{band}/filter", put(radio_bands::put_filter))
         .route("/radio/stats", get(radio::stats))
         .route("/radio/frames", get(radio::frames))
         .route("/links", get(links::list))

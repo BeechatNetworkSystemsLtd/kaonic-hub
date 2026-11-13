@@ -24,6 +24,10 @@ struct Hub {
 }
 
 fn hub(name: &str) -> Hub {
+    hub_with(name, None)
+}
+
+fn hub_with(name: &str, commd: Option<Arc<kaonic_mesh::commd::Commd>>) -> Hub {
     let dir = std::env::temp_dir().join(format!("kh-api-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("webui/assets")).unwrap();
@@ -79,6 +83,7 @@ fn hub(name: &str) -> Hub {
         vpn_error: Default::default(),
         vpn_config: None,
         plugins: Default::default(),
+        commd,
     });
     Hub {
         router: kaonic_hub::router(app),
@@ -638,4 +643,93 @@ async fn the_system_report_is_plain_text_for_the_admin() {
     }
     assert!(text.contains(env!("CARGO_PKG_VERSION")));
     assert!(!text.contains("correct-horse-1"), "never the password");
+}
+
+/// The kaonic1s r30's filters, as commd reports them.
+fn r30_filters() -> Vec<kaonic_mesh::commd::Filter> {
+    [("Wide 730–960 MHz", 730_000, 960_000), ("868 MHz", 862_000, 876_000), ("915 MHz", 902_000, 928_000)]
+        .into_iter()
+        .map(|(label, min_khz, max_khz)| kaonic_mesh::commd::Filter { label: label.into(), min_khz, max_khz })
+        .collect()
+}
+
+fn band<'a>(bands: &'a Value, id: &str) -> &'a Value {
+    bands.as_array().unwrap().iter().find(|band| band["id"] == id).unwrap()
+}
+
+#[tokio::test]
+async fn the_sub_ghz_filter_is_chosen_per_band_saved_and_handed_to_commd() {
+    let fake = kaonic_mesh::commd::FakeCommd::spawn("127.0.0.1:0".parse().unwrap(), 2, r30_filters(), (863_000, 928_000))
+        .await
+        .unwrap();
+    let commd = Arc::new(kaonic_mesh::commd::Commd::new(fake.addr));
+    let mut hub = hub_with("filter", Some(commd));
+
+    // Changing it is for the signed-in admin.
+    let (status, _) = hub.write("PUT", "/api/v1/radio/bands/a_sub/filter", json!({ "filter": 1 })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    hub.set_up().await;
+
+    let (status, bands) = hub.get("/api/v1/radio/bands").await;
+    assert_eq!(status, StatusCode::OK);
+    let a_sub = band(&bands, "a_sub");
+    assert_eq!(a_sub["filter"], "auto");
+    assert_eq!(a_sub["filter_state"], "ok");
+    assert_eq!(a_sub["active_filter"], 0);
+    assert_eq!(a_sub["filters"][1], json!({ "index": 1, "label": "868 MHz", "min_mhz": 862.0, "max_mhz": 876.0 }));
+    assert_eq!(a_sub["filters"].as_array().unwrap().len(), 3);
+    assert_eq!((a_sub["min_mhz"].as_f64(), a_sub["max_mhz"].as_f64()), (Some(863.0), Some(928.0)));
+    // The 2.4 GHz bands have no filter, only their range.
+    let a_24 = band(&bands, "a_24");
+    assert_eq!((a_24["filter_state"].as_str(), a_24["filters"].as_array().unwrap().len()), (Some("none"), 0));
+    assert_eq!((a_24["min_mhz"].as_f64(), a_24["max_mhz"].as_f64()), (Some(2400.0), Some(2483.5)));
+
+    // Any filter the board has may be chosen, whatever the frequency; it is saved and handed on.
+    let (status, view) = hub.write("PUT", "/api/v1/radio/bands/b_sub/filter", json!({ "filter": 2 })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!((view["filter"].as_u64(), view["active_filter"].as_u64()), (Some(2), Some(2)));
+    assert_eq!(*fake.selected.lock().unwrap(), vec![None, Some(2)]);
+
+    // A filter the board does not have, a name, or a filter on a 2.4 GHz band is refused.
+    for (path, filter) in [("b_sub", json!(3)), ("b_sub", json!("wide")), ("b_24", json!(1))] {
+        let (status, error) = hub.write("PUT", &format!("/api/v1/radio/bands/{path}/filter"), json!({ "filter": filter })).await;
+        assert!(status.is_client_error(), "{path} {filter}: {status}");
+        if let Some(fields) = error["details"]["fields"].as_object() {
+            assert!(fields.contains_key("filter"), "{error}");
+        }
+    }
+    assert_eq!(fake.selected.lock().unwrap()[1], Some(2));
+
+    // commd restarted (back on auto): the saved choice goes back to it.
+    fake.selected.lock().unwrap()[1] = None;
+    let (_, bands) = hub.get("/api/v1/radio/bands").await;
+    assert_eq!(band(&bands, "b_sub")["filter"], 2);
+    assert_eq!(fake.selected.lock().unwrap()[1], Some(2));
+
+    // Back to auto.
+    let (status, view) = hub.write("PUT", "/api/v1/radio/bands/b_sub/filter", json!({ "filter": "auto" })).await;
+    assert_eq!((status, view["filter"].as_str()), (StatusCode::OK, Some("auto")));
+    assert_eq!(fake.selected.lock().unwrap()[1], None);
+}
+
+#[tokio::test]
+async fn without_commd_the_filter_choice_is_kept_and_shown_unavailable() {
+    // A port nobody answers on.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let commd = Arc::new(kaonic_mesh::commd::Commd::new(silent.local_addr().unwrap()));
+    let mut hub = hub_with("filter-down", Some(commd));
+    hub.set_up().await;
+
+    let (status, view) = hub.write("PUT", "/api/v1/radio/bands/a_sub/filter", json!({ "filter": 1 })).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!((view["filter"].as_u64(), view["filter_state"].as_str()), (Some(1), Some("unavailable")));
+    assert_eq!(view["filters"], json!([]));
+    assert_eq!(view["min_mhz"], Value::Null);
+
+    // No commd at all (a laptop): the same.
+    let mut laptop = self::hub("filter-none");
+    laptop.set_up().await;
+    let (_, bands) = laptop.get("/api/v1/radio/bands").await;
+    assert_eq!(band(&bands, "a_sub")["filter_state"], "unavailable");
+    assert_eq!(band(&bands, "a_sub")["filter"], "auto");
 }
