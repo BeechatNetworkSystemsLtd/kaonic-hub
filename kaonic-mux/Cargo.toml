@@ -1,0 +1,10 @@
+[package]
+name = "kaonic-mux"
+version = "0.1.0"
+description = "Kaonic mux framing: several streams' messages in one Reticulum link packet"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
