@@ -1,0 +1,399 @@
+openapi: 3.1.0
+info:
+  title: Kaonic Hub Plugin API
+  version: 1.0.0-draft.2
+  summary: What a plugin can use on its node and across the mesh. Wrapped by the kaonic-hub-plugin SDK.
+  description: |
+    Served by the hub on a Unix socket of the plugin's own, `/run/kaonic-hub/plugins/<id>.sock`
+    (owned by the plugin's user, 0600); the installer tells every plugin in
+    `KAONIC_HUB_API=unix:<path>`. HTTP/1.1 on that socket (any `Host`). The hub answers only
+    the plugin's user on it (`SO_PEERCRED`), and only that plugin's token: another plugin's
+    token is `401` there. The socket appears within moments of an install (at most 30 s)
+    and goes when the plugin is removed; connect again if it is not there yet.
+
+    **Limits.** At most 16 connections at once per socket (more are closed unanswered), the
+    request headers within 20 s, a whole request within 30 s, and at most 4 `/events`
+    WebSockets per plugin (`429` code `too_many_sockets`).
+
+    Every request carries the plugin's token:
+    `Authorization: Bearer <token>`, read from the file in `KAONIC_PLUGIN_TOKEN`. The token
+    says which plugin it is and what it may do (signed by the installer), so a plugin never
+    names itself: everything here is its own. A token stops working when the plugin is
+    removed, reinstalled or rolled back (a new token is issued); through the hub that is at
+    once, otherwise within 30 s.
+
+    **Nodes and messages.** The hub keeps one authenticated link to every trusted node and
+    lends it out. A plugin talks to *the same plugin on other nodes*: a message to a node
+    is delivered to that node's copy of the plugin, if it runs (has its `/events` socket
+    open) and has the `mesh` permission. Traffic only ever goes between nodes the admin
+    trusts, and `from` of a message over a link is always the real sender. On the air a
+    plugin is named by the first 8 bytes of sha256 of its id; if two plugins on a node ever
+    share that name, nothing is delivered on it and sending is `409 ambiguous_name`.
+
+    **Sharing the radio.** The hub decides what goes on air: link control, voice and hub
+    services first, plugins last. Each plugin has an airtime budget (`limits.airtime_share`
+    of the channel, 10 % by default), a queue of `limits.queue` messages (the oldest is
+    dropped when it is full, or when it waited 30 s) and a largest message
+    (`limits.max_message`, one link packet). While the channel is very busy, plugins wait.
+
+    Needs the `mesh` permission for `/messages`, `/nodes/{node}/messages`, `/broadcast` and
+    `/events`; `403` with code `missing_permission` otherwise.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: http://localhost/api/plugin/v1
+    description: Over the Unix socket in `KAONIC_HUB_API` (`unix:/run/kaonic-hub/plugins/<id>.sock`), not TCP.
+security:
+  - token: []
+tags:
+  - name: node
+  - name: mesh
+  - name: store
+paths:
+  /self:
+    get:
+      tags: [node]
+      operationId: getSelf
+      summary: This plugin and the node it runs on.
+      responses:
+        '200':
+          description: Who we are.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Self' } } }
+        '401': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /nodes:
+    get:
+      tags: [mesh]
+      operationId: listNodes
+      summary: The trusted nodes of the network, with link state and whether they run this plugin.
+      responses:
+        '200':
+          description: Nodes, sorted by id.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Node' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+  /nodes/{node}:
+    parameters:
+      - { $ref: '#/components/parameters/Node' }
+    get:
+      tags: [mesh]
+      operationId: getNode
+      summary: One trusted node.
+      responses:
+        '200':
+          description: The node.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Node' } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /nodes/{node}/messages:
+    parameters:
+      - { $ref: '#/components/parameters/Node' }
+    post:
+      tags: [mesh]
+      operationId: sendToNode
+      summary: Send a message to this plugin on one node.
+      description: |
+        Queued and sent over the node's link, best effort. The answer says it was queued;
+        `sent` or `dropped` follow on the event stream with the same `id`.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Outgoing' } } }
+      responses:
+        '202':
+          description: Queued.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Queued' } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /messages:
+    post:
+      tags: [mesh]
+      operationId: sendToAll
+      summary: Send a message to this plugin on every linked node that runs it.
+      description: One `id` for all; `sent` and `dropped` come once per node, with `node` set.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Outgoing' } } }
+      responses:
+        '202':
+          description: Queued, once per node (`nodes` may be 0).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Queued' } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /broadcast:
+    post:
+      tags: [mesh]
+      operationId: broadcast
+      summary: One radio transmission heard by every neighbour (one hop), encrypted with the group key.
+      description: |
+        For voice and other one-to-many traffic, on the GROUP channel push-to-talk uses (the
+        packets are tagged so push-to-talk ignores them). Relaying further is the plugin's
+        job. At most `limits.max_broadcast` bytes. Each broadcast carries a random nonce;
+        a receiving hub drops one it has heard in the last 30 minutes (and last 4096
+        broadcasts), so a recorded broadcast replayed later than that is delivered again.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Outgoing' } } }
+      responses:
+        '202':
+          description: Queued.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Queued' } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /events:
+    get:
+      tags: [mesh]
+      operationId: events
+      summary: WebSocket of events; messages can also be sent on it.
+      description: |
+        Upgrades to a WebSocket. Text frames are JSON `Event`s from the hub. While a socket is
+        open the plugin counts as running on the mesh: other nodes hear `plugin_up`, and
+        messages for it are delivered. At most 4 at once per plugin; a fifth is `429` with
+        code `too_many_sockets`.
+
+        The plugin may send `SocketOutgoing` objects, the same as the POSTs above without a
+        round trip per message. Each is answered with `queued` (its `id`) or `refused`, with
+        the plugin's `ref` echoed. The socket closes when the token stops working.
+      responses:
+        '101': { description: Switching to WebSocket. }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /stats:
+    get:
+      tags: [mesh]
+      operationId: getStats
+      summary: This plugin's mesh use.
+      responses:
+        '200':
+          description: Counters since the hub started.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Stats' } } }
+  /store:
+    get:
+      tags: [store]
+      operationId: listKeys
+      summary: Keys in this plugin's store.
+      responses:
+        '200':
+          description: Keys, sorted.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Key' } } } }
+  /store/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Key' }
+    get:
+      tags: [store]
+      operationId: getValue
+      summary: One value.
+      responses:
+        '200':
+          description: The value as stored.
+          content: { application/json: { schema: {} } }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [store]
+      operationId: putValue
+      summary: Store any JSON value.
+      description: At most `limits.store.max_value` bytes; `max_bytes` (keys and values) and `max_keys` per plugin.
+      requestBody:
+        required: true
+        content: { application/json: { schema: {} } }
+      responses:
+        '204': { description: Stored. }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [store]
+      operationId: deleteValue
+      summary: Delete a value.
+      responses:
+        '204': { description: 'Deleted, or there was none.' }
+components:
+  securitySchemes:
+    token:
+      type: http
+      scheme: bearer
+      description: The plugin's token, `kpt1.…`, from the file in `KAONIC_PLUGIN_TOKEN`.
+  parameters:
+    Node:
+      name: node
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/NodeId' }
+  responses:
+    Error:
+      description: |
+        `401` bad, removed or replaced token; `403` the plugin lacks the permission
+        (`missing_permission`); `404` no such node or key; `409` this node has no group key
+        yet (`conflict`), or another plugin here has the same mesh name (`ambiguous_name`);
+        `413` too large (`too_large`) or the store is full (`store_full`); `422` invalid
+        (bad base64, a key or value that is not allowed); `429` the message could not be queued
+        (`busy`) or the plugin has 4 event sockets open (`too_many_sockets`); `503` the installer is not running, so tokens cannot be checked
+        (`installer_unavailable`).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [code, message]
+            properties:
+              code: { type: string }
+              message: { type: string }
+  schemas:
+    NodeId:
+      type: string
+      description: The node's identity hash, hex.
+      pattern: '^[0-9a-f]{32}$'
+    Channel:
+      type: integer
+      minimum: 0
+      maximum: 255
+      description: The plugin's own sub-channel, to tell its kinds of messages apart.
+    Data:
+      type: string
+      contentEncoding: base64
+      description: The payload, standard base64 with padding. At most `limits.max_message` bytes once decoded.
+    Key:
+      type: string
+      pattern: '^[A-Za-z0-9._-]{1,128}$'
+    Permission:
+      type: string
+      enum: [audio, realtime, mesh, network, root]
+    Self:
+      type: object
+      required: [plugin, version, permissions, node, codename, hub_version, limits]
+      properties:
+        plugin: { type: string, description: This plugin's id. }
+        version: { type: string }
+        permissions: { type: array, items: { $ref: '#/components/schemas/Permission' } }
+        node:
+          description: This node's id; null where the hub runs no mesh.
+          oneOf: [{ $ref: '#/components/schemas/NodeId' }, { type: 'null' }]
+        codename: { type: string }
+        hub_version: { type: string }
+        limits:
+          type: object
+          required: [max_message, max_broadcast, airtime_share, queue, store]
+          properties:
+            max_message: { type: integer, description: Largest message to a node in bytes (one link packet). }
+            max_broadcast: { type: integer, description: Largest broadcast in bytes (one GROUP packet). }
+            airtime_share: { type: number, description: "This plugin's share of the channel, 0-1." }
+            queue: { type: integer, description: Messages that may wait; more drop the oldest. }
+            store:
+              type: object
+              required: [max_value, max_bytes, max_keys]
+              properties:
+                max_value: { type: integer }
+                max_bytes: { type: integer }
+                max_keys: { type: integer }
+    Node:
+      type: object
+      required: [id, codename, admin, link, runs_plugin, rssi, rtt_ms, last_heard]
+      properties:
+        id: { $ref: '#/components/schemas/NodeId' }
+        codename: { type: string, description: As it announces itself; empty if not heard yet. }
+        admin: { type: boolean, description: This node is the network's admin. }
+        link: { type: string, enum: [up, connecting, down] }
+        runs_plugin: { type: boolean, description: The same plugin runs there (as last heard). }
+        rssi: { type: [integer, 'null'], description: 'dBm, its last announce.' }
+        rtt_ms: { type: [integer, 'null'] }
+        last_heard: { type: [integer, 'null'], description: Unix seconds. }
+    Outgoing:
+      type: object
+      required: [channel, data]
+      additionalProperties: false
+      properties:
+        channel: { $ref: '#/components/schemas/Channel' }
+        data: { $ref: '#/components/schemas/Data' }
+        reliable: { type: boolean, default: false, description: Reserved; every message is best effort for now. }
+    SocketOutgoing:
+      description: A message sent on the `/events` socket.
+      type: object
+      required: [to, channel, data]
+      additionalProperties: false
+      properties:
+        to: { type: string, description: 'A node id, `*` for every linked node running the plugin, or `broadcast`.' }
+        channel: { $ref: '#/components/schemas/Channel' }
+        data: { $ref: '#/components/schemas/Data' }
+        reliable: { type: boolean, default: false }
+        ref: { description: Anything; echoed in the answer. }
+    Queued:
+      type: object
+      required: [id, nodes]
+      properties:
+        id: { type: integer, description: Matches the later `sent` or `dropped` events. }
+        nodes: { type: integer, description: How many nodes it goes to (1 for a node or a broadcast). }
+    Event:
+      description: One event on `/events`.
+      oneOf:
+        - title: received
+          type: object
+          required: [type, from, channel, data, broadcast, rssi]
+          properties:
+            type: { const: received }
+            from:
+              $ref: '#/components/schemas/NodeId'
+              description: The sender. For a broadcast, as the sender (a holder of the group key) says.
+            channel: { $ref: '#/components/schemas/Channel' }
+            data: { $ref: '#/components/schemas/Data' }
+            broadcast: { type: boolean, description: Heard on the group channel. }
+            rssi: { type: [integer, 'null'] }
+        - title: node
+          type: object
+          required: [type, node]
+          properties:
+            type: { enum: [node_up, node_down, plugin_up, plugin_down] }
+            node: { $ref: '#/components/schemas/NodeId' }
+        - title: delivery
+          type: object
+          required: [type, id, node]
+          properties:
+            type: { enum: [sent, dropped] }
+            id: { type: integer }
+            node:
+              description: The node it was for; null for a broadcast.
+              oneOf: [{ $ref: '#/components/schemas/NodeId' }, { type: 'null' }]
+            reason: { type: string, enum: [queue_full, too_large, no_link, over_budget, not_running], description: Only on `dropped`. }
+        - title: congestion
+          type: object
+          required: [type, level]
+          properties:
+            type: { const: congestion }
+            level: { type: number, description: 'How busy the channel is, 0-1. Sent when it crosses 0.7 either way; slow down above it.' }
+        - title: answer
+          description: The answer to a `SocketOutgoing`.
+          type: object
+          required: [type, ref]
+          properties:
+            type: { enum: [queued, refused] }
+            ref: { description: As sent. }
+            id: { type: integer, description: On `queued`. }
+            nodes: { type: integer, description: On `queued`. }
+            code: { type: string, description: 'On `refused`, as the error codes above.' }
+            message: { type: string, description: On `refused`. }
+    Stats:
+      type: object
+      required: [sent, received, dropped, bytes_sent, bytes_received, airtime_ms, queue, airtime_share, per_node]
+      properties:
+        sent: { type: integer }
+        received: { type: integer }
+        dropped: { type: integer }
+        bytes_sent: { type: integer }
+        bytes_received: { type: integer }
+        airtime_ms: { type: integer, description: Time on air used by this plugin (estimated). }
+        queue: { type: integer, description: Messages waiting now. }
+        airtime_share: { type: number, description: 'Its budget, 0-1.' }
+        per_node:
+          type: object
+          description: By node id, for linked nodes only (at most 64); every other sender is counted under `other`.
+          additionalProperties:
+            type: object
+            required: [sent, received, dropped]
+            properties:
+              sent: { type: integer }
+              received: { type: integer }
+              dropped: { type: integer }

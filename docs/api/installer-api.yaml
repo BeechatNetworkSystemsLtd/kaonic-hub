@@ -1,0 +1,398 @@
+openapi: 3.1.0
+info:
+  title: Kaonic Hub Installer API
+  version: 1.0.0
+  summary: Installs, runs and upgrades plugins. Called by kaonic-hub only.
+  description: |
+    `kaonic-hub-installer` runs as root and serves HTTP/1.1 on the Unix socket
+    `/run/kaonic-hub-installer/api.sock` (0600, in a 0700 root directory). There is no TCP
+    listener, no secret and no `Authorization` header: on every connection the installer
+    reads the peer's uid (`SO_PEERCRED`) and drops the connection, before reading a byte,
+    unless the uid is allowed (root by default; `--allow-uid N` replaces it, for tests).
+    Every route, `/v1/core/kaonic-hub/ready` included, is behind this check. The hub, in
+    turn, checks that the socket's peer is root before it sends anything. The hub checks who
+    the user is and what they may do; the installer checks the package.
+
+    At start the installer binds the socket first, then starts the installed plugins, then
+    serves, so the hub can connect while plugins come up.
+
+    Package bodies (`POST /v1/plugins`, `/v1/packages/check`, `/v1/core/kaonic-hub`) are
+    streamed into a file in the installer's staging, at most 64 MiB (`413` beyond, by
+    `Content-Length` or by what is sent), and unpacked from there.
+
+    Every `{id}` in a path must be a plugin id or a core id (`422` otherwise) before it
+    names anything; records read back from disk are checked like a new manifest.
+
+    Packages are tars of `kaonic-plugin.toml`, `SHA256SUMS`, an optional
+    `SHA256SUMS.sig` (ECDSA P-256, a Beechat release key) and `bin/<id>`, `files/…`.
+
+    A device without a release key is a development device: signatures are not checked,
+    every package installs as unsigned, and signed-only cannot be turned on.
+    Packages carry no systemd unit: the installer writes it from the manifest.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: http://localhost
+    description: 'Over the Unix socket /run/kaonic-hub-installer/api.sock; the host is not used.'
+tags:
+  - name: plugins
+  - name: policy
+  - name: core
+    description: |
+      The hub and the installer update each other. The installer updates the hub here; the
+      hub updates the installer itself (it checks the package, swaps the copy in
+      `/usr/local/kaonic-core/kaonic-hub-installer/`, restarts it and waits for
+      `/v1/health`). At start each program runs the updated copy if it is at least as new
+      as the image's and has not failed to come up 3 times in a row.
+  - name: history
+paths:
+  /v1/health:
+    get:
+      tags: [core]
+      operationId: health
+      responses:
+        '200':
+          description: The installer is up.
+          content: { application/json: { schema: { type: object, required: [version], properties: { version: { type: string } } } } }
+  /v1/history:
+    get:
+      tags: [history]
+      operationId: history
+      summary: What happened to plugins and core programs, newest first (the last 1000 events are kept).
+      parameters:
+        - { name: id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+      responses:
+        '200':
+          description: Events.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Event' } } } }
+  /v1/core:
+    get:
+      tags: [core]
+      operationId: coreStatus
+      responses:
+        '200':
+          description: The hub and the installer.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/CoreStatus' } } } }
+  /v1/core/kaonic-hub:
+    post:
+      tags: [core]
+      operationId: updateHub
+      summary: Update the hub.
+      description: |
+        Checks the package (id `kaonic-hub`; signed when the device has a release key), then
+        answers 202 and restarts the hub with it. If the new hub does not report ready within
+        120 s, the previous one is put back. The hub reads the outcome from `/job` when it starts.
+        A job still `running` when the installer starts (it was cut off), or running 60 s past
+        the 120 s, becomes `failed` ("interrupted"), so it never blocks the next update.
+      parameters:
+        - { name: allow_downgrade, in: query, schema: { type: boolean, default: false } }
+      requestBody:
+        required: true
+        content: { application/x-tar: { schema: { type: string, format: binary, maxLength: 67108864 } } }
+      responses:
+        '202':
+          description: Started.
+          content: { application/json: { schema: { $ref: '#/components/schemas/HubJob' } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /v1/core/kaonic-hub/job:
+    get:
+      tags: [core]
+      operationId: hubJob
+      responses:
+        '200':
+          description: The last hub update.
+          content: { application/json: { schema: { $ref: '#/components/schemas/HubJob' } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /v1/core/kaonic-hub/ready:
+    post:
+      tags: [core]
+      operationId: hubReady
+      summary: The hub says it is fully up, at this version.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [version], properties: { version: { type: string } } } } }
+      responses:
+        '204': { description: Noted. }
+  /v1/plugins:
+    get:
+      tags: [plugins]
+      operationId: listPlugins
+      summary: Every installed plugin.
+      responses:
+        '200':
+          description: Plugins, sorted by id.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Plugin' } } } }
+    post:
+      tags: [plugins]
+      operationId: installPlugin
+      summary: Install or upgrade from a package.
+      description: |
+        Unpacks into staging, checks every file against `SHA256SUMS` and the signature,
+        then switches `current/` (the old one goes to `previous/`) and starts the plugin.
+        If it does not stay running, the previous version is put back, with a new token
+        matching its record. A version lower than any installed before (also before a
+        removal) needs `allow_downgrade`.
+
+        A plugin runs as its own uid from 61000-61999 (`uid` in the record; 0 for a `root`
+        plugin), kept across upgrades and never given to another plugin while a record or a
+        kept `data/` owns it. Refused with `409` if its mesh name (the first 8 bytes of
+        sha256(id), big-endian) equals another installed plugin's, or if `command = true`
+        would take a name that exists. A `root` plugin on a development device installs
+        (unsigned), with a warning in the installer's log.
+      parameters:
+        - { name: allow_downgrade, in: query, schema: { type: boolean, default: false } }
+      requestBody:
+        required: true
+        content: { application/x-tar: { schema: { type: string, format: binary, maxLength: 67108864 } } }
+      responses:
+        '200':
+          description: Installed and running.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Plugin' } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /v1/packages/check:
+    post:
+      tags: [plugins]
+      operationId: checkPackage
+      summary: Check a package without installing it.
+      requestBody:
+        required: true
+        content: { application/x-tar: { schema: { type: string, format: binary, maxLength: 67108864 } } }
+      responses:
+        '200':
+          description: The package is valid.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [manifest, signed]
+                properties:
+                  manifest: { $ref: '#/components/schemas/Manifest' }
+                  signed: { type: boolean }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /v1/plugins/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+    get:
+      tags: [plugins]
+      operationId: getPlugin
+      responses:
+        '200':
+          description: The plugin.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Plugin' } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [plugins]
+      operationId: removePlugin
+      summary: Stop and remove a plugin, its unit, command link and token.
+      parameters:
+        - name: keep_data
+          in: query
+          description: Keep `data/` (and the plugin's uid) for a later reinstall. The highest version is remembered either way.
+          schema: { type: boolean, default: false }
+      responses:
+        '204': { description: Removed. }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /v1/plugins/{id}/{action}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+      - name: action
+        in: path
+        required: true
+        description: |
+          `start` and `stop` also enable and disable it at boot. `rollback` goes back to
+          the version kept before the last upgrade (and keeps the current one as previous).
+        schema: { type: string, enum: [start, stop, restart, rollback] }
+    post:
+      tags: [plugins]
+      operationId: controlPlugin
+      responses:
+        '200':
+          description: The plugin after the action.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Plugin' } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /v1/policy:
+    get:
+      tags: [policy]
+      operationId: getPolicy
+      responses:
+        '200':
+          description: The install policy, and whether this device has a release key.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Policy' }
+                  - type: object
+                    required: [release_key]
+                    properties:
+                      release_key: { type: boolean, description: False on a development device. }
+    put:
+      tags: [policy]
+      operationId: setPolicy
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Policy' } } }
+      responses:
+        '200':
+          description: The policy now.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Policy' } } }
+        '409': { $ref: '#/components/responses/Error' }
+  /v1/token-key:
+    get:
+      tags: [policy]
+      operationId: getTokenKey
+      summary: The public key plugin tokens are signed with.
+      description: |
+        A plugin token is `kpt1.<base64url(claims)>.<base64url(Ed25519 signature)>`, the
+        signature over `kpt1.<base64url(claims)>`. The hub checks it with this key and
+        compares its SHA-256 with the plugin's `token_sha256`.
+      responses:
+        '200':
+          description: The key.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [public]
+                properties:
+                  public: { type: string, pattern: '^[0-9a-f]{64}$', description: Ed25519 public key, hex. }
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+  responses:
+    Error:
+      description: |
+        `403` refused by policy; `404` no such plugin; `409` clashes with what is installed
+        (or a downgrade, code `downgrade`); `413` the package is over 64 MiB; `422` invalid
+        package or id; `500` the device failed. A peer that is not allowed gets no answer:
+        the connection is closed.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  schemas:
+    Id:
+      type: string
+      pattern: '^[a-z][a-z0-9-]{0,46}[a-z0-9]$'
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, enum: [invalid, not_found, conflict, downgrade, forbidden, too_large, failed] }
+        message: { type: string }
+    Permission:
+      type: string
+      enum: [audio, realtime, mesh, network, root]
+    Manifest:
+      type: object
+      description: '`kaonic-plugin.toml`, `[kaonic-plugin]` and `[service]` together.'
+      required: [id, name, description, version, developer, args, permissions, command, restart, restart_sec, stop_timeout, environment, nice, memory_max_mb, cpu_quota]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: string, maxLength: 80 }
+        description: { type: string, maxLength: 1000 }
+        version: { type: string, examples: ['1.4.2'] }
+        developer: { type: string, maxLength: 120 }
+        channel: { type: [string, 'null'], enum: [dev, experimental, unstable, stable, null] }
+        url: { type: [string, 'null'], format: uri }
+        page:
+          type: boolean
+          description: |
+            It serves its web page on `<plugins>/<id>/run/page.sock` (told in
+            `KAONIC_PLUGIN_PAGE_SOCKET`); the hub shows it at `/apps/<id>/`. `run/` is the
+            plugin's own (its uid, 0700). There are no page ports.
+        icon: { type: [string, 'null'], description: 'PNG under files/.' }
+        command:
+          type: boolean
+          description: A /usr/bin/<id> link to the program. Only for ids starting with `kaonic-`, and never over a file the installer did not make.
+        args: { type: array, items: { type: string } }
+        permissions: { type: array, items: { $ref: '#/components/schemas/Permission' } }
+        restart: { type: string, enum: [on-failure, always, 'no'] }
+        restart_sec: { type: integer }
+        stop_timeout: { type: integer }
+        environment: { type: array, items: { type: array, prefixItems: [{ type: string }, { type: string }] } }
+        nice: { type: integer, minimum: -20, maximum: 19 }
+        memory_max_mb: { type: integer, description: 0 is no limit. }
+        cpu_quota: { type: integer, description: Percent of one core; 0 is no limit. }
+    Plugin:
+      type: object
+      required: [manifest, uid, signed, installed_at, enabled, highest_version, token_sha256, running]
+      properties:
+        manifest: { $ref: '#/components/schemas/Manifest' }
+        uid:
+          type: integer
+          description: |
+            The uid and gid it runs as: 61000-61999, or 0 for a `root` plugin. The hub checks
+            it against `SO_PEERCRED` on the plugin's API socket and its page socket.
+        signed: { type: boolean, description: Signed by a Beechat release key. }
+        installed_at: { type: integer, description: Unix seconds. }
+        enabled: { type: boolean, description: Started at boot. }
+        highest_version: { type: string, description: The highest version ever installed; lower ones need allow_downgrade. }
+        previous:
+          description: The version kept for rollback.
+          oneOf: [{ $ref: '#/components/schemas/Plugin' }, { type: 'null' }]
+        token_sha256: { type: string, description: SHA-256 of the plugin's current API token. }
+        running: { type: boolean }
+    Event:
+      type: object
+      required: [time, id, action, outcome]
+      properties:
+        time: { type: integer }
+        id: { type: string }
+        action: { type: string, enum: [install, upgrade, downgrade, rollback, start, stop, restart, remove] }
+        outcome: { type: string, enum: [done, rolled_back, failed] }
+        from: { type: string }
+        to: { type: string }
+        signed: { type: boolean }
+        actor: { type: string, description: 'Who asked (X-Kaonic-Actor from the hub).' }
+        message: { type: string }
+    CoreStatus:
+      type: object
+      required: [id, attempts]
+      properties:
+        id: { type: string, enum: [kaonic-hub, kaonic-hub-installer] }
+        updated:
+          description: The updated copy; null means the image's copy runs.
+          oneOf:
+            - type: object
+              required: [id, version, signed, installed_at, confirmed, highest_version]
+              properties:
+                id: { type: string }
+                version: { type: string }
+                signed: { type: boolean }
+                installed_at: { type: integer }
+                confirmed: { type: boolean }
+                highest_version: { type: string }
+                previous: { type: [string, 'null'] }
+            - type: 'null'
+        attempts: { type: integer, description: Starts since it last came up healthy; at 3 the image's copy runs. }
+    HubJob:
+      type: object
+      required: [id, version, state, message, started]
+      properties:
+        id: { type: integer }
+        version: { type: string }
+        state: { type: string, enum: [running, done, failed] }
+        message: { type: string }
+        started: { type: integer }
+        finished: { type: [integer, 'null'] }
+    Policy:
+      type: object
+      required: [require_signed]
+      properties:
+        require_signed: { type: boolean, description: Refuse packages without a release signature. }

@@ -1,0 +1,14 @@
+extends:
+  - recommended
+apis:
+  hub:
+    root: hub-api.yaml
+  installer:
+    root: installer-api.yaml
+  plugin:
+    root: plugin-api.yaml
+rules:
+  tag-description: off
+  info-license-strict: off
+  operation-4xx-response: off
+  no-unused-components: off   # Event is documented for the WebSocket, which OpenAPI cannot reference

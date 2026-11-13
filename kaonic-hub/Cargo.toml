@@ -1,0 +1,50 @@
+[package]
+name = "kaonic-hub"
+version = "0.1.0"
+description = "The Kaonic hub service: web UI, API, Wi-Fi and trust for a Kaonic device."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+argon2 = { workspace = true, features = ["password-hash", "std"] }
+axum = { workspace = true }
+ed25519-dalek = { workspace = true }
+# Already in the tree under axum and hyper: the plugin proxy streams a response body with it.
+http-body = "1"
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+kaonic-handshake = { path = "../kaonic-handshake" }
+# base64, the HTTP client to the installer, the peer uid of a Unix socket.
+kaonic-hub-common = { path = "../kaonic-hub-common" }
+# Plugin records, manifests and token checks; the installer itself runs as its own program.
+kaonic-hub-installer = { path = "../kaonic-hub-installer" }
+kaonic-keystore = { path = "../kaonic-keystore" }
+kaonic-mesh = { path = "../kaonic-mesh" }
+kaonic-mux = { path = "../kaonic-mux" }
+kaonic-pki = { path = "../kaonic-pki" }
+kaonic-ptt = { path = "../kaonic-ptt" }
+kaonic-store = { path = "../kaonic-store" }
+kaonic-trust = { path = "../kaonic-trust" }
+kaonic-vpn = { path = "../kaonic-vpn" }
+kaonic-wifi = { path = "../kaonic-wifi" }
+libc = { workspace = true }
+log = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "net", "time", "sync", "signal", "process", "fs", "io-util"] }
+tokio-rustls = { workspace = true }
+x25519-dalek = { workspace = true }
+zeroize = { workspace = true }
+
+[build-dependencies]
+# Reads the web UI's package.json for its version (build.rs).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", default-features = false, features = ["util"] }

@@ -1,0 +1,10 @@
+[kaonic-plugin]
+format = 2
+id = "kaonic-hub"
+name = "Kaonic Hub"
+description = "Web UI, API, mesh, VPN, push-to-talk and plugins for a Kaonic node"
+version = "{version}"
+developer = "Beechat Network Systems Ltd"
+channel = "stable"
+url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-hub"
+icon = "files/icon.png"

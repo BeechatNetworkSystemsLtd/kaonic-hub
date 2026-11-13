@@ -1,0 +1,4366 @@
+openapi: 3.1.0
+info:
+  title: Kaonic Hub API
+  version: 1.0.0-draft.2
+  summary: Public API of kaonic-hub, consumed by kaonic-webui and automation.
+  description: |
+    Contract for `/api/v1`. Conventions, security rules, the events WebSocket
+    and the legacy → v1 route map are in `README.md` next to this file.
+
+    - JSON only (`application/json`), except uploads (multipart / octet-stream)
+      and the root CA download.
+    - Every error is an `Error` object; never plain text, never an empty body.
+    - Writes return the updated resource. `PATCH` merges, `PUT` replaces.
+    - Anything that may take longer than a few seconds, or crosses the radio
+      with a payload, returns `202` with a `Job`; progress arrives on the
+      `jobs` event topic.
+    - `x-role` is the minimum role. `x-admin-device` marks operations that only
+      a Kaonic Admin device can perform.
+    - Mutating requests authenticated by the session cookie must carry
+      `X-Kaonic-CSRF` (see the `session` security scheme).
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://{host}/api/v1
+    variables:
+      host:
+        default: 192.168.10.1
+security:
+  - session: []
+  - token: []
+
+tags:
+  - name: setup
+    description: First boot. Unauthenticated, and only while the device is not set up.
+  - name: auth
+  - name: device
+  - name: system
+  - name: network
+  - name: wifi
+  - name: radio
+  - name: bearers
+  - name: mesh
+  - name: trust
+    description: Admin provisioning, certificates and the allowlist.
+  - name: peers
+  - name: remote
+    description: Operations run on a whitelisted node over its authenticated mesh link. Admin device only.
+  - name: links
+  - name: vpn
+  - name: media
+  - name: plugins
+  - name: updates
+  - name: audio
+  - name: ptt
+    description: Push-to-talk to every node of the network at once.
+  - name: jobs
+  - name: events
+
+paths:
+  # ───────────────────────────── setup ─────────────────────────────
+  /setup/identity:
+    get:
+      tags: [setup]
+      operationId: getSetupIdentity
+      summary: The identity this device generated on first boot.
+      description: A member keeps this identity; the admin device scans it to provision the member.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/SetupIdentity' } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /setup/derive-identity:
+    post:
+      tags: [setup]
+      operationId: deriveAdminIdentity
+      summary: The admin identity a seed password gives. Changes nothing.
+      description: |
+        Lets a recovery be checked against the known admin identity before it is
+        applied. Runs the same Argon2id derivation as `POST /setup`, so it is
+        rate limited like a login.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [seed_password]
+              properties:
+                seed_password: { $ref: '#/components/schemas/SeedPassword' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [identity_hash]
+                properties:
+                  identity_hash: { $ref: '#/components/schemas/Hash' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /setup:
+    post:
+      tags: [setup]
+      operationId: setup
+      summary: Set the device up as a member or as the Kaonic Admin, and sign in.
+      description: |
+        Atomic: either everything is applied (UI password, codename, identity,
+        and for an admin the root certificate and an empty allowlist) or
+        nothing is. On success the caller holds an admin session.
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SetupInput' } } }
+      responses:
+        '200': { $ref: '#/components/responses/SessionCreated' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ───────────────────────────── auth ─────────────────────────────
+  /auth/state:
+    get:
+      tags: [auth]
+      operationId: getAuthState
+      summary: Whether setup is required, who the caller is, and the CSRF token of the session.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/AuthState' } } }
+  /auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Sign in with the UI password.
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PasswordBody' } } }
+      responses:
+        '200': { $ref: '#/components/responses/SessionCreated' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: End this session.
+      x-role: viewer
+      responses:
+        '204': { description: Session deleted and cookie cleared. }
+  /auth/forgot:
+    get:
+      tags: [auth]
+      operationId: getForgotMethods
+      summary: How this device can be erased without its password, from this connection.
+      description: >-
+        Unauthenticated. `usb`: the client is on the USB cable (both ends of the connection on
+        usb0): typing the device's serial number and ERASE is enough. `seed`: this is the Kaonic
+        Admin device; its admin's seed password works from any of its own networks. A member
+        reached over the hotspot offers neither: it must be reset over USB.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [usb, seed, set_up]
+                properties:
+                  usb: { type: boolean }
+                  seed: { type: boolean }
+                  set_up: { type: boolean, description: False before setup (nothing to reset). }
+  /auth/forgot/factory-reset:
+    post:
+      tags: [auth]
+      operationId: forgotFactoryReset
+      summary: Erase the device without its password (forgotten password).
+      description: >-
+        Unauthenticated, rate-limited like a login (a wrong serial or seed counts as a failed
+        attempt). Erases everything the hub keeps — identity, certificates and allowlist, the PTT
+        group key, the password, settings and saved Wi-Fi networks — and restarts it in setup.
+        Logged to the system journal first. A member must then be provisioned again by its admin;
+        an admin device set up again with the same seed password gets the same admin identity.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [method, confirm]
+              properties:
+                method: { type: string, enum: [usb, seed] }
+                serial: { type: string, description: 'method usb: the serial number on the label (and the System page).' }
+                seed_password: { type: string, maxLength: 256, description: 'method seed: the admin''s seed password.' }
+                confirm: { type: string, enum: [ERASE] }
+      responses:
+        '202': { description: Erasing; the device restarts in setup within seconds. }
+        '403': { description: 'The method is not available from this connection: `usb_required` (not on the USB cable), `seed_unavailable` (not the admin device).' }
+        '409': { description: Not set up. }
+        '422': { $ref: '#/components/responses/Validation' }
+        '429': { description: Too many wrong attempts (`rate_limited`), or a check is already running (`busy`). }
+  /auth/password:
+    put:
+      tags: [auth]
+      operationId: changePassword
+      summary: Change the UI password.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [current, new]
+              properties:
+                current: { type: string, maxLength: 256 }
+                new: { $ref: '#/components/schemas/NewPassword' }
+      responses:
+        '204': { description: Changed. Every other session and every token is revoked. }
+        '422': { $ref: '#/components/responses/Validation' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/tokens:
+    get:
+      tags: [auth]
+      operationId: listTokens
+      summary: API tokens for scripts. Secrets are never returned after creation.
+      x-role: admin
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/ApiToken' } } } }
+    post:
+      tags: [auth]
+      operationId: createToken
+      summary: Create an API token. Needs the password again.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, role, password]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 48 }
+                role: { $ref: '#/components/schemas/Role' }
+                expires_ts: { type: [integer, 'null'], description: Unix seconds; null = never. }
+                password: { type: string, maxLength: 256 }
+      responses:
+        '201':
+          description: Created. `secret` is shown only in this response.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiToken'
+                  - type: object
+                    required: [secret]
+                    properties:
+                      secret: { type: string, description: '`kh_` followed by 43 base64url characters (256 bits).' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /auth/tokens/{token_id}:
+    delete:
+      tags: [auth]
+      operationId: deleteToken
+      summary: Revoke a token.
+      x-role: admin
+      parameters:
+        - { name: token_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{16}$' } }
+      responses:
+        '204': { description: Revoked. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── device ─────────────────────────────
+  /device:
+    get:
+      tags: [device]
+      operationId: getDevice
+      summary: What this device is.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Device' } } }
+  /device/codename:
+    put:
+      tags: [device]
+      operationId: setCodename
+      summary: Set the codename.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [codename]
+              properties:
+                codename: { $ref: '#/components/schemas/Codename' }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Device' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /device/rootca:
+    get:
+      tags: [device]
+      operationId: getRootCa
+      summary: The CA of this device's HTTPS certificate, so a browser can trust it.
+      security: []
+      responses:
+        '200':
+          description: PEM certificate, served as an attachment `kaonic-rootca.crt`.
+          content:
+            application/x-x509-ca-cert:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /device/features:
+    get:
+      tags: [device]
+      operationId: getFeatures
+      summary: Feature switches.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Features' } } }
+    patch:
+      tags: [device]
+      operationId: patchFeatures
+      summary: Toggle VPN / remote / shell and choose radio modules.
+      description: The shell switch applies immediately; other changes set `restart_required` until `restart` is requested.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/FeaturesPatch' } } }
+      responses:
+        '200':
+          description: Saved state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Features' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /device/reboot:
+    post:
+      tags: [device]
+      operationId: reboot
+      summary: Reboot.
+      x-role: admin
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                mode:
+                  type: string
+                  enum: [normal, usb_download]
+                  default: normal
+                  description: '`usb_download` reboots into the ROM code serial/DFU mode for flashing.'
+      responses:
+        '202': { description: Reboot scheduled. }
+  /device/factory-reset:
+    post:
+      tags: [device]
+      operationId: factoryReset
+      summary: Erase everything and return to setup. Needs the password again.
+      description: |
+        Erases the hub database and the keystore on userfs (identity, admin key,
+        certificates, Wi-Fi passwords), plugin data and spools, then restarts.
+        Nothing is kept: the device comes back with a new identity and must be
+        provisioned again.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PasswordBody' } } }
+      responses:
+        '202': { description: Reset scheduled. The session ends with it. }
+        '422': { $ref: '#/components/responses/Validation' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ───────────────────────────── system ─────────────────────────────
+  /system/metrics:
+    get:
+      tags: [system]
+      operationId: getMetrics
+      summary: CPU, memory, storage and battery.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/SystemMetrics' } } }
+  /system/boot:
+    get:
+      tags: [system]
+      operationId: getBoot
+      summary: The A/B boot slots, which runs and which boots next.
+      description: Reading the slots mounts their partitions briefly; the answer is cached for 60 s unless `refresh` is set.
+      x-role: viewer
+      parameters:
+        - { name: refresh, in: query, required: false, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/BootState' } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /system/boot/next:
+    put:
+      tags: [system]
+      operationId: setBootNext
+      summary: Choose the slot that boots next (the boot switch). Reboot with POST /device/reboot.
+      description: >-
+        `once`: that slot boots on the next boot only, then the previous order comes back; if it
+        fails, U-Boot falls back by itself. `permanent`: it becomes the first slot, with 3 attempts
+        before U-Boot falls back. A slot without a bootable system is refused.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [slot, mode, password]
+              properties:
+                slot: { type: string, enum: [a, b] }
+                mode: { type: string, enum: [once, permanent] }
+                password: { type: string, description: The admin password again. }
+      responses:
+        '200':
+          description: The new state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/BootState' } } }
+        '409': { description: '`slot_not_bootable`: that slot has no kernel, device tree or root filesystem.' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /system/boot/kernel/upload:
+    post:
+      tags: [system]
+      operationId: uploadKernel
+      summary: Upload a kernel (U-Boot uImage, ARM Linux, ≤ 24 MiB) or a device tree (≤ 1 MiB) to install.
+      description: >-
+        Raw bytes. Checked strictly (magic, header and data CRC, OS, architecture, type; FDT magic,
+        size, version) and kept in RAM until installed, discarded or the hub restarts. Unsigned:
+        there is no release signing key yet.
+      x-role: admin
+      parameters:
+        - { name: kind, in: query, required: true, schema: { type: string, enum: [kernel, dtb] } }
+      requestBody:
+        required: true
+        content: { application/octet-stream: { schema: { type: string, format: binary } } }
+      responses:
+        '200':
+          description: What the file is.
+          content: { application/json: { schema: { $ref: '#/components/schemas/BootImage' } } }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /system/boot/kernel/staged:
+    get:
+      tags: [system]
+      operationId: getStagedKernel
+      summary: The uploaded files waiting to be installed.
+      x-role: admin
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [kernel, dtb]
+                properties:
+                  kernel: { oneOf: [{ $ref: '#/components/schemas/BootStaged' }, { type: 'null' }] }
+                  dtb: { oneOf: [{ $ref: '#/components/schemas/BootStaged' }, { type: 'null' }] }
+    delete:
+      tags: [system]
+      operationId: discardStagedKernel
+      summary: Forget the uploaded files.
+      x-role: admin
+      responses:
+        '204': { description: Discarded. }
+  /system/boot/kernel/install:
+    post:
+      tags: [system]
+      operationId: installKernel
+      summary: Install the uploaded files into the slot that is not running (a job).
+      description: >-
+        The running slot is never written. If the target slot has no system yet (`prepare: auto`)
+        or `prepare: always`, the running system is copied into it first (minutes). A kernel whose
+        release has no /lib/modules/<release> in the target slot is refused unless
+        `allow_missing_modules` (the radio driver would not load). The job's result is
+        `{slot, prepared, kernel_file, dtb_file, modules_present}`. Then switch with
+        PUT /system/boot/next (once) and reboot.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password]
+              properties:
+                password: { type: string }
+                slot: { type: string, enum: [a, b], description: Defaults to the slot that is not running. }
+                prepare: { type: string, enum: [auto, always, never], default: auto }
+                allow_missing_modules: { type: boolean, default: false }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '409': { description: Nothing uploaded, or an install is already running. }
+        '422': { $ref: '#/components/responses/Validation' }
+  /system/report:
+    get:
+      tags: [system]
+      operationId: getSystemReport
+      summary: Everything about this device's Kaonic software and OS, as plain text.
+      description: |
+        For a support request: device, hub (version, commit, image or updated copy), web UI,
+        installer, release key, updated copies and the last hub update, OS and kernel, boot
+        slots, memory and storage, services, mesh, and every plugin with its version, signature,
+        state and permissions. No passwords, keys, tokens or Wi-Fi names; it does include the
+        serial and the node identity hash, so it is for the admin only.
+      x-role: admin
+      responses:
+        '200':
+          description: The report.
+          content:
+            text/plain: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /system/services:
+    get:
+      tags: [system]
+      operationId: listServices
+      summary: Core systemd units and their listening ports.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [services, ports]
+                properties:
+                  services: { type: array, items: { $ref: '#/components/schemas/ServiceStatus' } }
+                  ports: { type: array, items: { $ref: '#/components/schemas/PortStatus' } }
+  /system/services/{unit}/restart:
+    post:
+      tags: [system]
+      operationId: restartService
+      summary: Restart a core service.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/CoreUnit'
+      responses:
+        '200':
+          description: Restart issued; the state right after it.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ServiceStatus' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /system/boot/dtb:
+    put:
+      tags: [system]
+      operationId: replaceDtb
+      summary: Replace the device tree blob in /boot (previous one is kept as a backup). Needs the password again.
+      x-role: admin
+      parameters:
+        - { name: X-Kaonic-Password, in: header, required: true, schema: { type: string, maxLength: 256 } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary, maxLength: 1048576, description: 'Must start with the FDT magic d00dfeed.' }
+      responses:
+        '200':
+          description: Replaced; reboot to use it.
+          content: { application/json: { schema: { $ref: '#/components/schemas/BootInfo' } } }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /system/scripts:
+    post:
+      tags: [system]
+      operationId: runScript
+      summary: Run a shell script as root. Needs the shell feature and the password again.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [script, password]
+              properties:
+                name: { type: string, maxLength: 48, pattern: '^[A-Za-z0-9._-]*$' }
+                script: { type: string, maxLength: 1048576 }
+                timeout_secs: { type: integer, minimum: 1, maximum: 600, default: 120 }
+                password: { type: string, maxLength: 256 }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  # ───────────────────────────── network ─────────────────────────────
+  /network:
+    get:
+      tags: [network]
+      operationId: getNetwork
+      summary: Where internet comes from and who gets it.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/NetworkState' } } }
+    patch:
+      tags: [network]
+      operationId: patchNetwork
+      summary: Switch sources and consumers on or off.
+      description: |
+        The hub resolves exclusive switches itself and reports the result: the
+        single USB port is either `usb_phone` or `usb_computer`, and a device
+        cannot both take internet from the mesh (`mesh_gateway`) and share it
+        back (`mesh_peers`). Turning one on turns the other off.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/NetworkPatch' } } }
+      responses:
+        '200':
+          description: Applied.
+          content: { application/json: { schema: { $ref: '#/components/schemas/NetworkState' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /network/firewall:
+    get:
+      tags: [network]
+      operationId: getFirewall
+      summary: The rendered firewall and routes, read-only.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/FirewallSnapshot' } } }
+
+  # ───────────────────────────── wifi ─────────────────────────────
+  /network/wifi:
+    get:
+      tags: [wifi]
+      operationId: getWifi
+      summary: Saved networks, the joined network and the hotspot.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK. Saved network passwords are never returned; the hotspot password only to admins.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+  /network/wifi/scan:
+    get:
+      tags: [wifi]
+      operationId: getWifiScanResults
+      summary: Networks in range from the latest scan, without starting one.
+      description: |
+        The hub scans in the background (see `WifiConfig.client`), so this is
+        usually seconds old. `scanned_ts` says when it was taken.
+      x-role: viewer
+      responses:
+        '200':
+          description: Strongest first; one entry per network name.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiScanResults' } } }
+    post:
+      tags: [wifi]
+      operationId: scanWifi
+      summary: Scan now (a few seconds). Job result is `WifiScanResults`.
+      description: A scan already running is joined rather than started twice.
+      x-role: admin
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+  /network/wifi/networks:
+    post:
+      tags: [wifi]
+      operationId: joinWifiNetwork
+      summary: Save a network (or replace its password), put it first and join it now.
+      description: |
+        The join is pinned (see `WifiConfig.client.pinned`): the client stays on
+        this network rather than moving to another saved one, until it fails or
+        another network is chosen. The outcome arrives as `wifi.changed`.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/WifiNetworkInput' } } }
+      responses:
+        '200':
+          description: Saved; joining.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /network/wifi/networks/{ssid}:
+    parameters:
+      - $ref: '#/components/parameters/Ssid'
+    patch:
+      tags: [wifi]
+      operationId: patchWifiNetwork
+      summary: Change a saved network's password or whether it is joined automatically.
+      description: A new password clears a `wrong_password` problem, so the network is tried again.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/WifiNetworkPatch' } } }
+      responses:
+        '200':
+          description: Changed.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+    delete:
+      tags: [wifi]
+      operationId: forgetWifiNetwork
+      summary: Forget a saved network. If it is the joined one, the client moves to the next.
+      x-role: admin
+      responses:
+        '200':
+          description: Removed.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /network/wifi/networks/{ssid}/connect:
+    post:
+      tags: [wifi]
+      operationId: connectWifiNetwork
+      summary: Join a saved network now, and stay on it (pinned).
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/Ssid'
+      responses:
+        '200':
+          description: Joining. The outcome arrives as `wifi.changed`.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /network/wifi/order:
+    put:
+      tags: [wifi]
+      operationId: orderWifiNetworks
+      summary: Set the order of preference of the saved networks.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [ssids]
+              properties:
+                ssids:
+                  type: array
+                  uniqueItems: true
+                  description: Every saved network, most preferred first.
+                  items: { type: string, minLength: 1, maxLength: 32 }
+      responses:
+        '200':
+          description: Reordered. The client moves to a better network only by the rules in `WifiClient`.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /network/wifi/pin:
+    delete:
+      tags: [wifi]
+      operationId: unpinWifi
+      summary: Let the client choose among saved networks again after a manual join.
+      x-role: admin
+      responses:
+        '200':
+          description: Unpinned.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+  /network/wifi/hotspot:
+    put:
+      tags: [wifi]
+      operationId: setHotspot
+      summary: Hotspot name and password.
+      description: Applying it restarts the access point, so clients on it reconnect, including the browser making this call.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/HotspotInput' } } }
+      responses:
+        '200':
+          description: Applied.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /network/wifi/antenna:
+    put:
+      tags: [wifi]
+      operationId: setWifiAntenna
+      summary: Internal or external Wi-Fi antenna, on boards that have the switch.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [antenna]
+              properties:
+                antenna: { $ref: '#/components/schemas/WifiAntenna' }
+      responses:
+        '200':
+          description: Applied.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WifiConfig' } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ───────────────────────────── radio ─────────────────────────────
+  /radio/bands:
+    get:
+      tags: [radio]
+      operationId: listRadioBands
+      summary: The four bands (two modules × sub-GHz and 2.4 GHz) with their settings and limits.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RadioBand' } } } }
+  /radio/bands/{band}:
+    parameters:
+      - $ref: '#/components/parameters/Band'
+    get:
+      tags: [radio]
+      operationId: getRadioBand
+      summary: One band.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/RadioBand' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [radio]
+      operationId: putRadioBand
+      summary: Replace a band's settings.
+      description: >-
+        Validates against the driver's ranges, writes the changed settings to the radio driver,
+        then saves them (applied again at every start). Nothing is saved if the driver refuses.
+        `off` takes the band's interface down; the mesh band cannot be switched off.
+        With `scope=network` (the Kaonic Admin device, the mesh band only), the configuration is
+        sent to every node with an authenticated link and every node, this one included, switches
+        10 s later; a node that hears no other node within 60 s of switching goes back.
+      x-role: admin
+      parameters:
+        - { name: scope, in: query, required: false, schema: { type: string, enum: [node, network], default: node } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RadioConfig' } } }
+      responses:
+        '200':
+          description: Applied and saved.
+          content: { application/json: { schema: { $ref: '#/components/schemas/RadioBand' } } }
+        '202':
+          description: 'scope=network: sent; every node switches at switch_at_ts_ms.'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [switch_at_ts_ms, nodes]
+                properties:
+                  switch_at_ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+                  nodes: { type: integer, description: Nodes the change was sent to. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /radio/bands/{band}/test:
+    post:
+      tags: [radio]
+      operationId: sendRadioTestFrame
+      summary: Send one test frame on a band.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/Band'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [message]
+              properties:
+                message: { type: string, minLength: 1, maxLength: 2047 }
+      responses:
+        '204': { description: Frame queued for transmission. }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /radio/stats:
+    get:
+      tags: [radio]
+      operationId: getRadioStats
+      summary: Counters per band.
+      x-role: viewer
+      responses:
+        '200':
+          description: One entry per band.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RadioBandStats' } } } }
+  /radio/frames:
+    get:
+      tags: [radio]
+      operationId: getRadioFrames
+      summary: Recent frames (the live feed is the `frames` event topic).
+      x-role: viewer
+      parameters:
+        - { name: band, in: query, required: false, schema: { $ref: '#/components/schemas/BandId' } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        '200':
+          description: Oldest first.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RadioFrame' } } } }
+  /radio/tdd:
+    get:
+      tags: [radio]
+      operationId: getTdd
+      summary: Masterless slotted access in the radio daemon.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TddState' } } }
+    patch:
+      tags: [radio]
+      operationId: patchTdd
+      summary: Change slotted access.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                enabled: { type: boolean }
+                period_ms: { type: integer, minimum: 100, maximum: 5000 }
+      responses:
+        '200':
+          description: State after the change.
+          content: { application/json: { schema: { $ref: '#/components/schemas/TddState' } } }
+        '502': { $ref: '#/components/responses/Upstream' }
+
+  # ───────────────────────────── bearers ─────────────────────────────
+  /bearers:
+    get:
+      tags: [bearers]
+      operationId: listBearers
+      summary: Reticulum interfaces under the hub's single transport.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Bearer' } } } }
+  /bearers/{bearer_id}:
+    parameters:
+      - { name: bearer_id, in: path, required: true, schema: { $ref: '#/components/schemas/BearerId' } }
+    patch:
+      tags: [bearers]
+      operationId: patchBearer
+      summary: Change a bearer.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/BearerPatch' } } }
+      responses:
+        '200':
+          description: Applied.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Bearer' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  # ───────────────────────────── mesh ─────────────────────────────
+  /mesh:
+    get:
+      tags: [mesh]
+      operationId: getMesh
+      summary: This node on the mesh, and transport settings.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MeshState' } } }
+  /mesh/settings:
+    patch:
+      tags: [mesh]
+      operationId: patchMeshSettings
+      summary: Change transport settings. They apply live.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/MeshSettingsPatch' } } }
+      responses:
+        '200':
+          description: Applied.
+          content: { application/json: { schema: { $ref: '#/components/schemas/MeshState' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  # ───────────────────────────── trust ─────────────────────────────
+  /trust:
+    get:
+      tags: [trust]
+      operationId: getTrust
+      summary: This device's role in its network, its admin and the allowlist version.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TrustState' } } }
+  /trust/allowlist:
+    get:
+      tags: [trust]
+      operationId: getAllowlist
+      summary: The admin-signed list of identities allowed on the network, as this device holds it.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Allowlist' } } }
+        '404': { description: Not provisioned yet. }
+
+  # ───────────────────────────── peers ─────────────────────────────
+  /peers:
+    get:
+      tags: [peers]
+      operationId: listPeers
+      summary: Every node this device has heard of, excluding itself.
+      x-role: viewer
+      parameters:
+        - { name: online, in: query, required: false, schema: { type: boolean } }
+        - { name: list, in: query, required: false, schema: { $ref: '#/components/schemas/NodeList' } }
+      responses:
+        '200':
+          description: Online first, then newest first-seen.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Peer' } } } }
+  /peers/{peer_id}:
+    parameters:
+      - $ref: '#/components/parameters/PeerId'
+    get:
+      tags: [peers]
+      operationId: getPeer
+      summary: One node.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Peer' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [peers]
+      operationId: patchPeer
+      summary: Local notes about a node. Never sent over the air.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                tag: { type: string, maxLength: 48, description: Empty string clears. }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Peer' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+    delete:
+      tags: [peers]
+      operationId: forgetPeer
+      summary: Forget a node that is on neither list. It reappears if it announces again.
+      x-role: admin
+      responses:
+        '204': { description: Forgotten. }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /peers/{peer_id}/list:
+    put:
+      tags: [peers]
+      operationId: setPeerList
+      summary: Put a node on the whitelist or the blacklist, or take it off both.
+      description: |
+        Only the **admin device** changes the lists. Both are its signed
+        allowlist, which spreads to every
+        node, so every node shows the same `list`:
+        - `whitelist` on an unprovisioned node provisions it first: the hub
+          opens a link, takes its CSR, issues its certificate and sends it with
+          the new allowlist. Progress shows in `trust.provisioning` on the
+          `peers` topic. A node certified by another admin cannot be
+          whitelisted (`foreign_node`); it must be factory reset. A
+          blacklisted node is unblocked first.
+        - `blacklist` takes the node off the allowlist and blocks it: every
+          node refuses its links even with a valid certificate, and the
+          push-to-talk key is rotated. Any heard node can be blocked, also one
+          never provisioned or of another admin.
+        - `none` takes it off both lists (revokes or unblocks it).
+        - The Kaonic Admin cannot be removed or blacklisted (`is_admin`).
+
+        A member gets `not_admin_device`.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [list]
+              properties:
+                list: { $ref: '#/components/schemas/NodeList' }
+      responses:
+        '200':
+          description: Applied, or provisioning started.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Peer' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /peers/{peer_id}/ping:
+    post:
+      tags: [peers]
+      operationId: pingPeer
+      summary: Round trip over the authenticated link.
+      x-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rtt_ms]
+                properties:
+                  rtt_ms: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+
+  # ───────────────────────────── remote (on a node) ─────────────────────────────
+  /remote/jobs:
+    post:
+      tags: [remote]
+      operationId: startRemoteJobs
+      summary: Run one action on several nodes. One job per node, so each succeeds or fails on its own.
+      description: |
+        Jobs run one node at a time; the radio is a shared, slow link. Every node
+        must be whitelisted (`not_whitelisted` names the first that is not).
+      x-role: admin
+      x-admin-device: true
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RemoteJobsInput' } } }
+      responses:
+        '202':
+          description: Queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs: { type: array, items: { $ref: '#/components/schemas/Job' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /peers/{peer_id}/remote/device:
+    get:
+      tags: [remote]
+      operationId: getRemoteDevice
+      summary: What a node says about itself.
+      x-role: viewer
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/RemoteDevice' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+  /peers/{peer_id}/remote/radio/bands/{band}:
+    parameters:
+      - $ref: '#/components/parameters/PeerId'
+      - $ref: '#/components/parameters/Band'
+    put:
+      tags: [remote]
+      operationId: putRemoteRadioBand
+      summary: Change one band on a node, synchronously. Prefer `POST /remote/jobs` for several nodes.
+      description: Changing a node's radio can cut this device off from it; the UI must confirm.
+      x-role: admin
+      x-admin-device: true
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RadioConfig' } } }
+      responses:
+        '200':
+          description: Applied on the node.
+          content: { application/json: { schema: { $ref: '#/components/schemas/RadioBand' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+  /peers/{peer_id}/remote/features:
+    parameters:
+      - $ref: '#/components/parameters/PeerId'
+    get:
+      tags: [remote]
+      operationId: getRemoteFeatures
+      summary: A node's feature switches.
+      x-role: viewer
+      x-admin-device: true
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Features' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+    patch:
+      tags: [remote]
+      operationId: patchRemoteFeatures
+      summary: Change a node's feature switches.
+      description: The shell switch cannot be changed remotely (422 if present).
+      x-role: admin
+      x-admin-device: true
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/FeaturesPatch' } } }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Features' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+  /peers/{peer_id}/remote/plugins:
+    parameters:
+      - $ref: '#/components/parameters/PeerId'
+    get:
+      tags: [remote]
+      operationId: listRemotePlugins
+      summary: A node's plugins.
+      x-role: viewer
+      x-admin-device: true
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RemotePlugin' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+    post:
+      tags: [remote]
+      operationId: pushRemotePlugin
+      summary: Push a signed plugin package over the mesh (resumable bulk transfer, ≤ 96 MiB).
+      x-role: admin
+      x-admin-device: true
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                plugin_id: { $ref: '#/components/schemas/PluginId' }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Busy' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+  /peers/{peer_id}/remote/plugins/{plugin_id}/{action}:
+    post:
+      tags: [remote]
+      operationId: remotePluginAction
+      summary: Start, stop, restart or delete a plugin on a node.
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+        - $ref: '#/components/parameters/PluginIdPath'
+        - { name: action, in: path, required: true, schema: { type: string, enum: [start, stop, restart, delete] } }
+      responses:
+        '200':
+          description: Done on the node.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+  /peers/{peer_id}/remote/services/{unit}/restart:
+    post:
+      tags: [remote]
+      operationId: restartRemoteService
+      summary: Restart a core service on a node.
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+        - $ref: '#/components/parameters/CoreUnit'
+      responses:
+        '202': { description: Restart requested on the node. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+  /peers/{peer_id}/remote/shell/ticket:
+    post:
+      tags: [remote]
+      operationId: createRemoteShellTicket
+      summary: The password again, for a one-time ticket that opens the shell's WebSocket within 30 s.
+      description: |
+        A WebSocket carries no CSRF header, so the ticket stands in for it: it is bound to
+        this session and this node, and is used once. The node must be whitelisted and its
+        secure link up. Recorded in the audit log of both devices.
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password]
+              properties:
+                password: { type: string, maxLength: 256 }
+      responses:
+        '200':
+          description: The ticket.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket, expires_in_secs]
+                properties:
+                  ticket: { type: string }
+                  expires_in_secs: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: '`not_whitelisted`: the node is not in this network.' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '503': { description: '`peer_unreachable`: no secure link to the node now.' }
+  /peers/{peer_id}/remote/shell:
+    get:
+      tags: [remote]
+      operationId: openRemoteShell
+      summary: 'WebSocket: a root login shell on the node, over its secure link.'
+      description: |
+        Query: `ticket` (from `POST …/shell/ticket`), `cols` and `rows` (default 80×24).
+        Same origin and session rules as `/events`; admin only.
+        Binary messages are terminal bytes both ways. Text messages are JSON: from the
+        browser `{"type":"resize","cols":100,"rows":30}`; to it `{"type":"opened"}` once the
+        node started the shell, and `{"type":"closed","reason":"…"}` before the socket closes.
+        A node runs at most 2 shells; one is closed after a minute without hearing the admin
+        or 30 minutes without input. Over the mesh the bytes are carried reliably and in
+        order (KRM1 on mux stream 5).
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+        - { name: ticket, in: query, required: true, schema: { type: string } }
+        - { name: cols, in: query, schema: { type: integer, minimum: 10, maximum: 500 } }
+        - { name: rows, in: query, schema: { type: integer, minimum: 2, maximum: 500 } }
+      responses:
+        '101': { description: Switching to the WebSocket. }
+        '401': { description: Not signed in. }
+        '403': { description: '`ticket_invalid`, or not the admin.' }
+  /peers/{peer_id}/remote/codename:
+    put:
+      tags: [remote]
+      operationId: putRemoteCodename
+      summary: Renames a node. Answers with the node's `Device` as it is now.
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [codename]
+              properties:
+                codename: { type: string, pattern: '^[a-z0-9]{8}$' }
+      responses:
+        '200': { description: Renamed on the node. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+  /peers/{peer_id}/remote/ptt:
+    patch:
+      tags: [remote]
+      operationId: patchRemotePtt
+      summary: Changes a node's talk settings, as `PATCH /ptt/settings` does on the node. Prefer `POST /remote/jobs` for several nodes.
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PttSettingsPatch' } } }
+      responses:
+        '200':
+          description: The node's settings now.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PttSettings' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+
+  # ───────────────────────────── links ─────────────────────────────
+  /links:
+    get:
+      tags: [links]
+      operationId: listLinks
+      summary: Mesh links (at most one per peer) and the streams multiplexed on them.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Link' } } } }
+
+  # ───────────────────────────── vpn ─────────────────────────────
+  /vpn:
+    get:
+      tags: [vpn]
+      operationId: getVpn
+      summary: Tunnel state, routes and peers.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnState' } } }
+  /vpn/settings:
+    patch:
+      tags: [vpn]
+      operationId: patchVpnSettings
+      summary: How the VPN is shared with this node's clients.
+      description: >-
+        The tunnel network itself is set with `--vpn-network` on every node (a different value
+        here answers 422).
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                network: { $ref: '#/components/schemas/Ipv4Cidr' }
+                share_lans: { type: boolean }
+                lan_interfaces: { type: array, maxItems: 8, items: { type: string } }
+                map_lans: { type: boolean }
+                route_lans: { type: boolean }
+                mapping_pool: { $ref: '#/components/schemas/Ipv4Cidr' }
+                push_routes: { type: boolean }
+                lan_router: { type: string, enum: [auto, always, never] }
+                dns_servers: { type: array, maxItems: 4, items: { type: string, format: ipv4 } }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnState' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /vpn/routes:
+    put:
+      tags: [vpn]
+      operationId: putVpnRoutes
+      summary: Local subnets this node advertises into the mesh.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [advertised]
+              properties:
+                advertised: { type: array, maxItems: 32, items: { $ref: '#/components/schemas/Ipv4Cidr' } }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnRoutes' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /vpn/access:
+    put:
+      tags: [vpn]
+      operationId: putVpnAccess
+      summary: Which whitelisted nodes may exchange VPN traffic with this node.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/VpnAccess' } } }
+      responses:
+        '200':
+          description: Normalized policy.
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnAccess' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /vpn/uplink:
+    put:
+      tags: [vpn]
+      operationId: putVpnUplink
+      summary: Route this node's traffic through a whitelisted node acting as gateway.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                peer_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: Null picks the first node offering to be a gateway. }
+                default_route: { type: boolean, description: 'Everything goes through the gateway, this node''s own traffic too (the board''s kernel has no policy routing). Default true.' }
+                routes: { type: array, maxItems: 32, items: { $ref: '#/components/schemas/Ipv4Cidr' }, description: Destinations sent to the gateway when default_route is off. }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnUplink' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /vpn/gateway:
+    put:
+      tags: [vpn]
+      operationId: putVpnGateway
+      summary: Share this node's uplink (NAT) with the mesh.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                egress_interface: { type: [string, 'null'], description: Null = interface of the default route. }
+                routes:
+                  type: array
+                  maxItems: 32
+                  items: { $ref: '#/components/schemas/Ipv4Cidr' }
+                  description: Destinations to forward; 0.0.0.0/0 shares the full uplink. Required non-empty when enabled.
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnGateway' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /vpn/forward:
+    get:
+      tags: [vpn]
+      operationId: getVpnForward
+      summary: Multicast and broadcast forwarding rules, with their counters, and the presets.
+      description: >-
+        UDP multicast and broadcast of this node's client networks carried over the VPN to the
+        other nodes' client networks. Nothing is forwarded
+        without a rule, and every node applies its own rules. Until rules are stored with PUT, a
+        node has the `default` preset's: every multicast group and every broadcast, any port
+        (not the LAN's control chatter, never DHCP), so applications that find each other on a
+        LAN work across the mesh as they are. Answers the stored rules, with `active: false`,
+        while the VPN is not running.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnForward' } } }
+    put:
+      tags: [vpn]
+      operationId: putVpnForward
+      summary: Replace the forwarding rules (stored, and applied at once).
+      description: >-
+        To use a preset, send its `rules` as they are (alone or with others). Counters of rules
+        that keep their name go on. The first rule that names a datagram decides what happens to
+        it, so put the narrow rules first. An empty list turns forwarding off; the `default`
+        preset's rules bring the out-of-the-box behaviour back.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [rules]
+              properties:
+                rules: { type: array, maxItems: 16, items: { $ref: '#/components/schemas/VpnForwardRuleInput' } }
+            example:
+              rules:
+                - { name: atak-sa, address: 239.2.3.1, port: 6969 }
+                - { name: atak-chat, address: 224.10.10.1, port: 17012, rate: 2 }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnForward' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /vpn/packets:
+    get:
+      tags: [vpn]
+      operationId: getVpnPackets
+      summary: Recent tunnel packet log (newest first).
+      x-role: viewer
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 256, default: 64 } }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/VpnPacket' } } } }
+  /vpn/capture:
+    get:
+      tags: [vpn]
+      operationId: getVpnCapture
+      summary: The tunnel packet capture's state.
+      x-role: admin
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnCapture' } } }
+    post:
+      tags: [vpn]
+      operationId: startVpnCapture
+      summary: Start capturing tunnel packets (clears the previous capture).
+      description: >-
+        Off until an admin starts it. Captured bytes are what crossed kaonic0 (IPv4), cut to
+        `snaplen`: the default 128 keeps headers and little payload. Captures live in memory only
+        and end on stop, when `max_packets` is reached (oldest are then dropped if `ring`), after
+        `max_secs`, or when the hub restarts. Readable by admins only.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                snaplen: { type: integer, minimum: 64, maximum: 1500, default: 128 }
+                max_packets: { type: integer, minimum: 100, maximum: 20000, default: 5000, description: 'Lowered so max_packets × snaplen stays within 8 MiB; the response has the effective value.' }
+                max_secs: { type: integer, minimum: 10, maximum: 3600, default: 600 }
+                ring: { type: boolean, default: true, description: Keep the newest packets when full, else stop. }
+      responses:
+        '200':
+          description: Started.
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnCapture' } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /vpn/capture/stop:
+    post:
+      tags: [vpn]
+      operationId: stopVpnCapture
+      summary: Stop capturing (the packets stay until the next start).
+      x-role: admin
+      responses:
+        '200':
+          description: Stopped.
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnCapture' } } }
+  /vpn/capture/packets:
+    get:
+      tags: [vpn]
+      operationId: getVpnCapturePackets
+      summary: Captured packets after `after` (by seq), oldest first.
+      x-role: admin
+      parameters:
+        - { name: after, in: query, required: false, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 500 } }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/VpnCapturedPacket' } } } }
+  /vpn/capture.pcap:
+    get:
+      tags: [vpn]
+      operationId: downloadVpnCapture
+      summary: The capture as a pcap file for Wireshark (LINKTYPE_IPV4, microsecond timestamps in the hub's clock).
+      x-role: admin
+      responses:
+        '200':
+          description: The file (Content-Disposition attachment).
+          content: { application/vnd.tcpdump.pcap: { schema: { type: string, format: binary } } }
+  /vpn/ping:
+    post:
+      tags: [vpn]
+      operationId: vpnPing
+      summary: Ping a tunnel address.
+      x-role: viewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [address]
+              properties:
+                address: { type: string, format: ipv4 }
+      responses:
+        '200':
+          description: A failed ping is `ok=false`, not an error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, latency_ms]
+                properties:
+                  ok: { type: boolean }
+                  latency_ms: { type: [number, 'null'] }
+        '422': { $ref: '#/components/responses/Validation' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /vpn/speed-test:
+    post:
+      tags: [vpn]
+      operationId: vpnSpeedTest
+      summary: Download a payload from a peer's tunnel IP. Job result is `SpeedTestResult`.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [address]
+              properties:
+                address: { type: string, format: ipv4 }
+                bytes: { type: integer, minimum: 1024, maximum: 262144, default: 32768 }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /vpn/speed-payload:
+    get:
+      tags: [vpn]
+      operationId: getSpeedPayload
+      summary: Deterministic payload served to peers for speed tests. Reachable only over the tunnel, from whitelisted nodes; no session.
+      security: []
+      parameters:
+        - { name: bytes, in: query, required: false, schema: { type: integer, minimum: 1024, maximum: 262144, default: 32768 } }
+      responses:
+        '200':
+          description: Byte i = (i*31) mod 251.
+          content: { application/octet-stream: { schema: { type: string, format: binary } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ───────────────────────────── media ─────────────────────────────
+  /media:
+    get:
+      tags: [media]
+      operationId: getMedia
+      summary: Open media channels and their stream statistics.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [channels, streams]
+                properties:
+                  channels: { type: array, items: { $ref: '#/components/schemas/MediaChannel' } }
+                  streams: { type: array, items: { $ref: '#/components/schemas/MediaStreamStats' } }
+  /peers/{peer_id}/media:
+    post:
+      tags: [media]
+      operationId: openMediaChannel
+      summary: Bridge a local loopback UDP pair to a media stream on a whitelisted node's link.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/MediaChannelSpec' } } }
+      responses:
+        '201':
+          description: Open.
+          content: { application/json: { schema: { $ref: '#/components/schemas/MediaChannel' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /peers/{peer_id}/media/{stream}:
+    delete:
+      tags: [media]
+      operationId: closeMediaChannel
+      summary: Close a media channel.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+        - { name: stream, in: path, required: true, schema: { type: integer, minimum: 0, maximum: 255 } }
+      responses:
+        '204': { description: Closed. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── plugins ─────────────────────────────
+  # Plugins are installed and run by kaonic-hub-installer (installer-api.yaml); the hub
+  # decides who may ask and proxies to it. Design: docs/plugins.md.
+  /plugins:
+    get:
+      tags: [plugins]
+      operationId: listPlugins
+      summary: Installed plugins.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK, sorted by id.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Plugin' } } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    post:
+      tags: [plugins]
+      operationId: installPlugin
+      summary: Install or upgrade from a plugin package.
+      description: |
+        The package is a tar of `kaonic-plugin.toml`, `SHA256SUMS`, an optional
+        `SHA256SUMS.sig` (ECDSA P-256 by a Beechat release key; makes it `official`),
+        `bin/<id>` and `files/…`; it carries no systemd unit. The installer checks it, installs
+        it into `current/` (the old version kept for rollback), starts it and puts the old
+        version back if it does not stay running. A version lower than any installed before
+        needs `allow_downgrade` (otherwise `409` with code `downgrade`). Unsigned packages are refused while the plugin policy
+        requires signed ones (`403`, code `refused`). A plugin whose mesh name (the first 8
+        bytes of sha256 of its id) is another installed plugin's is refused (`409`). The
+        upload is streamed to a file and from it to the installer, at most 64 MiB (`413`).
+        The password is asked again.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, password]
+              properties:
+                file: { type: string, format: binary, maxLength: 67108864 }
+                password: { type: string, description: The UI password again; a wrong one is a field error. }
+                allow_downgrade: { type: string, enum: ['1', 'true'], description: Install a version lower than one installed before. }
+      responses:
+        '200':
+          description: Installed or upgraded, and running.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [action, plugin]
+                properties:
+                  action: { type: string, enum: [installed, updated] }
+                  plugin: { $ref: '#/components/schemas/Plugin' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /plugins/{plugin_id}:
+    parameters:
+      - $ref: '#/components/parameters/PluginIdPath'
+    get:
+      tags: [plugins]
+      operationId: getPlugin
+      summary: One plugin.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Plugin' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [plugins]
+      operationId: deletePlugin
+      summary: Stop and remove a plugin, its unit, command link and token.
+      description: Its data (`data/` and its key/value store) is erased unless `keep_data`.
+      x-role: admin
+      parameters:
+        - { name: keep_data, in: query, schema: { type: boolean, default: false }, description: Keep its data for a later reinstall. }
+      responses:
+        '204': { description: Removed. }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { $ref: '#/components/responses/Upstream' }
+  /plugins/{plugin_id}/package:
+    put:
+      tags: [plugins]
+      operationId: updatePlugin
+      summary: Upgrade a specific plugin; the package's id must match.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/PluginIdPath'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, password]
+              properties:
+                file: { type: string, format: binary, maxLength: 67108864 }
+                password: { type: string }
+                allow_downgrade: { type: string, enum: ['1', 'true'] }
+      responses:
+        '200':
+          description: Upgraded.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Plugin' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /plugins/{plugin_id}/icon:
+    get:
+      tags: [plugins]
+      operationId: getPluginIcon
+      summary: The plugin's icon.
+      description: |
+        The PNG named in the manifest, read from the installed (checked) package, never from
+        a file the plugin can write, and not through a symlink. Served with
+        `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'`.
+      x-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/PluginIdPath'
+      responses:
+        '200':
+          description: Icon image.
+          content:
+            image/png: { schema: { type: string, format: binary } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /plugins/{plugin_id}/open:
+    post:
+      tags: [plugins]
+      operationId: openPlugin
+      summary: A ticket URL to the plugin's page, for the UI's frame.
+      description: |
+        Plugin pages (`/apps/<id>/…`) are for the signed-in only. A page runs sandboxed in an
+        opaque origin, so the session cookie (`SameSite=Strict`) is not sent with what it
+        loads. This returns `/apps/<id>/~<ticket>/`: the ticket rides in the path, so
+        relative URLs keep it. It opens this plugin's pages only, ends with the session and
+        lasts at most `expires_in_secs`. A signed-in `GET /apps/<id>/…` without a ticket is
+        redirected (303) to one, so `app_url` also works as a link or frame source. One
+        session holds at most 16 tickets (its oldest go first); tickets are made only for an
+        installed plugin with a page (`404` otherwise). A proxied WebSocket is closed within
+        30 s of its ticket or session ending. The page is served from the plugin's page socket;
+        only content, caching and CSP headers of its answer come through, and a `Location`
+        only within `/apps/<id>/~<ticket>/`.
+      x-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/PluginIdPath'
+      responses:
+        '200':
+          description: The URL to load.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, expires_in_secs]
+                properties:
+                  url: { type: string, examples: ['/apps/audio-ptt/~3f9a…/'] }
+                  expires_in_secs: { type: integer }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /plugins/{plugin_id}/{action}:
+    post:
+      tags: [plugins]
+      operationId: pluginAction
+      summary: Start (and enable at boot), stop (and disable), restart, or roll back to the version kept before the last upgrade.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/PluginIdPath'
+        - { name: action, in: path, required: true, schema: { type: string, enum: [start, stop, restart, rollback] } }
+      responses:
+        '200':
+          description: The plugin after the action.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Plugin' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/Upstream' }
+  /plugin-policy:
+    get:
+      tags: [plugins]
+      operationId: getPluginPolicy
+      summary: What the installer accepts.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/PluginPolicy' } } }
+    put:
+      tags: [plugins]
+      operationId: setPluginPolicy
+      summary: Require signed packages, or not. The password is asked again.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [require_signed, password]
+              additionalProperties: false
+              properties:
+                require_signed: { type: boolean }
+                password: { type: string }
+      responses:
+        '200':
+          description: The policy now.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PluginPolicy' } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /plugin-check:
+    post:
+      tags: [plugins]
+      operationId: checkPluginPackage
+      summary: What a package is and asks for, without installing it.
+      description: The UI shows the permissions before asking for the password. Not under /plugins, where `check` would be a plugin id.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary, maxLength: 67108864 }
+      responses:
+        '200':
+          description: The package is valid.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name, version, developer, permissions, page, signed]
+                properties:
+                  id: { type: string }
+                  name: { type: string }
+                  version: { type: string }
+                  developer: { type: string }
+                  description: { type: string }
+                  permissions: { type: array, items: { type: string, enum: [audio, realtime, mesh, network, root] } }
+                  page: { type: boolean, description: It has a web page. }
+                  signed: { type: boolean }
+                  installed: { type: [string, 'null'], description: The version installed now, if any. }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  # ───────────────────────────── updates ─────────────────────────────
+  /software:
+    get:
+      tags: [updates]
+      operationId: getSoftware
+      summary: The hub and the installer, their updated copies, and the last hub update.
+      description: |
+        The hub and the installer update each other. `release_key: false` is a development
+        device: updates and plugins install unsigned.
+      x-role: viewer
+      responses:
+        '200':
+          description: Versions and update state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hub, installer]
+                properties:
+                  hub:
+                    type: object
+                    properties:
+                      version: { type: string }
+                      from_update: { type: boolean, description: Running the updated copy, not the image's. }
+                  installer:
+                    type: object
+                    properties:
+                      version: { type: [string, 'null'] }
+                      reachable: { type: boolean }
+                  core:
+                    description: The installer's `/v1/core` (see installer-api.yaml `CoreStatus`); null if unreachable.
+                    type: [array, 'null']
+                    items: { type: object }
+                  hub_update:
+                    description: The last hub update (installer-api.yaml `HubJob`), or null.
+                    type: [object, 'null']
+                    properties:
+                      id: { type: integer }
+                      version: { type: string }
+                      state: { type: string, enum: [running, done, failed] }
+                      message: { type: string }
+                      started: { type: integer }
+                      finished: { type: [integer, 'null'] }
+                  release_key: { type: [boolean, 'null'] }
+  /software/hub:
+    post:
+      tags: [updates]
+      operationId: updateHub
+      summary: Update the hub (the installer restarts it).
+      description: |
+        Answers 202 once the package is checked; the hub then restarts with it. If the new hub
+        does not come up within two minutes the installer puts the old one back. Read the
+        outcome from `GET /software` (`hub_update`) after the UI reconnects.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, password]
+              properties:
+                file: { type: string, format: binary, maxLength: 67108864 }
+                password: { type: string }
+                allow_downgrade: { type: string, enum: ['1', 'true'] }
+      responses:
+        '202':
+          description: Started (installer-api.yaml `HubJob`).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, version, state, message, started]
+                properties:
+                  id: { type: integer }
+                  version: { type: string }
+                  state: { type: string, enum: [running, done, failed] }
+                  message: { type: string }
+                  started: { type: integer }
+                  finished: { type: [integer, 'null'] }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /software/installer:
+    post:
+      tags: [updates]
+      operationId: updateInstaller
+      summary: Update the plugin installer (the hub restarts it and waits for it).
+      description: |
+        Answers when done (up to two minutes). If the new installer does not answer, the old one is back and the answer is `502 update_failed`.
+        A release key that is there but cannot be read refuses the update (`503 release_key_unreadable`); only a missing one
+        is a development device. The update runs to its end even if the request is cut short (the audit row says how it went).
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, password]
+              properties:
+                file: { type: string, format: binary, maxLength: 67108864 }
+                password: { type: string }
+                allow_downgrade: { type: string, enum: ['1', 'true'] }
+      responses:
+        '200':
+          description: Updated and running (installer-api.yaml `CoreStatus.updated`).
+          content: { application/json: { schema: { type: object } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /software/history:
+    get:
+      tags: [updates]
+      operationId: softwareHistory
+      summary: Plugin and update events, newest first (the last 1000).
+      x-role: admin
+      parameters:
+        - { name: id, in: query, description: A plugin id, kaonic-hub or kaonic-hub-installer., schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+      responses:
+        '200':
+          description: Events (installer-api.yaml `Event`).
+          content: { application/json: { schema: { type: array, items: { type: object } } } }
+  /updates:
+    get:
+      tags: [updates]
+      operationId: getUpdates
+      summary: Installed versions, and the release this device can hand out to other nodes.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Updates' } } }
+    post:
+      tags: [updates]
+      operationId: applyUpdate
+      summary: Upload a signed core package (hub, commd, installer, factory, webui). Job result is `Component`.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  # ───────────────────────────── audio ─────────────────────────────
+  /audio:
+    get:
+      tags: [audio]
+      operationId: getAudio
+      summary: Sound cards and their controls.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AudioCard' } } } }
+  /audio/cards/{card}/outputs/{output}:
+    parameters:
+      - $ref: '#/components/parameters/AudioCardId'
+      - $ref: '#/components/parameters/AudioOutput'
+    get:
+      tags: [audio]
+      operationId: getAudioControl
+      summary: One control.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/AudioControl' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [audio]
+      operationId: patchAudioControl
+      summary: Change volume or mute.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                volume: { type: integer, minimum: 0, maximum: 100 }
+                muted: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/AudioControl' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /audio/cards/{card}/outputs/{output}/test:
+    post:
+      tags: [audio]
+      operationId: testAudioOutput
+      summary: Play a test sample.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/AudioCardId'
+        - $ref: '#/components/parameters/AudioOutput'
+      responses:
+        '204': { description: Played. }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /audio/cards/{card}/save:
+    post:
+      tags: [audio]
+      operationId: saveAudioCard
+      summary: Keep the card's mixer state across reboots.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/AudioCardId'
+      responses:
+        '204': { description: Saved. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── ptt ─────────────────────────────
+  /ptt:
+    get:
+      tags: [ptt]
+      operationId: getPtt
+      summary: Push-to-talk state, the floor, settings and recent bursts.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/PttState' } } }
+  /ptt/settings:
+    patch:
+      tags: [ptt]
+      operationId: patchPttSettings
+      summary: Change volume, mic gain, voice activation, device playback, relaying.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PttSettingsPatch' } } }
+      responses:
+        '200':
+          description: The new settings.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PttSettings' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+  /ptt/test-tone:
+    post:
+      tags: [ptt]
+      operationId: pttTestTone
+      summary: Plays a 1 s tone on this device's speaker (not sent on the air).
+      x-role: admin
+      responses:
+        '204': { description: Played. }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /ptt/devices:
+    get:
+      tags: [ptt]
+      operationId: getPttDevices
+      summary: ALSA capture and playback devices this device has.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [capture, playback]
+                properties:
+                  capture: { type: array, items: { $ref: '#/components/schemas/PttAudioDevice' } }
+                  playback: { type: array, items: { $ref: '#/components/schemas/PttAudioDevice' } }
+  /ptt/key:
+    post:
+      tags: [ptt]
+      operationId: pttKey
+      summary: Talk from this device's microphone.
+      description: >-
+        Keys the device microphone (talk_input `device`). It stays keyed until `POST /ptt/unkey`,
+        or 2 s after the last `POST /ptt/key` (a held button repeats it every second), so a lost
+        release cannot leave the radio keyed.
+      x-role: admin
+      responses:
+        '204': { description: Keyed. }
+        '409': { description: 'The floor is taken: `{"code":"ptt_busy","talker":PttTalker}`.' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /ptt/unkey:
+    post:
+      tags: [ptt]
+      operationId: pttUnkey
+      summary: Stop talking from the device microphone (or a test transmission).
+      x-role: admin
+      responses:
+        '204': { description: Released. }
+  /ptt/test/wav:
+    get:
+      tags: [ptt]
+      operationId: getPttTestWav
+      summary: The uploaded test recording, if any.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { oneOf: [{ $ref: '#/components/schemas/PttTestWav' }, { type: 'null' }] } } }
+    put:
+      tags: [ptt]
+      operationId: putPttTestWav
+      summary: Upload a WAV (PCM, any rate, mono or stereo; at most 32 MiB) to transmit as a test.
+      x-role: admin
+      requestBody:
+        required: true
+        content: { audio/wav: { schema: { type: string, format: binary } } }
+      responses:
+        '200':
+          description: Stored (resampled to 16 kHz mono).
+          content: { application/json: { schema: { $ref: '#/components/schemas/PttTestWav' } } }
+        '413': { description: Too large. }
+        '422': { $ref: '#/components/responses/Validation' }
+    delete:
+      tags: [ptt]
+      operationId: deletePttTestWav
+      summary: Remove the test recording.
+      x-role: admin
+      responses:
+        '204': { description: Removed. }
+  /ptt/test/tx:
+    post:
+      tags: [ptt]
+      operationId: startPttTestTx
+      summary: Transmit the test recording (or a 1 kHz tone) to every node, as a normal burst.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [source]
+              properties:
+                source: { type: string, enum: [wav, tone] }
+                loop: { type: boolean, default: false, description: Repeat until stopped. }
+      responses:
+        '204': { description: Transmitting. }
+        '409': { description: 'The floor is taken (`ptt_busy`), or there is no recording.' }
+  /ptt/test/tx/stop:
+    post:
+      tags: [ptt]
+      operationId: stopPttTestTx
+      summary: Stop a test transmission.
+      x-role: admin
+      responses:
+        '204': { description: Stopped. }
+  /ptt/audio:
+    get:
+      tags: [ptt]
+      operationId: pttAudio
+      summary: Live audio over a WebSocket (browser talk and listen).
+      description: >-
+        Upgrade to a WebSocket (same origin and session rules as `/events`). Audio is binary:
+        PCM signed 16-bit little-endian, mono, 16 kHz, one 20 ms frame (320 samples, 640 bytes)
+        per message, in both directions. Control is JSON text.
+
+        Client → hub: `{"op":"listen"}` starts receiving the group's audio and
+        `{"op":"listen","on":false}` stops it;
+        `{"op":"key"}` asks for the floor; binary frames while keyed are sent to every node;
+        `{"op":"unkey"}` releases it. A keyed socket silent for 500 ms is unkeyed.
+
+        Hub → client: `{"type":"keyed"}`, `{"type":"busy","talker":PttTalker}` (the floor is
+        taken), `{"type":"unkeyed","reason":"released|preempted|timeout|forbidden"}` (`forbidden`: keying needs an admin session),
+        `{"type":"talker","talker":PttTalker|null}` when the talker changes. Keying needs an
+        admin session; listening, any signed-in user.
+      x-role: viewer
+      responses:
+        '101': { description: Switching to the WebSocket protocol. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /ptt/sessions:
+    post:
+      tags: [ptt]
+      operationId: createPttSession
+      summary: A UDP audio session for a native client (phone app, ATAK plugin).
+      description: >-
+        The same protocol as the kaonic-audio-ptt plugin (its PROTOCOL.md §1-2a): datagrams of
+        `"KU" | version 1 | type (1 AUDIO, 2 KEEPALIVE, 3 KEY, 4 UNKEY) | token u32 | seq u32 |
+        payload`, PCM s16le mono 16 kHz, 20 ms frames, to `udp_port` on this device. Existing
+        clients of the plugin work unchanged; the hub sends to the whole group instead of one peer.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [transport]
+              properties:
+                transport: { type: string, enum: [udp] }
+      responses:
+        '201':
+          description: Created. The token authenticates the UDP datagrams; it expires after 30 s without traffic.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PttSession' } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  # ───────────────────────────── jobs ─────────────────────────────
+  /jobs:
+    get:
+      tags: [jobs]
+      operationId: listJobs
+      summary: Running jobs, and finished ones from the last 24 hours.
+      description: Jobs are kept in the hub database, so they survive a hub restart; a job that was running is then `failed` with `detail` saying so.
+      x-role: viewer
+      responses:
+        '200':
+          description: Oldest first.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Job' } } } }
+  /jobs/{job_id}:
+    parameters:
+      - { name: job_id, in: path, required: true, schema: { $ref: '#/components/schemas/JobId' } }
+    get:
+      tags: [jobs]
+      operationId: getJob
+      summary: One job.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/Job' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [jobs]
+      operationId: cancelJob
+      summary: Cancel a queued or running job.
+      x-role: admin
+      responses:
+        '202': { description: Cancellation requested. }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ───────────────────────────── events ─────────────────────────────
+  /events:
+    get:
+      tags: [events]
+      operationId: events
+      summary: WebSocket event stream. See README.md for topics and cadence.
+      description: |
+        Upgrade to WebSocket. The upgrade is refused (403) unless `Origin` is
+        this device. Subscribe with `?topics=a,b` or by sending
+        `{"op":"subscribe","topics":[...]}` / `{"op":"unsubscribe","topics":[...]}`.
+        Every server frame is an `Event`. After (re)connecting, fetch REST state
+        first, then apply events.
+      x-role: viewer
+      parameters:
+        - { name: topics, in: query, required: false, schema: { type: string, examples: ['peers,jobs,metrics'] } }
+      responses:
+        '101': { description: Switching protocols. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: __Host-kaonic_session
+      description: |
+        Set by `POST /setup` and `POST /auth/login`: HttpOnly, Secure,
+        SameSite=Strict, Path=/, no Domain. The hub stores only a SHA-256 of the
+        token. A session ends after 12 h without use or 7 days in all, on
+        logout, and on a password change.
+
+        Every request authenticated by this cookie other than GET/HEAD must
+        send `X-Kaonic-CSRF` with the session's `csrf_token` (from
+        `AuthState`); a missing or stale token is refused with 403
+        `csrf_failed`. Such requests are also refused (403 `forbidden`) when
+        `Origin` is present and is not this device, or when `Sec-Fetch-Site`
+        is `cross-site`.
+    token:
+      type: http
+      scheme: bearer
+      description: API token created under /auth/tokens. Not subject to CSRF checks; never set by a browser.
+
+  parameters:
+    PeerId:
+      name: peer_id
+      in: path
+      required: true
+      description: Peer identity hash.
+      schema: { $ref: '#/components/schemas/Hash' }
+    Band:
+      name: band
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/BandId' }
+    Ssid:
+      name: ssid
+      in: path
+      required: true
+      description: Percent-encoded SSID.
+      schema: { type: string, minLength: 1, maxLength: 32 }
+    PluginIdPath:
+      name: plugin_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/PluginId' }
+    CoreUnit:
+      name: unit
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/CoreUnit' }
+    AudioCardId:
+      name: card
+      in: path
+      required: true
+      schema: { type: integer, minimum: 0, maximum: 31 }
+    AudioOutput:
+      name: output
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/AudioOutputId' }
+
+  responses:
+    SessionCreated:
+      description: Signed in. The session cookie is set; the body carries the new CSRF token.
+      headers:
+        Set-Cookie: { schema: { type: string } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/AuthState' } } }
+    JobAccepted:
+      description: Accepted; follow the job via GET /jobs/{id} or the `jobs` topic.
+      headers:
+        Location: { schema: { type: string }, description: '/api/v1/jobs/{id}' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Job' } } }
+    Unauthenticated:
+      description: No valid session or token, or wrong login password.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Role too low, bad origin or CSRF token, feature switched off, not the admin device, or the node is not whitelisted.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Resource not found.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: State conflict (already set up, not set up yet, node certified by another admin, network not in range).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Busy:
+      description: Another operation of this kind is running.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Validation:
+      description: |
+        Well-formed but invalid. `details.fields` maps field → message. A
+        wrong password given again for a dangerous operation is reported here
+        as a `password` (or `current`) field, not as 401, so it never ends the
+        session.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    TooLarge:
+      description: Body exceeds the limit for this endpoint.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    TooManyRequests:
+      description: Rate limited. `Retry-After` and `details.retry_after_secs` say when to try again.
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Upstream:
+      description: A dependency (radio daemon, installer, peer) failed or refused.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    PeerTimeout:
+      description: The peer did not answer in time (link setup or RPC).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unavailable:
+      description: Subsystem not running (e.g. radio daemon down).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  schemas:
+    # ── common ──
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable code. Clients treat an unknown code by its HTTP status.
+          enum:
+            - bad_request
+            - validation_failed
+            - unauthenticated
+            - forbidden
+            - csrf_failed
+            - feature_disabled
+            - not_admin_device
+            - not_whitelisted
+            - foreign_node
+            - not_found
+            - conflict
+            - busy
+            - payload_too_large
+            - rate_limited
+            - radio_unavailable
+            - radio_rejected
+            - installer_unavailable
+            - plugin_failed
+            - refused
+            - peer_unreachable
+            - peer_timeout
+            - peer_error
+            - not_running
+            - internal
+        message: { type: string, description: 'Human-readable, for display. Never contains secrets.' }
+        details:
+          type: object
+          additionalProperties: true
+          properties:
+            fields:
+              type: object
+              additionalProperties: { type: string }
+            retry_after_secs: { type: integer }
+    Message:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+    Hash:
+      type: string
+      pattern: '^[0-9a-f]{32}$'
+      description: 16-byte Reticulum identity hash, lowercase hex.
+    PublicIdentity:
+      type: string
+      pattern: '^[0-9a-f]{128}$'
+      description: X25519 public key followed by Ed25519 public key, lowercase hex.
+    Codename:
+      type: string
+      pattern: '^[a-z0-9]{8}$'
+    Ipv4Cidr:
+      type: string
+      pattern: '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$'
+      examples: [192.168.10.0/24]
+    Timestamp:
+      type: integer
+      description: Unix seconds.
+    TimestampMs:
+      type: integer
+      description: Unix milliseconds.
+    ModuleIndex:
+      type: integer
+      enum: [0, 1]
+      description: 0 = radio A, 1 = radio B.
+    BandId:
+      type: string
+      enum: [a_sub, a_24, b_sub, b_24]
+      description: Radio module (a, b) and transceiver (sub-GHz, 2.4 GHz).
+    CoreUnit:
+      type: string
+      enum: [kaonic-commd.service, kaonic-factory.service, kaonic-hub.service, kaonic-installer.service]
+    PluginId:
+      type: string
+      pattern: '^[a-z][a-z0-9-]{0,46}[a-z0-9]$'
+    JobId:
+      type: string
+      pattern: '^[0-9a-f]{16}$'
+    Role:
+      type: string
+      enum: [admin, viewer]
+    NewPassword:
+      type: string
+      minLength: 8
+      maxLength: 256
+      description: The UI password. Checked against a list of common passwords; stored as Argon2id.
+    SeedPassword:
+      type: string
+      minLength: 16
+      maxLength: 256
+      description: |
+        Derives the admin key. Anyone who hears the admin's announce can try to
+        guess it offline, so it must be long; the hub refuses common phrases.
+
+    # ── setup / auth ──
+    SetupIdentity:
+      type: object
+      required: [identity_hash, public_identity]
+      properties:
+        identity_hash: { $ref: '#/components/schemas/Hash' }
+        public_identity: { $ref: '#/components/schemas/PublicIdentity' }
+    SetupInput:
+      oneOf:
+        - type: object
+          title: MemberSetup
+          additionalProperties: false
+          required: [mode, password, codename]
+          properties:
+            mode: { type: string, const: member }
+            password: { $ref: '#/components/schemas/NewPassword' }
+            codename: { $ref: '#/components/schemas/Codename' }
+        - type: object
+          title: AdminSetup
+          additionalProperties: false
+          required: [mode, password, codename, seed_password]
+          properties:
+            mode: { type: string, const: admin }
+            password: { $ref: '#/components/schemas/NewPassword' }
+            codename: { $ref: '#/components/schemas/Codename' }
+            seed_password: { $ref: '#/components/schemas/SeedPassword' }
+      discriminator:
+        propertyName: mode
+    AuthState:
+      type: object
+      required: [setup_required, authenticated, role, csrf_token]
+      properties:
+        setup_required: { type: boolean, description: True on a factory-fresh device. }
+        authenticated: { type: boolean }
+        role: { oneOf: [{ $ref: '#/components/schemas/Role' }, { type: 'null' }] }
+        csrf_token:
+          type: [string, 'null']
+          description: Send as `X-Kaonic-CSRF` on writes. Bound to the session; null without one.
+    PasswordBody:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password: { type: string, maxLength: 256 }
+    ApiToken:
+      type: object
+      required: [id, name, role, created_ts, expires_ts, last_used_ts]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{16}$' }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        created_ts: { $ref: '#/components/schemas/Timestamp' }
+        expires_ts: { type: [integer, 'null'] }
+        last_used_ts: { type: [integer, 'null'] }
+
+    # ── device / system ──
+    Device:
+      type: object
+      required: [serial, codename, hostname, model, identity_hash, api_version, versions, uptime_secs, radio_modules, is_admin]
+      properties:
+        serial: { type: string }
+        codename: { $ref: '#/components/schemas/Codename' }
+        hostname: { type: string }
+        model: { type: string, description: 'Board name, e.g. "Kaonic 1S r30".' }
+        identity_hash: { $ref: '#/components/schemas/Hash' }
+        api_version: { type: string, example: '1.0' }
+        versions:
+          type: object
+          required: [hub, os, webui]
+          properties:
+            hub: { type: string }
+            os: { type: string }
+            webui: { type: [string, 'null'] }
+            commd: { type: [string, 'null'] }
+            installer: { type: [string, 'null'] }
+        uptime_secs: { type: integer }
+        radio_modules: { type: integer, minimum: 0, maximum: 2 }
+        is_admin: { type: boolean, description: This device is the Kaonic Admin of its network (holds the admin root). }
+    BootImage:
+      type: object
+      required: [kind, format, size, name, version, load_address, entry_address, built_ts]
+      properties:
+        kind: { type: string, enum: [kernel, dtb] }
+        format: { type: string, enum: [uimage, fdt] }
+        size: { type: integer }
+        name: { type: [string, 'null'], description: 'The uImage name (e.g. Linux-6.6.129-…), or the device tree''s model.' }
+        version: { type: [string, 'null'], description: The kernel release the name implies (/lib/modules/<release>). }
+        load_address: { type: [string, 'null'] }
+        entry_address: { type: [string, 'null'] }
+        built_ts: { type: [integer, 'null'] }
+    BootStaged:
+      type: object
+      required: [info, uploaded_ts]
+      properties:
+        info: { $ref: '#/components/schemas/BootImage' }
+        uploaded_ts: { $ref: '#/components/schemas/Timestamp' }
+    BootSlot:
+      type: object
+      required: [slot, attempts_left, bootfs, rootfs, kernel, dtb, modules, bootable]
+      properties:
+        slot: { type: string, enum: [a, b] }
+        attempts_left: { type: [integer, 'null'], description: 'Boots it may still fail before U-Boot falls back (3 when healthy).' }
+        bootfs: { type: boolean, description: Its boot partition has a filesystem. }
+        rootfs: { type: boolean }
+        kernel:
+          oneOf:
+            - type: 'null'
+            - type: object
+              properties:
+                file: { type: [string, 'null'], example: uImage-6.6.129-g548f960c059b-dirty }
+                name: { type: [string, 'null'] }
+                version: { type: [string, 'null'] }
+                size: { type: [integer, 'null'] }
+        dtb: { type: boolean }
+        modules: { type: array, items: { type: string }, description: Kernel releases with modules in its root filesystem. }
+        bootable: { type: boolean }
+    BootState:
+      type: object
+      required: [current, order, next, once, after_once, fdtfile, dry_run, slots]
+      properties:
+        current: { type: [string, 'null'], enum: [a, b, null], description: The running slot. }
+        order: { type: array, items: { type: string, enum: [a, b] }, description: U-Boot's BOOT_ORDER. }
+        next: { type: [string, 'null'], enum: [a, b, null] }
+        once: { type: boolean, description: A one-time boot is pending. }
+        after_once: { type: array, items: { type: string, enum: [a, b] } }
+        fdtfile: { type: [string, 'null'] }
+        dry_run: { type: boolean, description: The hub only logs boot commands (--boot-dry-run, or not on the board). }
+        slots: { type: array, items: { $ref: '#/components/schemas/BootSlot' } }
+    Features:
+      type: object
+      required: [vpn, remote, shell, restart_required]
+      properties:
+        vpn:
+          type: object
+          required: [enabled, module]
+          properties:
+            enabled: { type: boolean }
+            module: { $ref: '#/components/schemas/ModuleIndex' }
+        remote:
+          type: object
+          required: [enabled, module]
+          properties:
+            enabled: { type: boolean }
+            module: { $ref: '#/components/schemas/ModuleIndex' }
+        shell:
+          type: object
+          required: [enabled]
+          properties:
+            enabled: { type: boolean, description: Allows remote shell and local scripts. Default off. }
+        restart_required: { type: boolean, readOnly: true }
+    FeaturesPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        vpn:
+          type: object
+          additionalProperties: false
+          properties:
+            enabled: { type: boolean }
+            module: { $ref: '#/components/schemas/ModuleIndex' }
+        remote:
+          type: object
+          additionalProperties: false
+          properties:
+            enabled: { type: boolean }
+            module: { $ref: '#/components/schemas/ModuleIndex' }
+        shell:
+          type: object
+          additionalProperties: false
+          properties:
+            enabled: { type: boolean }
+        restart: { type: boolean, default: false, description: Restart the hub after saving to apply pending changes. }
+    Battery:
+      type: object
+      required: [percent, charging]
+      properties:
+        percent: { type: integer, minimum: 0, maximum: 100 }
+        charging: { type: boolean }
+    SystemMetrics:
+      type: object
+      required: [cpu_percent, ram_used_mb, ram_total_mb, fs_free_mb, fs_total_mb, uptime_secs, battery]
+      properties:
+        cpu_percent: { type: number }
+        ram_used_mb: { type: integer }
+        ram_total_mb: { type: integer }
+        fs_free_mb: { type: integer, description: Free space on userfs, where the hub keeps its data. }
+        fs_total_mb: { type: integer }
+        uptime_secs: { type: integer }
+        battery: { oneOf: [{ $ref: '#/components/schemas/Battery' }, { type: 'null' }], description: Null when the board has no battery gauge. }
+    ServiceStatus:
+      type: object
+      required: [unit, name, state, version]
+      properties:
+        unit: { type: string }
+        name: { type: string, example: Radio control }
+        state:
+          type: string
+          enum: [active, inactive, failed]
+          description: systemd `ActiveState`, with activating/reloading reported as active and deactivating as inactive.
+        version: { type: [string, 'null'] }
+    PortStatus:
+      type: object
+      required: [name, protocol, port, service, status]
+      properties:
+        name: { type: string }
+        protocol: { type: string, enum: [tcp, udp] }
+        port: { type: integer }
+        service: { type: string }
+        status: { type: string, example: listening }
+        details: { type: string }
+    BootInfo:
+      type: object
+      required: [mounted, dtb_files]
+      properties:
+        mounted: { type: boolean }
+        dtb_name: { type: [string, 'null'] }
+        dtb_bytes: { type: integer }
+        dtb_modified_ts: { type: [integer, 'null'] }
+        backup_name: { type: [string, 'null'] }
+        kernel: { type: [string, 'null'] }
+        running_model: { type: [string, 'null'] }
+        dtb_files: { type: array, items: { type: string } }
+    CommandResult:
+      type: object
+      description: Result of a local script or a remote shell command.
+      required: [code, output, truncated, duration_ms]
+      properties:
+        code: { type: integer, description: Exit code; -1 on timeout or signal. }
+        output: { type: string, description: 'stdout then stderr. Capped at 256 KiB (script) or 64 KiB (remote shell).' }
+        truncated: { type: boolean }
+        duration_ms: { type: integer }
+
+    # ── network ──
+    SourceId:
+      type: string
+      enum: [wifi_client, usb_phone, mesh_gateway]
+      description: Where internet can come from.
+    ConsumerId:
+      type: string
+      enum: [hotspot, usb_computer, mesh_peers]
+      description: Who can be given it.
+    PortState:
+      type: string
+      enum: [active, standby, waiting, 'off']
+      description: '`active` carries traffic now, `standby` is ready, `waiting` is wanted but not working.'
+    NetworkSource:
+      type: object
+      required: [id, enabled, status, detail]
+      properties:
+        id: { $ref: '#/components/schemas/SourceId' }
+        enabled: { type: boolean }
+        status: { $ref: '#/components/schemas/PortState' }
+        detail: { type: string, description: 'One line for the card, e.g. "Office" at -58 dBm.' }
+    NetworkConsumer:
+      type: object
+      required: [id, enabled, status, detail, clients]
+      properties:
+        id: { $ref: '#/components/schemas/ConsumerId' }
+        enabled: { type: boolean }
+        status: { $ref: '#/components/schemas/PortState' }
+        detail: { type: string }
+        clients: { type: integer, description: Devices or nodes connected through it. }
+    NetworkState:
+      type: object
+      required: [active_source, sources, consumers, lan]
+      properties:
+        active_source: { oneOf: [{ $ref: '#/components/schemas/SourceId' }, { type: 'null' }] }
+        sources: { type: array, items: { $ref: '#/components/schemas/NetworkSource' } }
+        consumers: { type: array, items: { $ref: '#/components/schemas/NetworkConsumer' } }
+        lan:
+          type: object
+          required: [address, subnet]
+          properties:
+            address: { type: string, format: ipv4 }
+            subnet: { $ref: '#/components/schemas/Ipv4Cidr' }
+    NetworkPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        sources:
+          type: object
+          additionalProperties: false
+          minProperties: 1
+          properties:
+            wifi_client: { type: boolean }
+            usb_phone: { type: boolean }
+            mesh_gateway: { type: boolean }
+        consumers:
+          type: object
+          additionalProperties: false
+          minProperties: 1
+          properties:
+            hotspot: { type: boolean }
+            usb_computer: { type: boolean }
+            mesh_peers: { type: boolean }
+    FirewallSnapshot:
+      type: object
+      required: [available, forwarding, rules, routes]
+      properties:
+        available: { type: boolean }
+        forwarding: { type: boolean }
+        detail: { type: string }
+        rules:
+          type: array
+          items:
+            type: object
+            required: [table, chain, rule]
+            properties:
+              table: { type: string }
+              chain: { type: string }
+              rule: { type: string }
+        routes:
+          type: array
+          items:
+            type: object
+            required: [destination, via, device, scope]
+            properties:
+              destination: { type: string }
+              via: { type: string }
+              device: { type: string }
+              scope: { type: string }
+
+    # ── wifi ──
+    WifiAntenna:
+      type: string
+      enum: [internal, external]
+    WifiSecurity:
+      type: string
+      enum: [open, wpa2, wpa3]
+      description: WEP and WPA1 networks are not shown; the device will not join them.
+    WifiConfig:
+      type: object
+      description: |
+        The single Wi-Fi radio joins a network as a client (the `wifi_client`
+        source), runs the hotspot (the `hotspot` consumer), or both (repeater).
+        This is their configuration and the client's live state.
+      required: [client, saved, hotspot, antenna, antenna_supported]
+      properties:
+        client: { $ref: '#/components/schemas/WifiClient' }
+        saved:
+          type: array
+          description: Most preferred first.
+          items: { $ref: '#/components/schemas/SavedWifiNetwork' }
+        hotspot: { $ref: '#/components/schemas/Hotspot' }
+        antenna: { $ref: '#/components/schemas/WifiAntenna' }
+        antenna_supported: { type: boolean }
+    WifiClient:
+      type: object
+      description: |
+        What the client is doing. While the `wifi_client` source is on, the hub
+        keeps it on the best saved network:
+
+        - **Choice.** Among saved networks in range with `auto_connect`, the
+          first in the saved order wins; between equals, the stronger signal.
+          A network with a `problem` is skipped until its retry time (or, for
+          `wrong_password`, until its password changes).
+        - **Staying put.** A working connection is kept. The client moves only
+          when it is lost, or when a network higher in the order has been seen
+          at -70 dBm or better in two scans in a row. It never moves to a
+          network lower in the order while the current one works.
+        - **Pinned.** A network joined by hand (`POST .../connect` or a new
+          network) is kept even if a preferred one appears, until it fails or
+          `DELETE /network/wifi/pin`.
+        - **Retries.** A failed network waits 30 s, then doubles to at most
+          10 min before it is tried again; a success resets it.
+        - **Scanning.** Every 10 s while searching with nothing to join (slowing
+          to 2 min after 5 minutes), every 5 min while connected (to notice
+          better networks), and on demand. Each scan updates `in_range`.
+      required: [state, ssid, signal_dbm, address, pinned, attempt, scanned_ts, fault]
+      properties:
+        state:
+          type: string
+          enum: ['off', searching, connecting, connected]
+          description: '`off`: the `wifi_client` source is off. `searching`: nothing it may join is in range.'
+        ssid: { type: [string, 'null'], description: The network it is connected or connecting to. }
+        signal_dbm: { type: [integer, 'null'] }
+        address: { type: [string, 'null'], description: 'IPv4 address with prefix, e.g. 192.168.1.23/24, once DHCP is done.' }
+        pinned: { type: [string, 'null'], description: A network joined by hand that it stays on. }
+        attempt:
+          description: The last failed try, until that network succeeds or another try fails. Kept while the client falls back to another network, so the UI can say why the one asked for did not work.
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [ssid, reason, ts]
+              properties:
+                ssid: { type: string }
+                reason: { $ref: '#/components/schemas/WifiProblem' }
+                ts: { $ref: '#/components/schemas/Timestamp' }
+        scanned_ts: { type: [integer, 'null'], description: When the last scan finished. }
+        fault:
+          type: [string, 'null']
+          description: The client is switched on but could not start (for example wpa_supplicant failed), and why. `state` is then `off`.
+    WifiProblem:
+      type: string
+      enum: [wrong_password, not_found, rejected, timeout, no_address]
+      description: |
+        `wrong_password`: the 4-way handshake failed. `not_found`: not in range.
+        `rejected`: the access point refused the association. `timeout`: no
+        answer in 20 s. `no_address`: joined, but DHCP gave no address.
+    SavedWifiNetwork:
+      type: object
+      required: [ssid, secured, auto_connect, in_range, signal_dbm, last_connected_ts, problem, retry_ts]
+      properties:
+        ssid: { type: string }
+        secured: { type: boolean, description: False for an open network. }
+        auto_connect: { type: boolean, description: May be joined without being asked. }
+        in_range: { type: boolean, description: Seen in the last scan. }
+        signal_dbm: { type: [integer, 'null'], description: From the last scan. }
+        last_connected_ts: { type: [integer, 'null'] }
+        problem: { oneOf: [{ $ref: '#/components/schemas/WifiProblem' }, { type: 'null' }], description: Why the last try failed; cleared by a success. }
+        retry_ts: { type: [integer, 'null'], description: Not tried automatically before this time. Null for `wrong_password`, which waits for a new password. }
+    Hotspot:
+      type: object
+      required: [ssid, password]
+      properties:
+        ssid: { type: string }
+        password: { type: [string, 'null'], description: Only shown to admins; null for viewers. }
+    HotspotInput:
+      type: object
+      additionalProperties: false
+      required: [ssid, password]
+      properties:
+        ssid: { type: string, minLength: 1, maxLength: 32 }
+        password: { type: string, minLength: 8, maxLength: 63 }
+    WifiScanResults:
+      type: object
+      required: [scanned_ts, networks]
+      properties:
+        scanned_ts: { type: [integer, 'null'], description: Null before the first scan. }
+        networks: { type: array, items: { $ref: '#/components/schemas/WifiScanEntry' } }
+    WifiScanEntry:
+      type: object
+      description: One network name. When several access points share it, the strongest is shown.
+      required: [ssid, signal_dbm, security, frequency_mhz, saved]
+      properties:
+        ssid: { type: string }
+        signal_dbm: { type: integer }
+        security: { $ref: '#/components/schemas/WifiSecurity' }
+        frequency_mhz: { type: integer, example: 2437 }
+        saved: { type: boolean }
+    WifiNetworkInput:
+      type: object
+      additionalProperties: false
+      required: [ssid, password]
+      properties:
+        ssid: { type: string, minLength: 1, maxLength: 32 }
+        password:
+          type: [string, 'null']
+          minLength: 8
+          maxLength: 63
+          description: Null for an open network. Kept in the keystore, never returned.
+        hidden: { type: boolean, default: false, description: The network does not broadcast its name; probe for it by name. }
+    WifiNetworkPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        password: { type: [string, 'null'], minLength: 8, maxLength: 63, description: Null makes it an open network. }
+        auto_connect: { type: boolean }
+
+    # ── radio ──
+    RadioBand:
+      type: object
+      required: [id, module, range, min_hz, max_hz, config, used_by, last_rssi]
+      properties:
+        id: { $ref: '#/components/schemas/BandId' }
+        module: { $ref: '#/components/schemas/ModuleIndex' }
+        range: { type: string, enum: [sub_ghz, 2g4] }
+        min_hz: { type: integer, example: 389500000 }
+        max_hz: { type: integer, example: 1020000000 }
+        config: { $ref: '#/components/schemas/RadioConfig' }
+        used_by: { type: array, items: { type: string }, description: 'What rides on this band, e.g. ["mesh", "vpn", "ptt"].' }
+        last_rssi: { type: [integer, 'null'] }
+        interface: { type: string, example: rf09_b }
+        state: { type: [string, 'null'], description: 'The driver''s transceiver state (idle, rx, tx…), or `emulated`.' }
+        ranges_hz: { type: array, items: { type: array, items: { type: integer }, minItems: 2, maxItems: 2 }, description: 'The tunable ranges (the sub-GHz transceiver has two: 389.5–510 and 779–1020 MHz); the channel centre must fall in one.' }
+        capabilities:
+          type: array
+          items: { type: string, enum: [fcs, cca, frontend, fsk, qpsk, 'off', acceleration, antenna, bandwidth_filter] }
+          description: 'Optional settings this hub can change on this band. acceleration, antenna and bandwidth_filter belong to commd and are not offered yet.'
+        pending_switch:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [at_ts_ms, switched, config]
+              properties:
+                at_ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+                switched: { type: boolean, description: Switched and waiting (up to 60 s) to hear a node; it goes back if none is heard. }
+                config: { $ref: '#/components/schemas/RadioConfig' }
+    RadioConfig:
+      type: object
+      additionalProperties: false
+      required: [frequency_hz, channel_spacing_hz, channel, modulation, tx_power]
+      properties:
+        frequency_hz: { type: integer, minimum: 1, example: 869535000 }
+        channel_spacing_hz: { type: integer, minimum: 1, example: 200000 }
+        channel: { type: integer, minimum: 0, maximum: 65535 }
+        modulation: { $ref: '#/components/schemas/Modulation' }
+        tx_power: { type: integer, minimum: 0, maximum: 31, description: RF215 TX power register value. }
+        fcs: { type: boolean, description: 'The chip appends a frame check sequence (changes the interface MTU; the mesh runs without it). Left out: unchanged.' }
+        cca:
+          type: object
+          additionalProperties: false
+          description: Listen before talk. Left out, unchanged.
+          required: [enabled, threshold_dbm, listen_us, retries, backoff_us]
+          properties:
+            enabled: { type: boolean }
+            threshold_dbm: { type: integer, minimum: -127, maximum: 4 }
+            listen_us: { type: integer, minimum: 0, maximum: 8064, description: 0 lets the driver use the modulation's own. }
+            retries: { type: integer, minimum: 0, maximum: 255 }
+            backoff_us: { type: integer, minimum: 0, maximum: 2000 }
+        frontend:
+          type: object
+          additionalProperties: false
+          description: Receiver front end. Left out, unchanged.
+          required: [agc_map, agc_target, lna_bypass]
+          properties:
+            agc_map: { type: integer, minimum: 0, maximum: 2 }
+            agc_target: { type: integer, minimum: 0, maximum: 7 }
+            lna_bypass: { type: boolean }
+    Modulation:
+      oneOf:
+        - $ref: '#/components/schemas/ModulationOff'
+        - $ref: '#/components/schemas/ModulationOfdm'
+        - $ref: '#/components/schemas/ModulationQpsk'
+        - $ref: '#/components/schemas/ModulationFsk'
+      discriminator:
+        propertyName: kind
+        mapping:
+          'off': '#/components/schemas/ModulationOff'
+          ofdm: '#/components/schemas/ModulationOfdm'
+          qpsk: '#/components/schemas/ModulationQpsk'
+          fsk: '#/components/schemas/ModulationFsk'
+    ModulationOff:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind: { type: string, const: 'off' }
+    ModulationFsk:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      description: Fields left out keep their value.
+      properties:
+        kind: { type: string, const: fsk }
+        symbol_rate_khz: { type: integer, enum: [50, 100, 150, 200, 300, 400] }
+        modulation_index: { type: number, enum: [0.375, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0] }
+        order: { type: integer, enum: [2, 4] }
+        bt: { type: number, enum: [0.5, 1.0, 1.5, 2.0] }
+        fec: { type: boolean }
+        whitening: { type: boolean }
+        preamble: { type: integer, minimum: 1, maximum: 1023 }
+    ModulationOfdm:
+      type: object
+      additionalProperties: false
+      required: [kind, mcs, option]
+      properties:
+        kind: { type: string, const: ofdm }
+        mcs: { type: integer, minimum: 0, maximum: 6, description: 'MCS0 (BPSK 1/2 ×4) .. MCS6 (16-QAM 3/4).' }
+        option: { type: integer, enum: [1, 2, 3, 4], description: OFDM bandwidth option. }
+    ModulationQpsk:
+      type: object
+      additionalProperties: false
+      required: [kind, chip_rate_khz, rate_mode]
+      properties:
+        kind: { type: string, const: qpsk }
+        chip_rate_khz: { type: integer, enum: [100, 200, 1000, 2000] }
+        rate_mode: { type: integer, enum: [0, 1, 2, 3, 4] }
+    RadioBandStats:
+      type: object
+      description: >-
+        What one band did since the hub started. Rates and airtime cover the last
+        sample interval (2 s). Packets are Reticulum packets; a packet goes on the
+        air as one to three LDPC-coded frames.
+      required: [band, interface, rx_frames, rx_packets, rx_bytes, rx_bps, rx_decode_errors, tx_frames, tx_packets, tx_bytes, tx_bps, tx_errors, airtime, last_rssi, noise_dbm, driver]
+      properties:
+        band: { $ref: '#/components/schemas/BandId' }
+        interface: { type: string, example: rf09_b, description: The radio's network interface. }
+        rx_frames: { type: integer }
+        rx_packets: { type: integer }
+        rx_bytes: { type: integer, description: 'Bytes of received packets, before coding: a frame''s `len` (bytes on the air) is larger.' }
+        rx_bps: { type: integer, description: Bits per second of received packets. }
+        rx_decode_errors: { type: integer, description: Frames that arrived but could not be decoded or reassembled. }
+        tx_frames: { type: integer }
+        tx_packets: { type: integer }
+        tx_bytes: { type: integer }
+        tx_bps: { type: integer }
+        tx_errors: { type: integer, description: Packets that could not be encoded or handed to the driver. }
+        airtime:
+          type: object
+          description: Share of the last interval this node's radio spent sending or receiving frames, estimated from frame sizes and the modulation's bit rate.
+          required: [rx_pct, tx_pct]
+          properties:
+            rx_pct: { type: number }
+            tx_pct: { type: number }
+        last_rssi: { type: [integer, 'null'] }
+        noise_dbm: { type: [integer, 'null'], description: The driver's energy detection on the channel, read each interval. }
+        driver:
+          type: object
+          description: The interface's own counters (Linux netdev statistics).
+          required: [rx_errors, rx_dropped, tx_errors, tx_dropped]
+          properties:
+            rx_errors: { type: integer }
+            rx_dropped: { type: integer }
+            tx_errors: { type: integer }
+            tx_dropped: { type: integer }
+    RadioFrame:
+      type: object
+      description: >-
+        One frame seen on the air, with what it carried when that is known.
+        Metadata only; payload bytes are never exposed.
+      required: [seq, ts_ms, band, direction, rssi, len, frequency_hz, bandwidth_hz, duration_ms, kind, hops, destination, destination_type, packet_len, peer_id, peer_codename]
+      properties:
+        seq: { type: integer, description: 'Numbers frames in the order the hub recorded them, from 1 at each start. Tells a frame from the live feed already loaded with `GET /radio/frames`.' }
+        ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+        band: { $ref: '#/components/schemas/BandId' }
+        direction: { type: string, enum: [rx, tx] }
+        rssi: { type: [integer, 'null'], description: dBm; null for sent frames. }
+        len: { type: integer, description: Bytes on the air. }
+        frequency_hz: { type: integer, description: Centre frequency. }
+        bandwidth_hz: { type: integer, description: Occupied bandwidth. }
+        duration_ms: { type: number, description: Time on air (estimated from the bit rate). }
+        kind:
+          type: string
+          enum: [announce, data, link_request, proof, segment, corrupt]
+          description: >-
+            The Reticulum packet the frame completed (`announce`, `data`,
+            `link_request`, `proof`); `segment` for a frame that is part of a
+            packet not yet complete; `corrupt` for a received frame that could
+            not be decoded.
+        hops: { type: [integer, 'null'], description: The packet's hop count. }
+        destination: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: The packet's destination hash (a link id for link traffic). }
+        destination_type: { type: [string, 'null'], enum: [single, group, plain, link, null] }
+        packet_len: { type: [integer, 'null'], description: Bytes of the whole packet. }
+        peer_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: 'The node the destination belongs to, when known: for an announce, its sender.' }
+        peer_codename: { type: [string, 'null'] }
+    TddState:
+      type: object
+      required: [enabled, period_ms, guard_ms, modules]
+      properties:
+        enabled: { type: boolean }
+        period_ms: { type: integer }
+        guard_ms: { type: integer }
+        modules:
+          type: array
+          items:
+            type: object
+            required: [module, mode]
+            properties:
+              module: { $ref: '#/components/schemas/ModuleIndex' }
+              mode: { type: string, enum: ['off', joining, alone, synced] }
+              node_id: { type: integer }
+              neighbours: { type: integer }
+              slot_ms: { type: integer }
+              weight: { type: integer }
+              held: { type: integer }
+              slot_used_ms: { type: integer }
+              pulses_sent: { type: integer }
+              pulses_heard: { type: integer }
+              error: { type: [string, 'null'] }
+
+    # ── bearers ──
+    BearerId:
+      type: string
+      enum: [radio, lan, internet]
+    Bearer:
+      type: object
+      required: [id, enabled, state, cost, counters]
+      properties:
+        id: { $ref: '#/components/schemas/BearerId' }
+        enabled: { type: boolean }
+        state: { type: string, enum: [up, down, disabled, error] }
+        detail: { type: [string, 'null'] }
+        cost: { type: integer, minimum: 0, maximum: 255, description: Higher = avoided when another path exists. }
+        config: { $ref: '#/components/schemas/BearerConfig' }
+        counters:
+          type: object
+          required: [tx_packets, rx_packets, tx_bytes, rx_bytes, errors]
+          properties:
+            tx_packets: { type: integer }
+            rx_packets: { type: integer }
+            tx_bytes: { type: integer }
+            rx_bytes: { type: integer }
+            errors: { type: integer }
+    BearerConfig:
+      oneOf:
+        - type: object
+          title: RadioBearerConfig
+          required: [bands, profile]
+          properties:
+            bands: { type: array, items: { $ref: '#/components/schemas/BandId' }, minItems: 1 }
+            profile: { type: string, enum: [robust, bulk], default: bulk }
+            dispatch: { type: string, enum: [round_robin, least_queued, diversity], description: Only with two bands. }
+        - type: object
+          title: LanBearerConfig
+          required: [interfaces]
+          properties:
+            interfaces: { type: array, items: { type: string }, example: [br0, wlan0] }
+            port: { type: integer, default: 4242 }
+        - type: object
+          title: InternetBearerConfig
+          required: [endpoints]
+          properties:
+            endpoints: { type: array, items: { type: string, description: 'host:port' } }
+    BearerPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        enabled: { type: boolean }
+        cost: { type: integer, minimum: 0, maximum: 255 }
+        config: { $ref: '#/components/schemas/BearerConfig' }
+
+    # ── mesh ──
+    MeshState:
+      type: object
+      required: [identity_hash, destination_hash, announce_interval_secs, transfer, fec]
+      properties:
+        identity_hash: { $ref: '#/components/schemas/Hash' }
+        destination_hash: { $ref: '#/components/schemas/Hash' }
+        announce_interval_secs: { type: integer, minimum: 30, maximum: 600 }
+        transfer:
+          type: object
+          required: [chunk_gap_ms, bulk_parity]
+          properties:
+            chunk_gap_ms: { type: integer, minimum: 0, maximum: 500 }
+            bulk_parity: { type: integer, minimum: 0, maximum: 8 }
+        fec:
+          type: object
+          required: [default_class, counters]
+          properties:
+            default_class: { $ref: '#/components/schemas/FecClass' }
+            counters:
+              type: object
+              properties:
+                verified_fast: { type: integer }
+                decoded_full: { type: integer }
+                failed: { type: integer }
+                header_failed: { type: integer }
+    MeshSettingsPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        announce_interval_secs: { type: integer, minimum: 30, maximum: 600 }
+        chunk_gap_ms: { type: integer, minimum: 0, maximum: 500 }
+        bulk_parity: { type: integer, minimum: 0, maximum: 8 }
+        fec_default_class: { $ref: '#/components/schemas/FecClass' }
+    FecClass:
+      type: string
+      enum: [robust, auto, fast, fastest, tm2048, tm1536, tm1280, tc512, none]
+    MeshPacket:
+      type: object
+      description: |
+        One mesh packet this device knows about. `data`: sent by this device or
+        addressed to it. `announce`: a node's announce reaching it. `relayed`:
+        forwarded by it. `overheard`: between two other devices. A null end is
+        this device.
+      required: [ts_ms, kind, from_id, to_id, bytes]
+      properties:
+        ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+        kind: { type: string, enum: [data, announce, relayed, overheard] }
+        from_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }] }
+        to_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }] }
+        bytes: { type: integer }
+
+    # ── trust ──
+    TrustState:
+      type: object
+      required: [role, provisioned, admin_id, allowlist_seq, allowlist_size]
+      properties:
+        role:
+          type: string
+          enum: [admin, member]
+          description: An admin device holds the root key; a member is certified by one.
+        provisioned: { type: boolean, description: 'Always true for an admin. A member is provisioned once an admin has certified it.' }
+        admin_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: 'The admin identity this device trusts; its own for an admin.' }
+        allowlist_seq: { type: [integer, 'null'], description: Version of the allowlist held; null before provisioning. }
+        allowlist_size: { type: integer }
+    Allowlist:
+      type: object
+      required: [seq, nodes]
+      properties:
+        seq: { type: integer }
+        nodes: { type: array, items: { $ref: '#/components/schemas/Hash' } }
+
+    # ── peers ──
+    NodeList:
+      type: string
+      enum: [whitelist, blacklist, none]
+      description: |
+        Which list a node is on, from the admin's signed list: the same on
+        every node of the network. `whitelist` is the allowlist; the Kaonic
+        Admin is always `whitelist` (with `trust.is_admin`). A blacklisted
+        node is blocked by the admin and refused everywhere even with a valid
+        certificate. `none` is a node seen but not decided about.
+    PeerTrust:
+      type: object
+      required: [network, is_admin, provisioning]
+      properties:
+        network:
+          type: string
+          enum: [ours, other, unprovisioned, unknown]
+          description: |
+            `ours`: certified by our admin (seen in its authenticated link, or on
+            our allowlist). `other`: its announce or certificate names another
+            admin. `unprovisioned`: it announces that it waits for an admin.
+            `unknown`: nothing proven yet.
+        is_admin: { type: boolean, description: This node is our admin. }
+        provisioning:
+          description: Set on the admin device while it provisions this node, or when that failed.
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [state, detail, updated_ts]
+              properties:
+                state: { type: string, enum: [running, failed] }
+                detail: { type: string }
+                updated_ts: { $ref: '#/components/schemas/Timestamp' }
+    PeerLink:
+      type: object
+      required: [state, rtt_ms, detail]
+      properties:
+        state:
+          type: string
+          enum: [none, pending, active, refused]
+          description: '`active` means both sides proved their certificates (AUTH); `refused` means the last attempt failed it.'
+        rtt_ms: { type: [integer, 'null'] }
+        detail: { type: [string, 'null'], description: Why the last link was refused or dropped. }
+    Peer:
+      type: object
+      required: [id, codename, tag, version, online, first_seen_ts, last_seen_ts, hops, via_id, rssi, bearer, list, trust, link, tunnel_ip]
+      properties:
+        id: { $ref: '#/components/schemas/Hash' }
+        codename: { type: string, description: From the announce. }
+        tag: { type: string, description: Local note. }
+        version: { type: string, description: Hub version from the announce. }
+        online: { type: boolean }
+        first_seen_ts: { $ref: '#/components/schemas/Timestamp' }
+        last_seen_ts: { $ref: '#/components/schemas/Timestamp' }
+        hops: { type: [integer, 'null'] }
+        via_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: 'The neighbour it is reached through, when more than one hop away and known.' }
+        rssi: { type: [integer, 'null'] }
+        bearer: { oneOf: [{ $ref: '#/components/schemas/BearerId' }, { type: 'null' }] }
+        list: { $ref: '#/components/schemas/NodeList' }
+        trust: { $ref: '#/components/schemas/PeerTrust' }
+        link: { $ref: '#/components/schemas/PeerLink' }
+        tunnel_ip: { type: [string, 'null'] }
+
+    # ── remote ──
+    RemoteJobsInput:
+      oneOf:
+        - type: object
+          title: NodeUpdate
+          additionalProperties: false
+          required: [kind, node_ids]
+          properties:
+            kind: { type: string, const: node_update }
+            node_ids: { $ref: '#/components/schemas/NodeIds' }
+        - type: object
+          title: NodeRestart
+          additionalProperties: false
+          required: [kind, node_ids]
+          properties:
+            kind: { type: string, const: node_restart }
+            node_ids: { $ref: '#/components/schemas/NodeIds' }
+        - type: object
+          title: NodeRadio
+          additionalProperties: false
+          required: [kind, node_ids, band, config]
+          properties:
+            kind: { type: string, const: node_radio }
+            node_ids: { $ref: '#/components/schemas/NodeIds' }
+            band: { $ref: '#/components/schemas/BandId' }
+            config: { $ref: '#/components/schemas/RadioConfig' }
+        - type: object
+          title: NodePtt
+          additionalProperties: false
+          required: [kind, node_ids, settings]
+          properties:
+            kind: { type: string, const: node_ptt }
+            node_ids: { $ref: '#/components/schemas/NodeIds' }
+            settings: { $ref: '#/components/schemas/PttSettingsPatch' }
+      discriminator:
+        propertyName: kind
+    NodeIds:
+      type: array
+      minItems: 1
+      maxItems: 256
+      uniqueItems: true
+      items: { $ref: '#/components/schemas/Hash' }
+    RemoteDevice:
+      type: object
+      required: [id, codename, serial, version, uptime_secs, battery, bands]
+      properties:
+        id: { $ref: '#/components/schemas/Hash' }
+        codename: { type: string }
+        serial: { type: string }
+        version: { type: string, description: The node's hub version. }
+        os_version: { type: string }
+        uptime_secs: { type: integer }
+        battery: { oneOf: [{ $ref: '#/components/schemas/Battery' }, { type: 'null' }] }
+        bands: { type: array, items: { $ref: '#/components/schemas/RadioBand' } }
+        metrics: { oneOf: [{ $ref: '#/components/schemas/SystemMetrics' }, { type: 'null' }] }
+        ptt: { oneOf: [{ $ref: '#/components/schemas/PttSettings' }, { type: 'null' }], description: Null where talk does not run. }
+    RemotePlugin:
+      type: object
+      required: [id, name, version, running]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        version: { type: string }
+        running: { type: boolean }
+
+    # ── links ──
+    Link:
+      type: object
+      required: [peer_id, link_id, initiator, state, peer_role, bearer, established_ts, streams, counters]
+      properties:
+        peer_id: { $ref: '#/components/schemas/Hash' }
+        link_id: { $ref: '#/components/schemas/Hash' }
+        initiator: { type: string, enum: [local, remote] }
+        state: { type: string, enum: [pending, authenticating, active, stale, closing] }
+        peer_role: { type: [string, 'null'], enum: [admin, node, null], description: What AUTH proved the peer to be. }
+        bearer: { $ref: '#/components/schemas/BearerId' }
+        rtt_ms: { type: [integer, 'null'] }
+        mdu: { type: integer, description: Largest mux payload per link packet. }
+        established_ts: { $ref: '#/components/schemas/Timestamp' }
+        last_rx_ts: { $ref: '#/components/schemas/Timestamp' }
+        leases: { type: array, items: { type: string }, description: 'Who keeps the link open, e.g. ["vpn", "ui-session"].' }
+        counters:
+          type: object
+          properties:
+            tx_packets: { type: integer }
+            rx_packets: { type: integer }
+            tx_bytes: { type: integer }
+            rx_bytes: { type: integer }
+            frames_per_packet: { type: number, description: Average mux frames bundled per link packet. }
+            keepalives: { type: integer }
+        streams: { type: array, items: { $ref: '#/components/schemas/Stream' } }
+    Stream:
+      type: object
+      required: [id, name, class, mode, owner]
+      properties:
+        id: { type: integer }
+        name: { type: string, example: vpn }
+        class: { type: string, enum: [control, realtime, interactive, bulk] }
+        mode: { type: string, enum: [datagram, lossy_arq, reliable, bulk, media] }
+        owner: { type: string, description: '"hub" or plugin id.' }
+        queued: { type: integer }
+        tx_bytes: { type: integer }
+        rx_bytes: { type: integer }
+        retransmits: { type: integer }
+        drops: { type: integer }
+
+    # ── vpn ──
+    VpnState:
+      type: object
+      required: [enabled, status, network, routes, access, uplink, gateway, counters, peers]
+      properties:
+        enabled: { type: boolean, description: 'On by default (the hub''s --no-vpn turns it off).' }
+        status: { type: string, enum: [running, stopped, error] }
+        interface: { type: [string, 'null'] }
+        network: { oneOf: [{ $ref: '#/components/schemas/Ipv4Cidr' }, { type: 'null' }], description: The tunnel network; null until the VPN is configured. }
+        tunnel_ip: { type: [string, 'null'] }
+        routes: { $ref: '#/components/schemas/VpnRoutes' }
+        access: { $ref: '#/components/schemas/VpnAccess' }
+        uplink: { $ref: '#/components/schemas/VpnUplink' }
+        gateway: { $ref: '#/components/schemas/VpnGateway' }
+        counters: { $ref: '#/components/schemas/TrafficCounters' }
+        peers: { type: array, items: { $ref: '#/components/schemas/VpnPeer' } }
+        last_error: { type: [string, 'null'] }
+        settings: { $ref: '#/components/schemas/VpnShareSettings' }
+        forward: { $ref: '#/components/schemas/VpnForward', description: As GET /vpn/forward (present while the VPN runs). }
+    VpnShareSettings:
+      type: object
+      description: >-
+        Sharing with end clients (phones and laptops on the hotspot, LAN and USB). Client networks
+        are advertised automatically. Every Kaonic ships the same LAN, so each node takes a /24
+        of the pool, picked by its identity, and serves that to its clients by DHCP
+        (`route_lans`): a client's address is the same to every node and client of the mesh.
+      required: [share_lans, lan_interfaces, map_lans, route_lans, mapping_pool, push_routes, lan_router, dns_servers, advertise, gateway, uplink]
+      properties:
+        share_lans: { type: boolean, description: Advertise the client networks (default true). }
+        lan_interfaces: { type: array, items: { type: string }, description: 'Default ["br0", "usb0"].' }
+        route_lans:
+          type: boolean
+          description: >-
+            Default true (needs `push_routes`). The node puts `.1` of its own /24 of the pool on
+            each client interface, next to the address the interface came with (192.168.10.1,
+            which stays for setup and the UI), and DHCP hands out addresses of that /24: clients
+            are reached across the mesh at the address they have, with no translation, so what
+            an application tells its peers about its own address is true. Clients still holding
+            an address of the shipped network reach the mesh from behind the node (masqueraded)
+            and are not reached from it. When another node turns out to have picked the same /24,
+            the node with the higher identity moves to its next pick and its clients are given
+            new addresses at their next renewal (within 5 minutes).
+        map_lans:
+          type: boolean
+          description: >-
+            Default true. Client networks not served as above (`route_lans` off, or a second
+            network on the interface) are mapped 1:1 (iptables NETMAP) into a /24 of the pool:
+            clients keep their addresses, other nodes see the mapped ones.
+        mapping_pool: { $ref: '#/components/schemas/Ipv4Cidr', description: 'Default 10.78.0.0/16.' }
+        push_routes:
+          type: boolean
+          description: >-
+            Default true, like the gateway's push-routes: dnsmasq serves DHCP on the client
+            networks (networkd's DHCP server off there) and hands clients classless static routes
+            (option 121, and 249 for old Windows) for the tunnel network, the mapping pool, other
+            nodes' advertised networks and the uplink's destinations, through this node; leases of
+            10 minutes. Linux, macOS, iOS and Windows (249) apply them; Android has no option 121
+            and is given the node as router instead (see lan_router).
+        lan_router:
+          type: string
+          enum: [auto, always, never]
+          description: >-
+            Make this node the clients' router (option 3, a default route in option 121) and give
+            DNS: `auto` only while it can forward somewhere (a gateway, or an uplink taking
+            everything), so a laptop keeps the internet of its own Wi-Fi; Android's DHCP client
+            (vendor class `android-dhcp-…`), which cannot take routes, is given the router option
+            (no DNS) in any case, which on Android is a default route for that network only.
+            `always`: everybody; `never`: nobody, Android included.
+        dns_servers: { type: array, items: { type: string }, description: 'Given to DHCP clients with the router. Default 1.1.1.1, 8.8.8.8.' }
+        advertise: { type: array, items: { $ref: '#/components/schemas/Ipv4Cidr' }, description: Extra prefixes advertised as they are (PUT /vpn/routes). }
+        gateway: { type: object, description: As PUT /vpn/gateway takes it. }
+        uplink: { type: object, description: As PUT /vpn/uplink takes it. }
+    VpnForwardRuleInput:
+      type: object
+      description: >-
+        One forwarding rule: UDP datagrams to `address`, ports `port` to `port_end`, between the
+        client networks of the nodes. Only `name` and `address` are required. A rule over a
+        range of groups or over more than 16 ports is a wide one: it never carries the LAN's
+        control chatter (224.0.0.0/24 with mDNS and LLMNR, SSDP 239.255.255.250, NetBIOS
+        broadcast ports 137 and 138), which only a rule naming that group or port does.
+      additionalProperties: false
+      required: [name, address]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 32, pattern: '^[A-Za-z0-9 _.-]+$', description: Unique among the rules; the counters are kept under it. }
+        enabled: { type: boolean, default: true }
+        address:
+          type: string
+          description: >-
+            A multicast group (224.0.0.0 to 239.255.255.255), a range of groups as a prefix
+            (`239.0.0.0/8`, `224.0.0.0/4` for all of them), or `255.255.255.255` for the LAN's
+            broadcast (the limited broadcast, re-emitted as it is, and the subnet's own broadcast
+            address, re-emitted to the far subnet's). DHCP (ports 67 and 68) is never carried.
+            Shown as a plain address for one group, as a prefix for a range.
+        port: { type: integer, minimum: 1, maximum: 65535, description: 'Omitted (with `port_end`): every port, shown as 1 to 65535.' }
+        port_end: { type: integer, minimum: 1, maximum: 65535, description: 'Last port of a range. Default: `port`.' }
+        direction:
+          type: string
+          enum: [both, to_mesh, from_mesh, block]
+          default: both
+          description: >-
+            `to_mesh`: only send what the LAN says; `from_mesh`: only re-emit what other nodes
+            send; `block`: neither, and no later rule gets to carry what this one names (an
+            exception to a wide rule after it).
+        interfaces: { type: array, maxItems: 8, items: { type: string }, default: [], description: 'The client interfaces served. Empty: the VPN''s `lan_interfaces` (br0, usb0).' }
+        rate: { type: integer, minimum: 1, maximum: 50, default: 5, description: 'Datagrams per second from the LAN to the mesh, for each sender and destination (group or broadcast, and port). All rules together stay under `node_budget`.' }
+        burst: { type: integer, minimum: 1, maximum: 100, default: 10 }
+        max_bytes: { type: integer, minimum: 1, maximum: 2048, default: 1472, description: Larger datagrams are dropped. Above about 760 bytes a datagram takes more than one radio packet. }
+        dedup_secs: { type: integer, minimum: 1, maximum: 60, default: 5, description: The same datagram (same content, group and port) within this time is forwarded once, in either direction. }
+        ttl: { type: integer, minimum: 1, maximum: 16, default: 1, description: TTL of the datagrams re-emitted on the LAN. }
+        keep_source:
+          type: boolean
+          default: true
+          description: >-
+            Re-emit a datagram with its sender's own address and port as source (a raw socket),
+            where the mesh routes to that address (`route_lans`; the mapped address otherwise).
+            Off, or where that is not possible: from this node's address on the LAN.
+    VpnForwardRule:
+      allOf:
+        - $ref: '#/components/schemas/VpnForwardRuleInput'
+        - type: object
+          required: [enabled, port, port_end, direction, interfaces, rate, burst, max_bytes, dedup_secs, ttl, keep_source, counters, lan]
+          properties:
+            counters:
+              type: object
+              required: [to_mesh_packets, to_mesh_bytes, from_mesh_packets, from_mesh_bytes, dropped]
+              properties:
+                to_mesh_packets: { type: integer, description: LAN datagrams sent to the other nodes. }
+                to_mesh_bytes: { type: integer }
+                from_mesh_packets: { type: integer, description: Datagrams from other nodes re-emitted on the LAN. }
+                from_mesh_bytes: { type: integer }
+                dropped:
+                  type: object
+                  properties:
+                    rate_limited: { type: integer, description: Over the rule's rate. }
+                    duplicate: { type: integer, description: Seen already within dedup_secs. }
+                    too_large: { type: integer }
+                    looped: { type: integer, description: From one of this node's own addresses. }
+                    foreign_source: { type: integer, description: 'From an address that is not on the interface''s networks: among them what another node on the same LAN re-emitted for a sender behind it.' }
+                    not_sent: { type: integer, description: 'Passed the rule, refused by the VPN: no node linked, or the node''s budget.' }
+                    emit_error: { type: integer, description: Could not be sent on the LAN. }
+                last_to_mesh_ts: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+                last_from_mesh_ts: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+            lan:
+              type: array
+              description: How the rule stands on each interface it serves (empty while the VPN is not running).
+              items:
+                type: object
+                required: [interface, state]
+                properties:
+                  interface: { type: string }
+                  state: { type: string, enum: [ready, waiting, error], description: '`waiting`: no such interface yet (tried again every 5 s).' }
+                  detail: { type: [string, 'null'] }
+    VpnForward:
+      type: object
+      required: [active, rules, presets, limits]
+      properties:
+        active: { type: boolean, description: False while the VPN is not running (the rules are stored and apply when it starts). }
+        rules: { type: array, items: { $ref: '#/components/schemas/VpnForwardRule' } }
+        presets:
+          type: array
+          description: 'Rule sets offered ready made: `default` (everything, what a node has until rules are stored) and `atak` (ATAK''s two groups only). Nothing uses them until they are sent with PUT.'
+          items:
+            type: object
+            required: [id, title, description, rules]
+            properties:
+              id: { type: string, example: atak }
+              title: { type: string }
+              description: { type: string }
+              rules: { type: array, items: { $ref: '#/components/schemas/VpnForwardRuleInput' } }
+        limits: { type: object, additionalProperties: { type: integer }, description: 'The bounds the rules are checked against (max_rules, max_ports, max_bytes, max_rate, …).' }
+        node_budget:
+          type: [object, 'null']
+          description: >-
+            Tunnel packets per second (and burst) that all rules together may send to the mesh;
+            each goes to every linked node. The most a node's clients can make it send, however
+            many applications and senders there are.
+          properties:
+            rate: { type: integer }
+            burst: { type: integer }
+    VpnRoutes:
+      type: object
+      required: [advertised, local_mappings, remote]
+      properties:
+        advertised: { type: array, items: { $ref: '#/components/schemas/Ipv4Cidr' } }
+        local_mappings:
+          type: array
+          items:
+            type: object
+            required: [subnet, mapped_subnet]
+            properties:
+              subnet: { type: string, description: The client network as its clients know it. }
+              mapped_subnet: { type: string, description: What other nodes see (equal to subnet when not mapped). }
+              interface: { type: string }
+              address: { type: [string, 'null'], description: This node's address on it (the clients' next hop). }
+              setup_subnet: { type: [string, 'null'], description: 'With `route_lans`: the network the interface came with (192.168.10.0/24), kept for setup next to `subnet`, the node''s own.' }
+        remote:
+          type: array
+          items:
+            type: object
+            required: [network, peer_id, status, installed, last_seen_ts]
+            properties:
+              network: { $ref: '#/components/schemas/Ipv4Cidr' }
+              peer_id: { $ref: '#/components/schemas/Hash' }
+              status: { type: string, enum: [active, conflict, refused], description: '`conflict`: two peers advertise overlapping prefixes (both refused). `refused`: not accepted from this peer (see reason).' }
+              reason: { type: [string, 'null'], description: Why it is refused. }
+              installed: { type: boolean }
+              last_seen_ts: { $ref: '#/components/schemas/Timestamp' }
+    VpnAccess:
+      type: object
+      additionalProperties: false
+      required: [allow_all_peers, peers]
+      properties:
+        allow_all_peers: { type: boolean, description: All whitelisted nodes. Never nodes off the whitelist. }
+        peers: { type: array, maxItems: 256, items: { $ref: '#/components/schemas/Hash' }, uniqueItems: true }
+    VpnUplink:
+      type: object
+      required: [enabled, active, routes, default_route]
+      properties:
+        enabled: { type: boolean }
+        active: { type: boolean }
+        peer_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }] }
+        routes: { type: array, items: { $ref: '#/components/schemas/Ipv4Cidr' } }
+        default_route: { type: boolean }
+        detail: { type: [string, 'null'] }
+        gateways:
+          type: array
+          description: Nodes offering to be a gateway, with the destinations they forward.
+          items:
+            type: object
+            required: [peer_id, codename, routes]
+            properties:
+              peer_id: { $ref: '#/components/schemas/Hash' }
+              codename: { type: string }
+              routes: { type: array, items: { $ref: '#/components/schemas/Ipv4Cidr' } }
+    VpnGateway:
+      type: object
+      required: [enabled, active, routes, available_interfaces]
+      properties:
+        enabled: { type: boolean }
+        active: { type: boolean }
+        egress_interface: { type: [string, 'null'] }
+        routes: { type: array, items: { $ref: '#/components/schemas/Ipv4Cidr' } }
+        available_interfaces: { type: array, items: { type: string } }
+        detail: { type: [string, 'null'] }
+    TrafficCounters:
+      type: object
+      required: [tx_packets, tx_bytes, tx_bps, rx_packets, rx_bytes, rx_bps, dropped]
+      properties:
+        tx_packets: { type: integer }
+        tx_bytes: { type: integer }
+        tx_bps: { type: integer }
+        rx_packets: { type: integer }
+        rx_bytes: { type: integer }
+        rx_bps: { type: integer }
+        dropped: { type: integer }
+        last_tx_ts: { $ref: '#/components/schemas/Timestamp' }
+        last_rx_ts: { $ref: '#/components/schemas/Timestamp' }
+    VpnPeer:
+      type: object
+      required: [peer_id, codename, tunnel_ip, state, is_gateway, routes, counters]
+      properties:
+        peer_id: { $ref: '#/components/schemas/Hash' }
+        codename: { type: string }
+        tag: { type: string }
+        tunnel_ip: { type: [string, 'null'] }
+        state: { type: string, enum: [discovered, pending, active, closed, error] }
+        is_gateway: { type: boolean }
+        routes: { type: array, items: { $ref: '#/components/schemas/Ipv4Cidr' } }
+        counters: { $ref: '#/components/schemas/TrafficCounters' }
+        arq:
+          type: object
+          properties:
+            resent: { type: integer }
+            fast_resent: { type: integer }
+            given_up: { type: integer }
+            duplicates: { type: integer }
+            rtt_ms: { type: integer }
+        last_error: { type: [string, 'null'] }
+    VpnCapture:
+      type: object
+      required: [running, started_ts_ms, stopped_ts_ms, snaplen, max_packets, max_secs, ring, packets, dropped, bytes]
+      properties:
+        running: { type: boolean }
+        started_ts_ms: { oneOf: [{ $ref: '#/components/schemas/TimestampMs' }, { type: 'null' }] }
+        stopped_ts_ms: { oneOf: [{ $ref: '#/components/schemas/TimestampMs' }, { type: 'null' }] }
+        snaplen: { type: integer }
+        max_packets: { type: integer }
+        max_secs: { type: integer }
+        ring: { type: boolean }
+        packets: { type: integer, description: Packets held now. }
+        dropped: { type: integer, description: Packets pushed out of the ring (or not taken once full). }
+        bytes: { type: integer, description: Original bytes of the packets held. }
+        first_seq: { type: [integer, 'null'] }
+        last_seq: { type: [integer, 'null'] }
+    VpnCapturedPacket:
+      type: object
+      required: [seq, ts_us, dir, peer_id, peer_codename, len, data, verdict]
+      properties:
+        seq: { type: integer, description: 'From 1 per capture; the "No." column.' }
+        ts_us: { type: integer, description: Unix microseconds in the hub's clock. }
+        dir: { type: string, enum: [tx, rx], description: 'tx: from this node''s side into the tunnel; rx: from a peer.' }
+        peer_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: 'For tx, the node it went to (null when it went to every node or nowhere); for rx, the node it came from (also for a broadcast, which has flood set).' }
+        peer_codename: { type: [string, 'null'] }
+        flood: { type: boolean, description: Sent to every node (broadcast/multicast). }
+        len: { type: integer, description: Original length. }
+        data: { type: string, format: byte, description: 'The IPv4 packet, base64, cut to snaplen.' }
+        verdict: { type: string, enum: [sent, delivered, dropped], description: What the hub did with it. }
+        reason: { type: [string, 'null'], description: 'Why it was dropped: not_ipv4, no_route, no_peers (a broadcast with no linked node), source_not_allowed, destination_not_allowed, rate_limited. Drops after packing (a full link, a dead link) are only in the counters.' }
+    VpnPacket:
+      type: object
+      required: [ts_ms, dir, src, dst, proto, len]
+      properties:
+        ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+        dir: { type: string, enum: [tx, rx] }
+        src: { type: string }
+        dst: { type: string }
+        proto: { type: string, example: TCP }
+        sport: { type: [integer, 'null'] }
+        dport: { type: [integer, 'null'] }
+        len: { type: integer }
+    SpeedTestResult:
+      type: object
+      required: [bytes, duration_ms, bps]
+      properties:
+        bytes: { type: integer }
+        duration_ms: { type: integer }
+        bps: { type: integer, description: Bits per second. }
+
+    # ── media ──
+    MediaChannelSpec:
+      type: object
+      additionalProperties: false
+      required: [stream, ingress, egress]
+      properties:
+        stream: { type: integer, minimum: 0, maximum: 255 }
+        ingress: { type: string, pattern: '^127\.0\.0\.1:\d{1,5}$', description: 'Loopback ip:port the app sends to.', example: '127.0.0.1:5000' }
+        egress: { type: string, pattern: '^127\.0\.0\.1:\d{1,5}$', description: 'Loopback ip:port received media is delivered to.', example: '127.0.0.1:5001' }
+        profile: { type: string, enum: [voice, video, custom], default: voice }
+        k: { type: integer, minimum: 1, description: Data shards per block (k + m ≤ 64). }
+        m: { type: integer, minimum: 0 }
+        block_timeout_ms: { type: integer, minimum: 5, maximum: 2000 }
+        latency_ms: { type: integer, minimum: 20, maximum: 5000 }
+        pack_ms: { type: integer, minimum: 0, maximum: 500 }
+    MediaChannel:
+      type: object
+      required: [peer_id, stream, ingress, egress, profile, k, m, datagrams_in, datagrams_out, dropped]
+      properties:
+        peer_id: { $ref: '#/components/schemas/Hash' }
+        stream: { type: integer }
+        ingress: { type: string }
+        egress: { type: string }
+        profile: { type: string }
+        k: { type: integer }
+        m: { type: integer }
+        datagrams_in: { type: integer }
+        datagrams_out: { type: integer }
+        dropped: { type: integer }
+    MediaStreamStats:
+      type: object
+      required: [peer_id, codename, stream, direction]
+      properties:
+        peer_id: { $ref: '#/components/schemas/Hash' }
+        codename: { type: string }
+        stream: { type: integer }
+        direction: { type: string, enum: [out, in] }
+        k: { type: integer }
+        m: { type: integer }
+        packets_sent: { type: integer }
+        parity_sent: { type: integer }
+        packets_received: { type: integer }
+        packets_recovered: { type: integer }
+        packets_lost: { type: integer }
+        shards_late: { type: integer }
+
+    # ── plugins / updates ──
+    Plugin:
+      type: object
+      required: [id, name, version, description, developer, official, running, enabled, removable, has_icon, app_url, channel, url, permissions, service, installed_ts, highest_version, previous_version]
+      properties:
+        id: { $ref: '#/components/schemas/PluginId' }
+        name: { type: string }
+        version: { type: string }
+        description: { type: string }
+        developer: { type: string }
+        official: { type: boolean, description: 'Signed by a Beechat release key, as the installer checked.' }
+        running: { type: boolean }
+        enabled: { type: boolean, description: Started at boot (turned on). }
+        removable: { type: boolean }
+        has_icon: { type: boolean }
+        app_url: { type: [string, 'null'], description: 'Its page, /apps/{id}/, if the manifest has `page = true` (a bool; it was a port); see openPlugin.' }
+        channel: { type: [string, 'null'], enum: [dev, experimental, unstable, stable, null] }
+        url: { type: [string, 'null'], description: The developer's page for it. }
+        permissions:
+          type: array
+          description: Extra rights it was installed with.
+          items: { type: string, enum: [audio, realtime, mesh, network, root] }
+        service: { type: string, description: 'Its systemd unit, kaonic-plugin-<id>.service.' }
+        installed_ts: { $ref: '#/components/schemas/Timestamp' }
+        highest_version: { type: string, description: The highest version ever installed; lower ones need allow_downgrade. }
+        previous_version: { type: [string, 'null'], description: The version a rollback goes back to. }
+    PluginPolicy:
+      type: object
+      required: [require_signed]
+      properties:
+        require_signed: { type: boolean, description: Refuse packages without a Beechat release signature. }
+        release_key: { type: boolean, description: 'GET only. False on a development device: no release key, so packages install unsigned and require_signed cannot be turned on.' }
+    Component:
+      type: object
+      required: [id, version]
+      properties:
+        id: { type: string, enum: [hub, commd, installer, factory, webui] }
+        version: { type: string }
+        unit: { type: [string, 'null'] }
+        updated_ts: { type: [integer, 'null'] }
+    SoftwareRelease:
+      type: object
+      required: [version, size_bytes]
+      properties:
+        version: { type: string }
+        size_bytes: { type: integer }
+    Updates:
+      type: object
+      required: [installed, release]
+      properties:
+        installed: { type: array, items: { $ref: '#/components/schemas/Component' } }
+        release:
+          description: The signed release this device holds and can send to other nodes; null if none.
+          oneOf: [{ $ref: '#/components/schemas/SoftwareRelease' }, { type: 'null' }]
+
+    # ── ptt ──
+    PttTalker:
+      type: object
+      required: [id, codename, is_admin, local, source]
+      properties:
+        id: { $ref: '#/components/schemas/Hash', description: 'The talker''s identity hash. Voice packets name only its first 4 bytes: for a talker not in the peer table, those 4 bytes followed by zeros.' }
+        codename: { type: string, description: Empty for a talker not in the peer table. }
+        is_admin: { type: boolean, description: A signed admin burst (has priority). }
+        local: { type: boolean, description: This device is talking. }
+        source: { type: [string, 'null'], enum: [device, browser, udp, squelch, test, null], description: 'Where local talk comes from (squelch: the device microphone keyed by sound, e.g. the hardware PTT button); null for a remote talker.' }
+    PttBurst:
+      type: object
+      required: [talker, started_ts_ms, duration_ms, frames, lost_frames, hops, ended]
+      properties:
+        talker: { $ref: '#/components/schemas/PttTalker' }
+        ended: { type: string, enum: [released, preempted, timeout], description: 'How it ended: the talker let go, the admin took the floor, or it went silent (500 ms).' }
+        started_ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+        duration_ms: { type: integer }
+        frames: { type: integer, description: '20 ms frames played; for our own bursts (`talker.local`), frames sent.' }
+        lost_frames: { type: integer, description: Frames concealed because they never arrived. }
+        hops: { type: [integer, 'null'], description: Fewest relays the burst came through; null for our own. }
+    PttSettings:
+      type: object
+      description: >-
+        Defaults (the kaonic-audio-ptt plugin's): volume and mic_gain null, devices `default`, talk_input device, play_on_device true, rx_while_tx false, auto_arm true, squelch on at -45 dBFS with 6 dB hysteresis, 600 ms hangover and 120 ms pre-roll, jitter 120/320 ms, Opus 20 kbps complexity 5 with DTX, no FEC, 0 % loss, VBR, packets of 4 frames growing to 8 with LDPC alignment, relay on, ttl 4, spectrum on with 14 bands.
+      required: [volume, mic_gain, capture_device, playback_device, talk_input, play_on_device, rx_while_tx, auto_arm, squelch_enabled, squelch_open_dbfs, squelch_hysteresis_db, squelch_hangover_ms, squelch_preroll_ms, jitter_target_ms, jitter_max_ms, opus_bitrate_bps, opus_complexity, opus_dtx, opus_fec, opus_packet_loss_pct, opus_cbr, packet_frames, packet_frames_max, packet_align_ldpc, relay, ttl, spectrum_enabled, spectrum_bands]
+      properties:
+        volume: { type: [integer, 'null'], minimum: 0, maximum: 100, description: 'Speaker volume, % of the sound card''s playback control; re-applied at start. null leaves the card as the system set it.' }
+        mic_gain: { type: [integer, 'null'], minimum: 0, maximum: 100, description: 'Microphone gain, % of the card''s Capture control, like volume.' }
+        capture_device: { type: string, maxLength: 64, example: default, description: 'ALSA capture device (see GET /ptt/devices).' }
+        playback_device: { type: string, maxLength: 64, example: default }
+        talk_input: { type: string, enum: [device, browser], description: 'What the Talk page button keys: this device''s microphone (POST /ptt/key) or the browser''s (the audio WebSocket). Default device.' }
+        play_on_device: { type: boolean, description: Play the group on this device's speaker. }
+        rx_while_tx: { type: boolean, description: 'Keep playing received audio on the device while it talks. Off: the device''s speaker and microphone have no echo canceller between them.' }
+        auto_arm: { type: boolean, description: 'Keep the device microphone armed so the squelch keys it. The Kaonic hardware PTT button only unmutes the microphone and is invisible to software: this is how it keys the radio.' }
+        squelch_enabled: { type: boolean, description: Key only while the device microphone hears sound (silence closes it). }
+        squelch_open_dbfs: { type: number, minimum: -90, maximum: 0, description: Frame level above which the squelch opens. }
+        squelch_hysteresis_db: { type: number, minimum: 0, maximum: 30, description: How far below the open level it must fall before closing. }
+        squelch_hangover_ms: { type: integer, minimum: 0, maximum: 5000, description: How long the level must stay low before the squelch closes. }
+        squelch_preroll_ms: { type: integer, minimum: 0, maximum: 1000, description: Audio kept while closed and sent on opening, so speech onset is not clipped. }
+        jitter_target_ms: { type: integer, minimum: 20, maximum: 1000, description: Playback queue the receiver settles at. }
+        jitter_max_ms: { type: integer, minimum: 20, maximum: 2000, description: 'Queue depth past which the receiver sheds audio; at least jitter_target_ms.' }
+        opus_bitrate_bps: { type: integer, minimum: 6000, maximum: 64000 }
+        opus_complexity: { type: integer, minimum: 0, maximum: 10 }
+        opus_dtx: { type: boolean }
+        opus_fec: { type: boolean }
+        opus_packet_loss_pct: { type: integer, minimum: 0, maximum: 100 }
+        opus_cbr: { type: boolean }
+        packet_frames: { type: integer, minimum: 1, maximum: 8, description: Frames a voice packet holds before it is sent (the latency floor). }
+        packet_frames_max: { type: integer, minimum: 1, maximum: 16, description: 'Frames a packet may grow to while they still fit the radio frame already paid for (packet_align_ldpc); at least packet_frames.' }
+        packet_align_ldpc: { type: boolean }
+        relay: { type: boolean, description: Re-send voice heard from others so it reaches further nodes. }
+        ttl: { type: integer, minimum: 1, maximum: 8, description: Relays a burst may cross. }
+        spectrum_enabled: { type: boolean, description: Show the live level animation on the Talk page. }
+        spectrum_bands: { type: integer, minimum: 4, maximum: 64 }
+    PttSettingsPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        volume: { type: [integer, 'null'], minimum: 0, maximum: 100 }
+        mic_gain: { type: [integer, 'null'], minimum: 0, maximum: 100 }
+        capture_device: { type: string, maxLength: 64, example: default }
+        playback_device: { type: string, maxLength: 64, example: default }
+        talk_input: { type: string, enum: [device, browser] }
+        play_on_device: { type: boolean }
+        rx_while_tx: { type: boolean }
+        auto_arm: { type: boolean }
+        squelch_enabled: { type: boolean }
+        squelch_open_dbfs: { type: number, minimum: -90, maximum: 0 }
+        squelch_hysteresis_db: { type: number, minimum: 0, maximum: 30 }
+        squelch_hangover_ms: { type: integer, minimum: 0, maximum: 5000 }
+        squelch_preroll_ms: { type: integer, minimum: 0, maximum: 1000 }
+        jitter_target_ms: { type: integer, minimum: 20, maximum: 1000 }
+        jitter_max_ms: { type: integer, minimum: 20, maximum: 2000 }
+        opus_bitrate_bps: { type: integer, minimum: 6000, maximum: 64000 }
+        opus_complexity: { type: integer, minimum: 0, maximum: 10 }
+        opus_dtx: { type: boolean }
+        opus_fec: { type: boolean }
+        opus_packet_loss_pct: { type: integer, minimum: 0, maximum: 100 }
+        opus_cbr: { type: boolean }
+        packet_frames: { type: integer, minimum: 1, maximum: 8 }
+        packet_frames_max: { type: integer, minimum: 1, maximum: 16 }
+        packet_align_ldpc: { type: boolean }
+        relay: { type: boolean }
+        ttl: { type: integer, minimum: 1, maximum: 8 }
+        spectrum_enabled: { type: boolean }
+        spectrum_bands: { type: integer, minimum: 4, maximum: 64 }
+    PttState:
+      type: object
+      required: [status, detail, self, group, floor, settings, audio, recent, stats]
+      properties:
+        status: { type: string, enum: [running, unprovisioned, error], description: '`unprovisioned`: no group key yet.' }
+        self:
+          type: object
+          required: [id, is_admin]
+          description: This device. The Kaonic Admin's talk has priority.
+          properties:
+            id: { $ref: '#/components/schemas/Hash' }
+            is_admin: { type: boolean }
+        detail: { type: [string, 'null'] }
+        group:
+          type: object
+          required: [name, epoch, members]
+          properties:
+            name: { type: string, example: all }
+            epoch: { type: [integer, 'null'], description: The group key's epoch; it changes when a node is revoked. }
+            members: { type: integer, description: Nodes of the network heard recently. }
+        floor:
+          type: object
+          required: [state, talker, since_ts_ms, level]
+          properties:
+            state: { type: string, enum: [idle, talking, receiving] }
+            talker: { oneOf: [{ $ref: '#/components/schemas/PttTalker' }, { type: 'null' }] }
+            since_ts_ms: { oneOf: [{ $ref: '#/components/schemas/TimestampMs' }, { type: 'null' }] }
+            level: { type: number, minimum: 0, maximum: 1, description: Loudness of the current talk. }
+        settings: { $ref: '#/components/schemas/PttSettings' }
+        audio:
+          type: object
+          required: [device, codec]
+          properties:
+            device: { type: boolean, description: This device has a microphone and speaker the hub can use. }
+            codec: { type: [string, 'null'], example: opus, description: null when the codec library is missing (talk and play need it). }
+        recent: { type: array, maxItems: 20, items: { $ref: '#/components/schemas/PttBurst' }, description: Newest first. Audio is never recorded. }
+        stats:
+          type: object
+          required: [tx_packets, rx_packets, relayed, suppressed, duplicates]
+          properties:
+            tx_packets: { type: integer }
+            rx_packets: { type: integer }
+            relayed: { type: integer, description: Packets we re-sent for others. }
+            suppressed: { type: integer, description: Relays dropped because enough others relayed. }
+            duplicates: { type: integer }
+    PttAudioDevice:
+      type: object
+      required: [name, description]
+      properties:
+        name: { type: string, example: 'hw:0,0' }
+        description: { type: string, example: Kaonic WM8960 Audio }
+    PttTestWav:
+      type: object
+      required: [duration_ms, size_bytes, uploaded_ts]
+      properties:
+        duration_ms: { type: integer }
+        size_bytes: { type: integer }
+        uploaded_ts: { $ref: '#/components/schemas/Timestamp' }
+    PttSession:
+      type: object
+      required: [token, transport, udp_port, format, sample_rate_hz, frame_ms, samples_per_frame, keepalive_interval_ms, unkey_timeout_ms]
+      properties:
+        token: { type: string, example: 1f2e3d4c, description: 8 hex digits. }
+        transport: { type: string, enum: [udp] }
+        udp_port: { type: integer, example: 8781 }
+        format: { type: string, enum: [pcm_s16le_mono] }
+        sample_rate_hz: { type: integer, enum: [16000] }
+        frame_ms: { type: integer, enum: [20] }
+        samples_per_frame: { type: integer, enum: [320] }
+        keepalive_interval_ms: { type: integer }
+        unkey_timeout_ms: { type: integer }
+
+    # ── audio ──
+    AudioOutputId:
+      type: string
+      enum: [speaker, headphones, microphone]
+    AudioControl:
+      type: object
+      required: [id, label, volume, muted, backend]
+      properties:
+        id: { $ref: '#/components/schemas/AudioOutputId' }
+        label: { type: string }
+        volume: { type: integer, minimum: 0, maximum: 100 }
+        muted: { type: boolean }
+        backend: { type: string }
+    AudioCard:
+      type: object
+      required: [id, name, controls]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        controls: { type: array, items: { $ref: '#/components/schemas/AudioControl' } }
+
+    # ── jobs ──
+    Job:
+      type: object
+      required: [id, kind, state, node_id, progress, detail, created_ts, updated_ts]
+      properties:
+        id: { $ref: '#/components/schemas/JobId' }
+        kind:
+          type: string
+          enum: [wifi_scan, script, remote_plugin_push, vpn_speed_test, update, node_update, node_radio, node_restart, node_ptt]
+        state: { type: string, enum: [queued, running, done, failed, cancelled] }
+        node_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: The node a remote job acts on. }
+        progress: { type: [number, 'null'], minimum: 0, maximum: 1, description: Null when the job cannot tell. }
+        detail: { type: [string, 'null'], description: What is happening, or what went wrong. }
+        result:
+          description: Present when `state` is `done`; shape depends on `kind`.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/WifiScanResults'
+            - $ref: '#/components/schemas/CommandResult'
+            - $ref: '#/components/schemas/SpeedTestResult'
+            - $ref: '#/components/schemas/Component'
+        error: { oneOf: [{ $ref: '#/components/schemas/Error' }, { type: 'null' }] }
+        created_ts: { $ref: '#/components/schemas/Timestamp' }
+        updated_ts: { $ref: '#/components/schemas/Timestamp' }
+
+    # ── events ──
+    TrafficRate:
+      type: object
+      required: [rx_bps, tx_bps]
+      properties:
+        rx_bps: { type: integer, description: Bits per second. }
+        tx_bps: { type: integer }
+    TrafficSample:
+      type: object
+      required: [ts_ms, channels]
+      properties:
+        ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+        channels:
+          type: object
+          required: [a_sub, a_24, b_sub, b_24, vpn]
+          properties:
+            a_sub: { $ref: '#/components/schemas/TrafficRate' }
+            a_24: { $ref: '#/components/schemas/TrafficRate' }
+            b_sub: { $ref: '#/components/schemas/TrafficRate' }
+            b_24: { $ref: '#/components/schemas/TrafficRate' }
+            vpn: { $ref: '#/components/schemas/TrafficRate' }
+    Event:
+      type: object
+      required: [topic, type, ts_ms, data]
+      properties:
+        topic:
+          type: string
+          description: A topic from README.md, or `plugin.<id>`.
+          enum: [metrics, traffic, frames, packets, peers, jobs, network, trust, links, radio, vpn, plugins, system]
+        type: { type: string, description: 'Dotted event name, e.g. peer.updated. See README.md.' }
+        ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+        data: { description: 'Payload; schema per `type` in README.md.' }
