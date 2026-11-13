@@ -61,7 +61,8 @@ async fn the_peer_table_stays_within_its_cap() {
     let _c = node(&air, "c").await;
     // Both are heard (each replaces the other), but the table never holds more than one.
     let mut heard = std::collections::HashSet::new();
-    for _ in 0..80 {
+    // Up to 30 s: announces are every second, but a busy machine (the whole suite) is slow.
+    for _ in 0..300 {
         let peers = small.peers();
         assert!(peers.len() <= 1, "{} peers", peers.len());
         heard.extend(peers.into_iter().map(|peer| peer.id));

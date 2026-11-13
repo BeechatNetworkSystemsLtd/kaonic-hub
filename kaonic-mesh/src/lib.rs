@@ -9,12 +9,14 @@
 //! - [`traffic`]: every frame sent and heard, for the traffic analyser.
 //! - [`links`]: one authenticated link per trusted peer, carrying mux packets.
 //! - [`node`]: the transport, this node's destination and announces, and the peers heard.
+//! - [`log_limit`]: a log line written at most once per interval.
 
 pub mod announce;
 pub mod group;
 pub mod iface;
 pub mod link;
 pub mod links;
+pub mod log_limit;
 pub mod node;
 pub mod radio;
 pub mod radio_config;

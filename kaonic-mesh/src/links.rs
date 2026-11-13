@@ -7,7 +7,7 @@
 //! authentication is closed and its peer backed off. Unprovisioned nodes have no
 //! credentials and link nobody; provisioning has its own messages (`KPV1`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,13 @@ const BACKOFF_FIRST: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Opening a link (Reticulum's request and proof) may take this long on a busy channel.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Links we opened that are not yet authenticated: announces that merely claim our admin
+/// cannot make us send link requests to more peers than this at once.
+const MAX_OPENING: usize = 16;
+/// Links others opened that are not yet authenticated; past this the oldest is closed.
+const MAX_IN_HANDSHAKES: usize = 64;
+/// Failed peers remembered (the peer table's default size); past this the oldest is forgotten.
+const MAX_FAILURES: usize = 512;
 
 /// This node's credentials and trust; None while unprovisioned.
 pub struct Auth {
@@ -77,11 +84,11 @@ pub struct LinkView {
     pub detail: Option<String>,
 }
 
-#[derive(Default)]
 struct Failure {
     count: u32,
     retry_at: Option<Instant>,
     detail: String,
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -128,12 +135,18 @@ impl Links {
                 tokio::select! {
                     event = ins.recv() => match event {
                         Ok(event) => manager.on_event(event, false).await,
-                        Err(broadcast::error::RecvError::Lagged(missed)) => log::warn!("links: missed {missed} in-link events"),
+                        Err(broadcast::error::RecvError::Lagged(missed)) => {
+                            log::warn!("links: missed {missed} in-link events");
+                            manager.reconcile().await;
+                        }
                         Err(broadcast::error::RecvError::Closed) => return,
                     },
                     event = outs.recv() => match event {
                         Ok(event) => manager.on_event(event, true).await,
-                        Err(broadcast::error::RecvError::Lagged(missed)) => log::warn!("links: missed {missed} out-link events"),
+                        Err(broadcast::error::RecvError::Lagged(missed)) => {
+                            log::warn!("links: missed {missed} out-link events");
+                            manager.reconcile().await;
+                        }
                         Err(broadcast::error::RecvError::Closed) => return,
                     },
                     _ = tick.tick() => manager.on_tick().await,
@@ -288,12 +301,19 @@ impl Links {
             .filter(|peer| me < peer.id.as_str())
             .filter(|peer| !state.up.contains_key(&peer.id) && !state.links.values().any(|entry| entry.peer.as_deref() == Some(peer.id.as_str())))
             .filter(|peer| state.failures.get(&peer.id).and_then(|failure| failure.retry_at).is_none_or(|at| now >= at))
+            .take(MAX_OPENING.saturating_sub(opening(&state.links)))
             .map(|peer| peer.id)
             .collect()
     }
 
     async fn on_tick(&self) {
-        let wanted = self.wanted(&self.state.lock().expect("links lock"));
+        let wanted = {
+            let mut state = self.state.lock().expect("links lock");
+            // Peers the mesh forgot are not backed off any more.
+            let known: HashSet<String> = self.mesh.peers().into_iter().map(|peer| peer.id).collect();
+            state.failures.retain(|peer, _| known.contains(peer));
+            self.wanted(&state)
+        };
         for peer in wanted {
             self.open(peer).await;
         }
@@ -366,39 +386,72 @@ impl Links {
         match event.event {
             LinkEvent::Activated => {
                 if !out {
-                    let has_auth = {
+                    let (has_auth, excess) = {
                         let mut state = self.state.lock().expect("links lock");
                         let has_auth = state.auth.is_some();
                         if has_auth {
                             state.links.entry(id).or_insert(Entry { side: Side::In, peer: None, handshake: None, opened: Instant::now() });
                         }
-                        has_auth
+                        (has_auth, excess_in_handshakes(&state.links))
                     };
-                    if !has_auth {
+                    for old in excess {
+                        log::debug!("links {}: too many links authenticating, closing {}", &self.mesh.identity_hash()[..8], hex(&old));
+                        self.close(old, "too many links authenticating").await;
+                    }
+                    if !has_auth || !self.state.lock().expect("links lock").links.contains_key(&id) {
                         return;
                     }
                 }
                 self.begin(id).await;
             }
             LinkEvent::Data(payload) => self.on_data(id, payload.as_slice()).await,
-            LinkEvent::Closed => {
-                let peer = {
-                    let mut state = self.state.lock().expect("links lock");
-                    let entry = state.links.remove(&id);
-                    let peer = entry.and_then(|entry| entry.peer);
-                    if let Some(peer) = &peer
-                        && state.up.get(peer).is_some_and(|(up, _)| *up == id)
-                    {
-                        state.up.remove(peer);
-                    }
-                    peer
+            LinkEvent::Closed => self.on_closed(id),
+            LinkEvent::Proof(_) | LinkEvent::RemoteIdentified(_) => {}
+        }
+    }
+
+    /// Reticulum closed the link.
+    fn on_closed(&self, id: LinkId) {
+        let peer = {
+            let mut state = self.state.lock().expect("links lock");
+            let entry = state.links.remove(&id);
+            let peer = entry.and_then(|entry| entry.peer);
+            if let Some(peer) = &peer
+                && state.up.get(peer).is_some_and(|(up, _)| *up == id)
+            {
+                state.up.remove(peer);
+            }
+            peer
+        };
+        if let Some(peer) = peer {
+            log::info!("links {}: link to {peer} closed", &self.mesh.identity_hash()[..8]);
+            let _ = self.changes.send(peer);
+        }
+    }
+
+    /// Link events were missed: forgets links Reticulum no longer has open, so their peers
+    /// are linked again.
+    async fn reconcile(&self) {
+        let entries: Vec<(LinkId, Side)> = self.state.lock().expect("links lock").links.iter().map(|(id, entry)| (*id, entry.side)).collect();
+        let mut gone = Vec::new();
+        {
+            let transport = self.mesh.transport().lock().await;
+            for (id, side) in entries {
+                let link = match side {
+                    Side::Out(_) => transport.find_out_link(&id).await,
+                    Side::In => transport.find_in_link(&id).await,
                 };
-                if let Some(peer) = peer {
-                    log::info!("links {}: link to {peer} closed", &self.mesh.identity_hash()[..8]);
-                    let _ = self.changes.send(peer);
+                let closed = match link {
+                    Some(link) => link.lock().await.status() == LinkStatus::Closed,
+                    None => true,
+                };
+                if closed {
+                    gone.push(id);
                 }
             }
-            LinkEvent::Proof(_) | LinkEvent::RemoteIdentified(_) => {}
+        }
+        for id in gone {
+            self.on_closed(id);
         }
     }
 
@@ -488,7 +541,10 @@ impl Links {
                 }
                 Event::Close(reason) => {
                     let why = reason.to_string();
-                    log::warn!("links {}: closing {}: {why}", &self.mesh.identity_hash()[..8], hex(&id));
+                    // Anyone can open a link to us: only an authenticated one is worth a warning.
+                    let was_up = self.state.lock().expect("links lock").up.values().any(|(up, _)| *up == id);
+                    let level = if was_up { log::Level::Warn } else { log::Level::Debug };
+                    log::log!(level, "links {}: closing {}: {why}", &self.mesh.identity_hash()[..8], hex(&id));
                     self.fail(id, &why);
                     self.close(id, &why).await;
                 }
@@ -530,11 +586,7 @@ impl Links {
     fn fail(&self, id: LinkId, why: &str) {
         let mut state = self.state.lock().expect("links lock");
         let Some(peer) = state.links.get(&id).and_then(|entry| entry.peer.clone()) else { return };
-        let failure = state.failures.entry(peer).or_default();
-        failure.count += 1;
-        let wait = BACKOFF_FIRST.saturating_mul(1 << failure.count.min(6)).min(BACKOFF_MAX);
-        failure.retry_at = Some(Instant::now() + wait);
-        failure.detail = why.to_owned();
+        record_failure(&mut state.failures, peer, why, Instant::now());
     }
 
     async fn close(&self, id: LinkId, why: &str) {
@@ -553,5 +605,89 @@ impl Links {
         if let Some(peer) = peer {
             let _ = self.changes.send(peer);
         }
+    }
+}
+
+/// Counts a failure of `peer` and backs it off, forgetting the oldest failure past
+/// [`MAX_FAILURES`].
+fn record_failure(failures: &mut HashMap<String, Failure>, peer: String, why: &str, now: Instant) {
+    if !failures.contains_key(&peer) && failures.len() >= MAX_FAILURES {
+        let oldest = failures.iter().min_by_key(|(_, failure)| failure.at).map(|(peer, _)| peer.clone());
+        if let Some(oldest) = oldest {
+            failures.remove(&oldest);
+        }
+    }
+    let failure = failures.entry(peer).or_insert(Failure { count: 0, retry_at: None, detail: String::new(), at: now });
+    failure.count += 1;
+    let wait = BACKOFF_FIRST.saturating_mul(1 << failure.count.min(6)).min(BACKOFF_MAX);
+    failure.retry_at = Some(now + wait);
+    failure.detail = why.to_owned();
+    failure.at = now;
+}
+
+fn authenticated(entry: &Entry) -> bool {
+    entry.handshake.as_ref().is_some_and(Handshake::is_established)
+}
+
+/// Links we opened that are not authenticated yet.
+fn opening(links: &HashMap<LinkId, Entry>) -> usize {
+    links.values().filter(|entry| matches!(entry.side, Side::Out(_)) && !authenticated(entry)).count()
+}
+
+/// The oldest links others opened that are past [`MAX_IN_HANDSHAKES`] unauthenticated.
+fn excess_in_handshakes(links: &HashMap<LinkId, Entry>) -> Vec<LinkId> {
+    let mut waiting: Vec<(Instant, LinkId)> = links.iter().filter(|(_, entry)| entry.side == Side::In && !authenticated(entry)).map(|(id, entry)| (entry.opened, *id)).collect();
+    let excess = waiting.len().saturating_sub(MAX_IN_HANDSHAKES);
+    waiting.sort();
+    waiting.into_iter().take(excess).map(|(_, id)| id).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u32) -> LinkId {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        AddressHash::new(bytes)
+    }
+
+    fn entry(side: Side, opened: Instant) -> Entry {
+        Entry { side, peer: None, handshake: None, opened }
+    }
+
+    #[test]
+    fn failures_are_bounded_and_the_oldest_goes_first() {
+        let (mut failures, now) = (HashMap::new(), Instant::now());
+        for n in 0..MAX_FAILURES * 3 {
+            record_failure(&mut failures, format!("peer{n}"), "no", now + Duration::from_millis(n as u64));
+        }
+        assert_eq!(failures.len(), MAX_FAILURES);
+        assert!(!failures.contains_key("peer0"));
+        assert!(failures.contains_key(&format!("peer{}", MAX_FAILURES * 3 - 1)));
+        // A peer failing again is counted, not added.
+        record_failure(&mut failures, format!("peer{}", MAX_FAILURES * 3 - 1), "again", now);
+        assert_eq!(failures.len(), MAX_FAILURES);
+        assert_eq!(failures[&format!("peer{}", MAX_FAILURES * 3 - 1)].count, 2);
+    }
+
+    #[test]
+    fn opening_links_are_counted_and_unauthenticated_in_links_are_capped() {
+        let now = Instant::now();
+        let mut links = HashMap::new();
+        for n in 0..5 {
+            links.insert(id(n), entry(Side::Out(id(1000 + n)), now));
+        }
+        assert_eq!(opening(&links), 5);
+        for n in 0..MAX_IN_HANDSHAKES as u32 + 10 {
+            links.insert(id(100 + n), entry(Side::In, now + Duration::from_millis(u64::from(n))));
+        }
+        let excess = excess_in_handshakes(&links);
+        assert_eq!(excess, (100..110).map(id).collect::<Vec<_>>(), "the oldest ten");
+        for old in excess {
+            links.remove(&old);
+        }
+        assert!(excess_in_handshakes(&links).is_empty());
+        assert_eq!(opening(&links), 5, "in-links are not ours");
     }
 }

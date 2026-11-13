@@ -27,10 +27,14 @@ use reticulum::iface::{Interface, InterfaceContext, RxMessage, TxMessage};
 use reticulum::packet::{DestinationType, Packet, PacketContext, PacketType};
 use reticulum::serde::Serialize;
 
+use crate::log_limit::LogLimit;
 use crate::radio::{FRAME_SIZE, RadioSocket};
 use crate::settings::RadioSettings;
 use crate::traffic::{Direction, FrameKind, FrameRecord, PacketInfo, Traffic};
 
+/// The largest Reticulum packet: two header bytes, a transport and a destination hash, a
+/// context byte, and the data.
+const MAX_PACKET: usize = 2 + 16 + 16 + 1 + reticulum::packet::PACKET_MDU;
 const SEGMENTS: usize = 3;
 /// Quiet time after each frame's airtime before the next: a receiver still reading out one frame
 /// drops the next if it starts at once (measured on boards: 21-38 % of frames sent back to back
@@ -44,6 +48,8 @@ const TX_LIMITS: [usize; 3] = [16, 64, 24];
 /// Bulk that waited longer than this is stale: dropped, so queues do not turn into delay
 /// (TCP and the VPN's repair react to a loss far sooner than to a growing round trip).
 const BULK_SOJOURN: std::time::Duration = std::time::Duration::from_millis(150);
+/// A radio fault repeats for every packet: it is logged at most this often.
+const FAULT_LOG_EVERY: Duration = Duration::from_secs(10);
 
 type RadioNetwork = Network<FRAME_SIZE, SEGMENTS, REASSEMBLY_QUEUE, LdpcPacketCoder<FRAME_SIZE>>;
 
@@ -167,6 +173,7 @@ impl RadioInterface {
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; FRAME_SIZE];
+                let mut fault_log = LogLimit::new(FAULT_LOG_EVERY);
                 loop {
                     let received = tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -176,7 +183,9 @@ impl RadioInterface {
                         Ok(Some(length)) => length,
                         Ok(None) => continue,
                         Err(error) => {
-                            log::error!("radio {}: receive: {error}", socket.iface());
+                            if let Some(skipped) = fault_log.allow(std::time::Instant::now()) {
+                                log::error!("radio {}: receive: {error} ({skipped} more not logged)", socket.iface());
+                            }
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             continue;
                         }
@@ -220,6 +229,7 @@ impl RadioInterface {
             let mut serialized = vec![0u8; reticulum::packet::PACKET_MDU * 2];
             let mut frames = [Frame::<FRAME_SIZE>::new(); SEGMENTS];
             let mut quiet_until = tokio::time::Instant::now();
+            let mut fault_log = LogLimit::new(FAULT_LOG_EVERY);
             loop {
                 let (next, stale) = queue.lock().expect("tx queue lock").pop(std::time::Instant::now());
                 if stale > 0 {
@@ -240,7 +250,9 @@ impl RadioInterface {
                 let encoded = match network.transmit(output.as_slice(), OsRng, &mut frames) {
                     Ok(encoded) => encoded,
                     Err(error) => {
-                        log::warn!("radio {}: encode: {error:?}", socket.iface());
+                        if let Some(skipped) = fault_log.allow(std::time::Instant::now()) {
+                            log::warn!("radio {}: encode: {error:?} ({skipped} more not logged)", socket.iface());
+                        }
                         counters.lock().expect("counters lock").tx_errors += 1;
                         continue;
                     }
@@ -271,7 +283,9 @@ impl RadioInterface {
                             });
                         }
                         Err(error) => {
-                            log::warn!("radio {}: send: {error}", socket.iface());
+                            if let Some(skipped) = fault_log.allow(std::time::Instant::now()) {
+                                log::warn!("radio {}: send: {error} ({skipped} more not logged)", socket.iface());
+                            }
                             counters.lock().expect("counters lock").tx_errors += 1;
                             break;
                         }
@@ -330,7 +344,11 @@ fn decode(
             match network.process(now, &mut assembled) {
                 Ok(segment) => {
                     let bytes = segment.as_slice();
-                    let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(bytes)) else {
+                    // Larger than a Reticulum packet can be: dropped here, before it reaches a
+                    // decoder that may not check (an older reticulum panicked on it).
+                    let too_large = bytes.len() > MAX_PACKET;
+                    let decoded = if too_large { None } else { Packet::deserialize(&mut InputBuffer::new(bytes)).ok() };
+                    let Some(packet) = decoded else {
                         counters.lock().expect("counters lock").rx_decode_errors += 1;
                         if record.packet.is_none() {
                             record.kind = FrameKind::Corrupt;
