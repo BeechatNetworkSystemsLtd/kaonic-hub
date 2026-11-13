@@ -151,6 +151,8 @@ pub enum Action {
 /// How long past [`crate::core::START_TIMEOUT`] a running hub update may go before it
 /// counts as interrupted.
 const HUB_JOB_MARGIN: Duration = Duration::from_secs(60);
+/// How long the hub has to answer its caller before the installer restarts it for an update.
+const HUB_ANSWER_GRACE: Duration = Duration::from_secs(2);
 
 impl Installer {
     pub fn new(paths: Paths, release_keys: Vec<Vec<u8>>, host: Arc<dyn Host>, settle: Duration) -> Result<Self, Error> {
@@ -223,10 +225,12 @@ impl Installer {
     /// restart of the hub and the wait for it (up to [`crate::core::START_TIMEOUT`]) run
     /// after, with [`Installer::hub_job`] telling how it went.
     pub fn update_hub(self: &Arc<Self>, archive: &mut impl std::io::Read, allow_downgrade: bool, actor: Option<&str>) -> Result<HubJob, Error> {
-        self.update_hub_with(archive, allow_downgrade, actor, crate::core::START_TIMEOUT)
+        self.update_hub_with(archive, allow_downgrade, actor, HUB_ANSWER_GRACE, crate::core::START_TIMEOUT)
     }
 
-    pub fn update_hub_with(self: &Arc<Self>, archive: &mut impl std::io::Read, allow_downgrade: bool, actor: Option<&str>, timeout: Duration) -> Result<HubJob, Error> {
+    /// As [`Installer::update_hub`], waiting `grace` before the switch so the hub can pass
+    /// the answer on to whoever asked it before it is restarted.
+    pub fn update_hub_with(self: &Arc<Self>, archive: &mut impl std::io::Read, allow_downgrade: bool, actor: Option<&str>, grace: Duration, timeout: Duration) -> Result<HubJob, Error> {
         const HUB: &str = "kaonic-hub";
         self.end_interrupted_hub_job(crate::core::START_TIMEOUT + HUB_JOB_MARGIN);
         let mut job_slot = self.hub_job.lock().expect("hub job lock");
@@ -250,6 +254,7 @@ impl Installer {
         let actor = actor.map(str::to_owned);
         let job_id = job.id;
         std::thread::spawn(move || {
+            std::thread::sleep(grace);
             let ready = installer.hub_ready.clone();
             let healthy = move |version: &str| ready.lock().expect("hub ready lock").as_deref() == Some(version);
             let result = installer.core.run_switch(&staged, actor.as_deref(), &healthy, timeout);
@@ -1037,9 +1042,9 @@ mod tests {
     fn the_installer_updates_the_hub_and_waits_for_it() {
         let root = staging();
         let installer = Arc::new(Installer::new(Paths::under(&root), vec![], Arc::new(Fake::default()), Duration::ZERO).unwrap());
-        let job = installer.update_hub_with(&mut hub_package("1.1").as_slice(), false, Some("admin"), Duration::from_secs(5)).unwrap();
+        let job = installer.update_hub_with(&mut hub_package("1.1").as_slice(), false, Some("admin"), Duration::ZERO, Duration::from_secs(5)).unwrap();
         assert_eq!(job.state, HubJobState::Running);
-        assert!(installer.update_hub_with(&mut hub_package("1.2").as_slice(), false, None, Duration::from_secs(5)).is_err(), "one at a time");
+        assert!(installer.update_hub_with(&mut hub_package("1.2").as_slice(), false, None, Duration::ZERO, Duration::from_secs(5)).is_err(), "one at a time");
         installer.hub_ready("1.0");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(installer.hub_job().unwrap().state, HubJobState::Running, "an old hub saying ready does not count");
@@ -1056,7 +1061,7 @@ mod tests {
     fn a_hub_that_never_says_ready_is_rolled_back() {
         let root = staging();
         let installer = Arc::new(Installer::new(Paths::under(&root), vec![], Arc::new(Fake::default()), Duration::ZERO).unwrap());
-        installer.update_hub_with(&mut hub_package("1.1").as_slice(), false, None, Duration::from_millis(100)).unwrap();
+        installer.update_hub_with(&mut hub_package("1.1").as_slice(), false, None, Duration::ZERO, Duration::from_millis(100)).unwrap();
         let job = wait_for(&installer, HubJobState::Failed);
         assert!(job.message.contains("did not come up"), "{}", job.message);
         assert!(installer.core().record("kaonic-hub").is_none(), "the image's hub runs");

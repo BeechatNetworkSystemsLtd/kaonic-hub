@@ -16,9 +16,18 @@ pub const RESERVED: &[&str] = &[
     "kaonic-plugin",
 ];
 
-/// The device's own programs that update each other: the installer updates the hub, the
-/// hub updates the installer. Their packages use the plugin format with one of these ids.
-pub const CORE: &[&str] = &["kaonic-hub", "kaonic-hub-installer"];
+/// The device's own programs, updated with packages in the plugin format under one of these
+/// ids: the installer updates the hub; the hub updates the installer, commd and the factory
+/// server. None of them can be removed.
+pub const CORE: &[&str] = &["kaonic-hub", "kaonic-hub-installer", "kaonic-commd", "kaonic-factory"];
+
+/// Core programs that do not switch to their update themselves (they come from
+/// kaonic-radio): their units start them through `kaonic-hub-installer run-core`.
+pub const LAUNCHED: &[&str] = &["kaonic-commd", "kaonic-factory"];
+
+pub fn is_launched(id: &str) -> bool {
+    LAUNCHED.contains(&id)
+}
 
 pub fn is_core(id: &str) -> bool {
     CORE.contains(&id)
@@ -113,7 +122,7 @@ mod tests {
     #[test]
     fn request_ids_are_plugin_or_core_ids() {
         assert!(path_id("kaonic-hub").is_ok() && path_id("sample").is_ok());
-        for bad in ["../x", "a/b", "x%2Fy", "kaonic-commd", ""] {
+        for bad in ["../x", "a/b", "x%2Fy", "kaonic-init", ""] {
             assert!(path_id(bad).is_err(), "{bad}");
         }
     }

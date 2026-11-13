@@ -263,7 +263,7 @@ fn an_interrupted_hub_update_does_not_block_the_next() {
     let job = installer.hub_job().unwrap();
     assert_eq!(job.state, HubJobState::Failed);
     assert!(job.message.contains("interrupted"), "{}", job.message);
-    let next = installer.update_hub_with(&mut package("kaonic-hub", "2", "").as_slice(), false, None, Duration::from_millis(50)).unwrap();
+    let next = installer.update_hub_with(&mut package("kaonic-hub", "2", "").as_slice(), false, None, Duration::ZERO, Duration::from_millis(50)).unwrap();
     assert_eq!((next.id, next.state), (2, HubJobState::Running));
 }
 

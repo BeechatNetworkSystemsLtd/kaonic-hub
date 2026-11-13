@@ -3,6 +3,8 @@
 //! ```text
 //! kaonic-hub-installer [--allow-uid UID]... [--release-key PEM]... [--root DIR] [--settle SECS]
 //! kaonic-hub-installer check PACKAGE     check a package and print its manifest
+//! kaonic-hub-installer run-core ID IMAGE-PROGRAM IMAGE-VERSION [ARGS]...
+//!                                         start commd or the factory server: its update if good
 //! ```
 //! On a device the defaults are right: the API is on `/run/kaonic-hub-installer/api.sock`
 //! for root only. `--allow-uid` replaces root in the allowed peers (repeat it for more).
@@ -50,7 +52,18 @@ fn args() -> Result<Args, String> {
 }
 
 const USAGE: &str = "usage: kaonic-hub-installer [--allow-uid UID]... [--release-key PEM]... [--root DIR] [--settle SECS]
-       kaonic-hub-installer check PACKAGE";
+       kaonic-hub-installer check PACKAGE
+       kaonic-hub-installer run-core ID IMAGE-PROGRAM IMAGE-VERSION [ARGS]...";
+
+/// `run-core`: what a launched core program's unit runs. Replaces this process with the program.
+fn run_core(args: &[std::ffi::OsString]) -> ! {
+    let [id, image, version, rest @ ..] = args else {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
+    };
+    let error = kaonic_hub_installer::core::launch(&Paths::device().core, &id.to_string_lossy(), std::path::Path::new(image), &version.to_string_lossy(), rest);
+    fatal(error)
+}
 
 struct Logger;
 
@@ -69,6 +82,10 @@ impl log::Log for Logger {
 
 fn main() {
     let _ = log::set_logger(&Logger).map(|_| log::set_max_level(log::LevelFilter::Info));
+    let all: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if all.first().is_some_and(|first| first == "run-core") {
+        run_core(&all[1..]);
+    }
     let args = match args() {
         Ok(args) => args,
         Err(message) => {
@@ -124,6 +141,12 @@ async fn run(args: Args) {
     }
     log::info!("installer: {} listening on {} for uids {:?}", env!("CARGO_PKG_VERSION"), socket.display(), args.allowed);
     kaonic_hub_installer::core::healthy(&args.paths.core, "kaonic-hub-installer");
+    // Launched core programs cannot say they came up: a start that stays up counts as good.
+    let core = args.paths.core.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(30));
+        kaonic_hub_installer::core::mark_launched_good(&core, &System);
+    });
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
         tokio::select! {

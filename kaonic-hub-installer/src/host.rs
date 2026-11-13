@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::Error;
 
@@ -15,6 +16,12 @@ pub trait Host: Send + Sync {
     fn is_active(&self, unit: &str) -> bool;
     /// Sets the owner of `path`, not following a symlink.
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> Result<(), Error>;
+    /// The unit's main process and how long it has run, while the unit is active.
+    fn main_process(&self, unit: &str) -> Option<(u32, Duration)>;
+    /// The program process `pid` runs.
+    fn program_of(&self, pid: u32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
 }
 
 /// The real system. Tools are called by absolute path.
@@ -37,6 +44,25 @@ impl Host for System {
 
     fn is_active(&self, unit: &str) -> bool {
         Command::new(SYSTEMCTL).args(["is-active", "--quiet", unit]).status().is_ok_and(|status| status.success())
+    }
+
+    fn main_process(&self, unit: &str) -> Option<(u32, Duration)> {
+        let output = Command::new(SYSTEMCTL).args(["show", "-p", "ActiveState", "-p", "MainPID", "-p", "ExecMainStartTimestampMonotonic", unit]).output().ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let field = |name: &str| text.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix('='));
+        if field("ActiveState")? != "active" {
+            return None;
+        }
+        let pid: u32 = field("MainPID")?.parse().ok().filter(|pid| *pid != 0)?;
+        let started_us: u64 = field("ExecMainStartTimestampMonotonic")?.parse().ok()?;
+        // CLOCK_MONOTONIC, as systemd's monotonic timestamps.
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid timespec to fill.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+            return None;
+        }
+        let now_us = now.tv_sec as u64 * 1_000_000 + now.tv_nsec as u64 / 1000;
+        Some((pid, Duration::from_micros(now_us.saturating_sub(started_us))))
     }
 
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> Result<(), Error> {
@@ -64,6 +90,8 @@ pub struct FakeState {
     pub chowned: Vec<(PathBuf, u32, u32)>,
     /// Units that fail to stay up when started.
     pub crashing: HashSet<String>,
+    /// Main processes of active units: pid, how long it has run, and its program.
+    pub processes: std::collections::HashMap<String, (u32, Duration, PathBuf)>,
 }
 
 impl Host for Fake {
@@ -93,5 +121,17 @@ impl Host for Fake {
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> Result<(), Error> {
         self.state.lock().unwrap().chowned.push((path.to_owned(), uid, gid));
         Ok(())
+    }
+
+    fn main_process(&self, unit: &str) -> Option<(u32, Duration)> {
+        let state = self.state.lock().unwrap();
+        if !state.active.contains(unit) {
+            return None;
+        }
+        state.processes.get(unit).map(|(pid, up, _)| (*pid, *up))
+    }
+
+    fn program_of(&self, pid: u32) -> Option<PathBuf> {
+        self.state.lock().unwrap().processes.values().find(|(known, _, _)| *known == pid).map(|(_, _, program)| program.clone())
     }
 }

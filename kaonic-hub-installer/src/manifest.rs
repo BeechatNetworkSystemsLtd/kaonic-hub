@@ -439,7 +439,7 @@ nice = -5
         assert!(with("format = 2", "format = 1").is_err(), "old format");
         assert!(with("version = \"0.3.0\"\n", "").is_err(), "no version");
         assert!(with("\"kaonic-ptt-voice\"", "\"../evil\"").is_err());
-        assert!(with("\"kaonic-ptt-voice\"", "\"kaonic-commd\"").is_err());
+        assert!(with("\"kaonic-ptt-voice\"", "\"kaonic-init\"").is_err());
         assert!(with("page = true", "page = 8780").is_err(), "no page ports any more");
         assert!(with("\"kaonic-ptt-voice\"", "\"ip\"").is_err(), "a command link outside kaonic-*");
         assert!(with("command = true", "command = false").is_ok());

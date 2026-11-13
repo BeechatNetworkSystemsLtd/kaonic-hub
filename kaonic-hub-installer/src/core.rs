@@ -96,6 +96,11 @@ impl Core {
         read_record(&self.root, id)
     }
 
+    /// The record of core program `id` under `root`, without opening a [`Core`].
+    pub fn record_in(root: &Path, id: &str) -> Option<CoreRecord> {
+        read_record(root, id)
+    }
+
     pub fn status(&self, id: &str) -> CoreStatus {
         CoreStatus { id: id.to_owned(), updated: self.record(id), attempts: attempts(&self.root, id) }
     }
@@ -336,6 +341,61 @@ pub fn healthy(root: &Path, id: &str) {
     set_attempts(root, id, 0);
 }
 
+/// Where the system image keeps a core program's manifest and files (`kaonic-plugin.toml`,
+/// `files/icon.png`), laid out as in its package, for programs that bring their own.
+pub const IMAGE_FILES: &str = "/usr/share/kaonic-core";
+
+/// The manifest of core program `id` and the directory its paths are relative to: the updated
+/// copy's if there is one, else the system image's under `image`.
+pub fn describe(root: &Path, image: &Path, id: &str) -> Option<(crate::manifest::Manifest, PathBuf)> {
+    if !names::is_core(id) {
+        return None;
+    }
+    [root.join(id).join("current"), image.join(id)].into_iter().find_map(|dir| {
+        let text = fs::read_to_string(dir.join("kaonic-plugin.toml")).ok()?;
+        let manifest = crate::manifest::parse(&text).ok().filter(|manifest| manifest.id == id)?;
+        Some((manifest, dir))
+    })
+}
+
+/// How long a launched core program must run its updated copy before the update counts as up.
+pub const LAUNCHED_SETTLE: Duration = Duration::from_secs(20);
+/// How long a launched core program must stay up before its start counts as good.
+pub const LAUNCHED_GOOD: Duration = Duration::from_secs(60);
+
+/// Whether launched core program `id` runs its updated copy and has for `settle`: the
+/// health check of its update, as it cannot say its version.
+pub fn runs_update(root: &Path, host: &dyn Host, id: &str, settle: Duration) -> bool {
+    let Some((pid, up)) = host.main_process(&format!("{id}.service")) else { return false };
+    let program = root.join(id).join("current/bin").join(id);
+    let expected = fs::canonicalize(&program).unwrap_or(program);
+    up >= settle && host.program_of(pid).is_some_and(|running| running == expected)
+}
+
+/// Marks each launched core program that has stayed up long enough as good, so its updated
+/// copy keeps being used across restarts. Called every so often by the installer.
+pub fn mark_launched_good(root: &Path, host: &dyn Host) {
+    for id in names::LAUNCHED {
+        if host.main_process(&format!("{id}.service")).is_some_and(|(_, up)| up >= LAUNCHED_GOOD) && attempts(root, id) > 0 {
+            set_attempts(root, id, 0);
+        }
+    }
+}
+
+/// `kaonic-hub-installer run-core <id> <image program> <image version> [args...]`: starts
+/// launched core program `id`, its updated copy when [`choose`] picks it, else the image's.
+/// Only returns on failure.
+pub fn launch(root: &Path, id: &str, image: &Path, image_version: &str, args: &[std::ffi::OsString]) -> Error {
+    use std::os::unix::process::CommandExt;
+    if !names::is_launched(id) {
+        return Error::invalid(format!("{id} is not started through the installer"));
+    }
+    let program = choose(root, id, image_version).unwrap_or_else(|| image.to_owned());
+    log::info!("core: starting {id} from {}", program.display());
+    let error = std::process::Command::new(&program).args(args).env(EXEC_ENV, id).exec();
+    Error::failed(format!("starting {}: {error}", program.display()))
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |since| since.as_secs())
 }
@@ -414,6 +474,65 @@ mod tests {
         assert_eq!(read_release_keys(&[dir.join("key.pem"), dir.join("missing.pem")]).unwrap(), [b"pem".to_vec()]);
         assert!(read_release_keys(&[dir.join("missing.pem")]).unwrap().is_empty());
         assert!(read_release_keys(std::slice::from_ref(&dir)).is_err(), "a directory, not a key");
+    }
+
+    #[test]
+    fn a_launched_program_is_up_when_its_unit_runs_the_update_long_enough() {
+        const COMMD: &str = "kaonic-commd";
+        let (core, dir, host) = core(vec![]);
+        let root = dir.join("core");
+        let unit = "kaonic-commd.service".to_owned();
+        let image = PathBuf::from("/usr/bin/kaonic-commd");
+        // Still the image's program: the update is not running, so it is rolled back.
+        host.state.lock().unwrap().processes.insert(unit.clone(), (7, Duration::from_secs(60), image.clone()));
+        let healthy = |_: &str| runs_update(&root, host.as_ref(), COMMD, LAUNCHED_SETTLE);
+        assert!(core.update(COMMD, &mut core_package(COMMD, "1.1", None).as_slice(), false, None, &healthy, Duration::ZERO).is_err());
+        assert!(core.record(COMMD).is_none());
+        // The update runs, but only just started: not yet.
+        core.stage(COMMD, &mut core_package(COMMD, "1.1", None).as_slice(), false).unwrap();
+        core.switch(&Staged { id: COMMD.into(), version: "1.1".into(), signed: false }).unwrap();
+        let updated = fs::canonicalize(root.join("kaonic-commd/current/bin/kaonic-commd")).unwrap();
+        host.state.lock().unwrap().processes.insert(unit.clone(), (8, Duration::from_secs(2), updated.clone()));
+        assert!(!runs_update(&root, host.as_ref(), COMMD, LAUNCHED_SETTLE));
+        host.state.lock().unwrap().processes.insert(unit.clone(), (8, LAUNCHED_SETTLE, updated));
+        assert!(runs_update(&root, host.as_ref(), COMMD, LAUNCHED_SETTLE));
+        // Starts count until it has stayed up a while.
+        assert!(choose(&root, COMMD, "1.0").is_some());
+        assert_eq!(attempts(&root, COMMD), 1);
+        mark_launched_good(&root, host.as_ref());
+        assert_eq!(attempts(&root, COMMD), 1, "up for less than a minute");
+        host.state.lock().unwrap().processes.get_mut(&unit).unwrap().1 = LAUNCHED_GOOD;
+        mark_launched_good(&root, host.as_ref());
+        assert_eq!(attempts(&root, COMMD), 0);
+    }
+
+    #[test]
+    fn a_program_is_described_by_its_update_else_by_the_image() {
+        const COMMD: &str = "kaonic-commd";
+        let (core, dir, _) = core(vec![]);
+        let (root, image) = (dir.join("core"), dir.join("image"));
+        assert!(describe(&root, &image, COMMD).is_none(), "nothing yet");
+        fs::create_dir_all(image.join(COMMD)).unwrap();
+        let manifest = |name: &str| format!("[kaonic-plugin]\nformat = 2\nid = \"{COMMD}\"\nname = \"{name}\"\nversion = \"1.0\"\ndeveloper = \"Beechat\"\nicon = \"files/icon.png\"\n");
+        fs::write(image.join(COMMD).join("kaonic-plugin.toml"), manifest("From the image")).unwrap();
+        let (about, from) = describe(&root, &image, COMMD).unwrap();
+        assert_eq!((about.name.as_str(), from), ("From the image", image.join(COMMD)));
+        core.update(COMMD, &mut core_package(COMMD, "1.1", None).as_slice(), false, None, &|_| true, Duration::ZERO).unwrap();
+        assert_eq!(describe(&root, &image, COMMD).unwrap().1, root.join("kaonic-commd/current"), "the update's own");
+        // Only core programs, and a manifest must name the program it describes.
+        fs::create_dir_all(image.join("sample")).unwrap();
+        fs::write(image.join("sample").join("kaonic-plugin.toml"), manifest("x").replace(COMMD, "sample")).unwrap();
+        assert!(describe(&root, &image, "sample").is_none());
+        fs::write(image.join(COMMD).join("kaonic-plugin.toml"), manifest("x").replace(COMMD, "kaonic-factory")).unwrap();
+        let _ = fs::remove_dir_all(root.join(COMMD));
+        assert!(describe(&root, &image, COMMD).is_none());
+    }
+
+    #[test]
+    fn only_commd_and_the_factory_server_are_launched() {
+        let dir = staging();
+        assert_eq!(launch(&dir, "kaonic-hub", Path::new("/bin/true"), "1", &[]).kind, crate::Kind::Invalid);
+        assert!(names::is_core("kaonic-commd") && names::is_core("kaonic-factory"));
     }
 
     #[test]
