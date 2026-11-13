@@ -4,10 +4,16 @@
 //! during its delay drops its own copy (counter-based flooding), so in a dense cluster only
 //! a few nodes relay. Packets are told apart by `(talker, burst, seq)`, remembered 10 s.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::packet::Packet;
+
+/// Packets remembered at most; past this the oldest are forgotten (about 30 s of a busy
+/// group's traffic, so only a flood reaches it).
+const SEEN: usize = 2048;
+
+type Key = ([u8; 4], u16, u16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RelayConfig {
@@ -55,18 +61,43 @@ pub struct Relay {
     config: RelayConfig,
     me: [u8; 4],
     enabled: bool,
-    seen: HashMap<([u8; 4], u16, u16), Seen>,
+    seen: HashMap<Key, Seen>,
+    /// `seen` keys in the order they came, so forgetting is not a scan of all of them. Holds
+    /// stale keys too (forgotten or overwritten), told apart by `first`.
+    order: VecDeque<(Instant, Key)>,
     stats: RelayStats,
 }
 
 impl Relay {
     pub fn new(config: RelayConfig, me: [u8; 4]) -> Self {
-        Self { config, me, enabled: true, seen: HashMap::new(), stats: RelayStats::default() }
+        Self { config, me, enabled: true, seen: HashMap::new(), order: VecDeque::new(), stats: RelayStats::default() }
     }
 
     fn forget_old(&mut self, now: Instant) {
-        let memory = self.config.memory;
-        self.seen.retain(|_, seen| seen.pending.is_some() || now.saturating_duration_since(seen.first) < memory);
+        while let Some(&(first, key)) = self.order.front() {
+            if now.saturating_duration_since(first) < self.config.memory {
+                break;
+            }
+            match self.seen.get(&key) {
+                Some(seen) if seen.first == first && seen.pending.is_some() => break,
+                Some(seen) if seen.first == first => {
+                    self.seen.remove(&key);
+                }
+                _ => {}
+            }
+            self.order.pop_front();
+        }
+    }
+
+    fn remember(&mut self, key: Key, seen: Seen) {
+        while self.order.len() >= SEEN {
+            let Some((first, old)) = self.order.pop_front() else { break };
+            if self.seen.get(&old).is_some_and(|seen| seen.first == first) {
+                self.seen.remove(&old);
+            }
+        }
+        self.order.push_back((seen.first, key));
+        self.seen.insert(key, seen);
     }
 
     /// A packet heard (and decrypted). New packets with ttl > 1 are scheduled for one relay
@@ -86,7 +117,7 @@ impl Relay {
         }
         if packet.talker == self.me {
             // Our own from before a restart, or one we did not record: never relay it.
-            self.seen.insert(packet.key(), Seen { first: now, own: true, copies: 0, pending: None });
+            self.remember(packet.key(), Seen { first: now, own: true, copies: 0, pending: None });
             return Heard::Own;
         }
         let pending = (self.enabled && packet.ttl > 1).then(|| {
@@ -98,7 +129,7 @@ impl Relay {
         });
         // The copy just heard counts: in a group that all hears the talker, the first relay is
         // the second copy everyone hears, and it suppresses the other relays.
-        self.seen.insert(packet.key(), Seen { first: now, own: false, copies: 1, pending });
+        self.remember(packet.key(), Seen { first: now, own: false, copies: 1, pending });
         Heard::New
     }
 
@@ -114,7 +145,7 @@ impl Relay {
     /// Our own packets, so their echoes are recognised.
     pub fn on_sent(&mut self, packet: &Packet, now: Instant) {
         self.forget_old(now);
-        self.seen.insert(packet.key(), Seen { first: now, own: true, copies: 0, pending: None });
+        self.remember(packet.key(), Seen { first: now, own: true, copies: 0, pending: None });
     }
 
     /// Relays to send now, ttl already lowered.
@@ -237,5 +268,22 @@ mod tests {
         relay.due(now + Duration::from_millis(50));
         assert_eq!(relay.on_heard(&packet(1, 0, 4), now + Duration::from_secs(9), 0.0), Heard::Duplicate);
         assert_eq!(relay.on_heard(&packet(1, 0, 4), now + Duration::from_secs(11), 0.0), Heard::New);
+    }
+
+    #[test]
+    fn memory_is_bounded_under_a_flood() {
+        let now = Instant::now();
+        let mut relay = Relay::new(RelayConfig::default(), [9; 4]);
+        for n in 0..30_000u32 {
+            let forged = Packet { talker: (n >> 16).to_be_bytes()[2..].iter().chain(&[1, 2]).copied().collect::<Vec<_>>().try_into().unwrap(), seq: n as u16, ..packet(0, 0, 1) };
+            assert_eq!(relay.on_heard(&forged, now, 0.0), Heard::New);
+            if n % 2 == 0 {
+                relay.forget(&forged);
+            }
+        }
+        assert!(relay.seen.len() <= SEEN && relay.order.len() <= SEEN);
+        // The newest are still recognised.
+        let last = Packet { talker: [0, 0, 1, 2], seq: 29_999u32 as u16, ..packet(0, 0, 1) };
+        assert_eq!(relay.on_heard(&last, now, 0.0), Heard::Duplicate);
     }
 }

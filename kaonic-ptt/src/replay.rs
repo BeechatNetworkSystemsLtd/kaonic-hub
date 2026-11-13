@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use crate::Packet;
 
-/// Talkers remembered; past this the least recently heard is forgotten.
+/// Talkers remembered; past this the least recently heard with no open burst is forgotten
+/// (never the protected admin), and a new talker is refused while every one has an open burst.
 const TALKERS: usize = 256;
 /// A burst with no packets for this long is closed.
 pub const BURST_CLOSE: Duration = Duration::from_secs(2);
@@ -70,6 +71,8 @@ impl Burst {
 pub struct Replay {
     talkers: HashMap<[u8; 4], Talker>,
     clock: u64,
+    /// Never forgotten to make room (the admin).
+    protected: Option<[u8; 4]>,
 }
 
 impl Replay {
@@ -81,11 +84,8 @@ impl Replay {
     /// packet of a burst that is older than one already heard or already closed.
     pub fn check(&mut self, packet: &Packet, now: Instant) -> bool {
         self.clock += 1;
-        if !self.talkers.contains_key(&packet.talker) && self.talkers.len() >= TALKERS {
-            let oldest = self.talkers.iter().min_by_key(|(_, talker)| talker.heard).map(|(id, _)| *id);
-            if let Some(oldest) = oldest {
-                self.talkers.remove(&oldest);
-            }
+        if !self.talkers.contains_key(&packet.talker) && self.talkers.len() >= TALKERS && !self.make_room(now) {
+            return false;
         }
         let talker = self.talkers.entry(packet.talker).or_default();
         talker.heard = self.clock;
@@ -106,6 +106,23 @@ impl Replay {
             talker.current = None;
         }
         taken
+    }
+
+    /// The talker never forgotten to make room for others (the admin): forged talker ids
+    /// cannot push its counter out and so let a recording of it in again.
+    pub fn protect(&mut self, talker: Option<[u8; 4]>) {
+        self.protected = talker;
+    }
+
+    /// Forgets the least recently heard talker whose burst is closed, other than the protected
+    /// one. False when every one has an open burst.
+    fn make_room(&mut self, now: Instant) -> bool {
+        let closed = |talker: &Talker| talker.current.as_ref().is_none_or(|burst| now.saturating_duration_since(burst.last) >= BURST_CLOSE);
+        let oldest = self.talkers.iter()
+            .filter(|(id, talker)| self.protected != Some(**id) && closed(talker))
+            .min_by_key(|(_, talker)| talker.heard)
+            .map(|(id, _)| *id);
+        oldest.is_some_and(|oldest| self.talkers.remove(&oldest).is_some())
     }
 
     /// The highest counter taken from `talker` (to keep across restarts).
@@ -203,5 +220,30 @@ mod tests {
         }
         replay.check(&packet(9, 1, 0, 1, true), now);
         assert!(replay.talkers.len() <= TALKERS);
+    }
+
+    #[test]
+    fn forged_talkers_cannot_push_out_the_admin_or_an_open_burst() {
+        let (mut replay, now) = (Replay::new(), Instant::now());
+        replay.protect(Some([7; 4]));
+        let recorded = packet(7, 10, 0, 100, true);
+        assert!(replay.check(&recorded, now));
+        assert!(replay.check(&packet(1, 10, 0, 100, true), now));
+        // A talker with an open burst is not forgotten: new ids are refused instead.
+        let forged = |id: u16| Packet { talker: [9, 9, (id >> 8) as u8, id as u8], ..packet(0, 1, 0, 1, true) };
+        for id in 0..1000 {
+            replay.check(&forged(id), now);
+        }
+        assert!(replay.talkers.len() <= TALKERS);
+        assert!(!replay.check(&packet(1, 10, 0, 100, true), now), "taken once before");
+        assert!(replay.check(&packet(1, 10, 1, 100, false), now), "its burst goes on");
+        // Once the bursts closed, the forged ones are forgotten first, the admin never.
+        let later = now + BURST_CLOSE;
+        for id in 1000..3000 {
+            replay.check(&forged(id), later);
+        }
+        assert!(replay.talkers.len() <= TALKERS);
+        assert_eq!(replay.highest(&[7; 4]), Some(100));
+        assert!(!replay.check(&recorded, later), "the admin's recording is still refused");
     }
 }

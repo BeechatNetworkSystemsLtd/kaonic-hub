@@ -52,6 +52,7 @@ impl Gate {
     /// The admin's talker id; None while unknown.
     pub fn set_admin_talker(&mut self, talker: Option<[u8; 4]>) {
         self.admin_talker = talker;
+        self.replay.protect(talker);
     }
 
     pub fn replay(&mut self) -> &mut Replay {
