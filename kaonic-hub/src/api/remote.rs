@@ -47,6 +47,7 @@ fn remote_device(id: &str, info: Value) -> Value {
         "bands": info["bands"],
         "metrics": info["metrics"],
         "ptt": info["ptt"],
+        "sharing": info["sharing"],
     })
 }
 
@@ -75,6 +76,20 @@ pub async fn ptt(State(app): State<App>, _: Admin, Path(id): Path<String>, Json(
     let settings = admin::request(&app, &id, json!({ "op": "ptt", "settings": settings })).await?;
     audit(&app, "remote.ptt", id).await;
     Ok(no_store(axum::Json(settings)))
+}
+
+/// `PUT /peers/{id}/remote/vpn/uplink`: the node takes internet from a gateway node, or stops.
+pub async fn uplink(State(app): State<App>, _: Admin, Path(id): Path<String>, Json(uplink): Json<Value>) -> ApiResult<Response> {
+    let view = admin::request(&app, &id, json!({ "op": "uplink", "uplink": uplink })).await?;
+    audit(&app, "remote.uplink", format!("{id}: {}", if view["enabled"] == true { "on" } else { "off" })).await;
+    Ok(no_store(axum::Json(view)))
+}
+
+/// `PUT /peers/{id}/remote/vpn/gateway`: the node shares its internet with the mesh, or stops.
+pub async fn gateway(State(app): State<App>, _: Admin, Path(id): Path<String>, Json(gateway): Json<Value>) -> ApiResult<Response> {
+    let view = admin::request(&app, &id, json!({ "op": "gateway", "gateway": gateway })).await?;
+    audit(&app, "remote.gateway", format!("{id}: {}", if view["enabled"] == true { "on" } else { "off" })).await;
+    Ok(no_store(axum::Json(view)))
 }
 
 #[derive(Deserialize)]

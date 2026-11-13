@@ -39,6 +39,10 @@ pub(crate) enum Op {
     Codename { codename: String },
     Radio { band: String, config: Value },
     Ptt { settings: Value },
+    /// Take internet from a gateway node (as `PUT /vpn/uplink` takes it).
+    Uplink { uplink: Value },
+    /// Share this node's internet with the mesh (as `PUT /vpn/gateway` takes it).
+    Gateway { gateway: Value },
     Restart {},
     Reboot {},
     Update {},
@@ -198,6 +202,8 @@ fn op_name(op: &Op) -> &'static str {
         Op::Codename { .. } => "codename",
         Op::Radio { .. } => "radio",
         Op::Ptt { .. } => "ptt",
+        Op::Uplink { .. } => "uplink",
+        Op::Gateway { .. } => "gateway",
         Op::Restart {} => "restart",
         Op::Reboot {} => "reboot",
         Op::Update {} => "update",
@@ -211,6 +217,7 @@ async fn run(app: &App, op: Op) -> ApiResult<Value> {
             "metrics": app.metrics.read(&app.device, &app.config.state_dir),
             "bands": crate::api::radio_bands::all_bands(app).await,
             "ptt": app.ptt.get().map(|ptt| ptt.settings()),
+            "sharing": crate::api::vpn::sharing(app),
         })),
         Op::Codename { codename } => {
             crate::api::device::set_codename_here(app, codename, "remote-admin").await?;
@@ -223,6 +230,14 @@ async fn run(app: &App, op: Op) -> ApiResult<Value> {
             let settings = patch.apply(ptt.settings()).map_err(|(field, message)| ApiError::field(field, message))?;
             ptt.set_settings(settings.clone()).await;
             Ok(serde_json::to_value(settings)?)
+        }
+        Op::Uplink { uplink } => {
+            let body = serde_json::from_value(uplink).map_err(|_| ApiError::bad_request("These uplink settings are not valid."))?;
+            crate::api::vpn::apply_uplink(app, body).await
+        }
+        Op::Gateway { gateway } => {
+            let body = serde_json::from_value(gateway).map_err(|_| ApiError::bad_request("These gateway settings are not valid."))?;
+            crate::api::vpn::apply_gateway(app, body).await
         }
         Op::Restart {} | Op::Reboot {} => {
             let reboot = matches!(op, Op::Reboot {});
@@ -366,6 +381,9 @@ mod tests {
         assert!(serde_json::from_str::<Op>(r#"{"op":"shell","command":"rm -rf /"}"#).is_err());
         assert!(serde_json::from_str::<Op>(r#"{"op":"restart","now":true}"#).is_err());
         assert!(serde_json::from_str::<Op>(r#"{"op":"codename"}"#).is_err());
+        assert!(matches!(serde_json::from_str::<Op>(r#"{"op":"uplink","uplink":{"enabled":true,"peer_id":null}}"#), Ok(Op::Uplink { .. })));
+        assert!(matches!(serde_json::from_str::<Op>(r#"{"op":"gateway","gateway":{"enabled":false}}"#), Ok(Op::Gateway { .. })));
+        assert!(serde_json::from_str::<Op>(r#"{"op":"uplink","enabled":true}"#).is_err());
     }
 
     #[test]

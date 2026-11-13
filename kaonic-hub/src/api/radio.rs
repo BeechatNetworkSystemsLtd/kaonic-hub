@@ -267,13 +267,19 @@ const PACKETS_PER_EVENT: usize = 30;
 
 /// A complete packet's frame as the Mesh page draws it. `me` is this node's identity hash,
 /// `owner` the node a destination belongs to (link ids belong to nobody we can name cheaply).
+/// One frame as a packet between two nodes. A null end is this device (as `MeshPacket` says),
+/// or a node that cannot be named; `owner` names the node behind a destination or link id.
 fn packet_view(frame: &FrameRecord, me: &str, owner: impl Fn(&kaonic_mesh::reticulum::hash::AddressHash) -> Option<String>) -> Option<MeshPacketView> {
     let packet = frame.packet.as_ref()?;
     let announce = packet.kind == FrameKind::Announce;
     let dest_owner = owner(&packet.destination);
+    // The other end: whoever owns the destination, unless that is us.
+    let other = dest_owner.clone().filter(|owner| owner != me);
     let (from_id, to_id) = match frame.direction {
-        Direction::Tx => (Some(me.to_owned()), if announce { None } else { dest_owner.clone() }),
-        Direction::Rx => (if announce { dest_owner.clone() } else { None }, Some(me.to_owned())),
+        // Our own announce goes to everyone: no single other end.
+        Direction::Tx => (None, if announce { None } else { other }),
+        // An announce names its sender; link data its link's other end.
+        Direction::Rx => (other, None),
     };
     // Through a relay, and not ours to end: an announce passed on, a packet for someone else.
     let relayed = packet.hops > 0 && dest_owner.as_deref() != Some(me);
@@ -357,7 +363,13 @@ pub fn spawn_producers(app: App) {
                         let views: Vec<FrameView> = frames.iter().map(|frame| namer.view(frame)).collect();
                         app.bus.publish("frames", "radio.frames", views);
                         let me = mesh.identity_hash();
-                        let mut packets: Vec<MeshPacketView> = frames.iter().filter_map(|frame| packet_view(frame, me, |destination| mesh.owner_of(destination))).collect();
+                        // Link packets are addressed to the link: name its other end.
+                        let link_peers: std::collections::HashMap<String, String> = match app.links.get() {
+                            Some(links) => links.view().await.into_iter().filter(|view| !view.link_id.is_empty()).map(|view| (view.link_id, view.peer)).collect(),
+                            None => Default::default(),
+                        };
+                        let owner = |destination: &kaonic_mesh::reticulum::hash::AddressHash| mesh.owner_of(destination).or_else(|| link_peers.get(&kaonic_mesh::node::hex(destination)).cloned());
+                        let mut packets: Vec<MeshPacketView> = frames.iter().filter_map(|frame| packet_view(frame, me, owner)).collect();
                         if packets.len() > PACKETS_PER_EVENT {
                             packets.drain(..packets.len() - PACKETS_PER_EVENT);
                         }
@@ -382,7 +394,14 @@ mod tests {
         use kaonic_mesh::traffic::PacketInfo;
         let peer_dest = AddressHash::new_from_slice(&[1; 16]);
         let link = AddressHash::new_from_slice(&[2; 16]);
-        let owner = |destination: &AddressHash| (*destination == peer_dest).then(|| "peer".to_owned());
+        let own = AddressHash::new_from_slice(&[3; 16]);
+        let owner = |destination: &AddressHash| {
+            if *destination == peer_dest || *destination == link {
+                Some("peer".to_owned())
+            } else {
+                (*destination == own).then(|| "me".to_owned())
+            }
+        };
         let frame = |direction, kind, destination, hops| FrameRecord {
             seq: 1,
             ts_ms: 5,
@@ -394,19 +413,22 @@ mod tests {
             packet: Some(PacketInfo { kind, hops, destination, destination_type: DestinationType::Single, len: 120 }),
         };
         let view = |frame: FrameRecord| packet_view(&frame, "me", owner).unwrap();
-        // Our announce: broadcast.
+        // This device is the null end. Our announce goes to everyone.
         let ours = view(frame(Direction::Tx, FrameKind::Announce, AddressHash::new_from_slice(&[9; 16]), 0));
-        assert_eq!((ours.kind, ours.from_id.as_deref(), ours.to_id.as_deref(), ours.bytes), ("announce", Some("me"), None, 120));
+        assert_eq!((ours.kind, ours.from_id.as_deref(), ours.to_id.as_deref(), ours.bytes), ("announce", None, None, 120));
         // A neighbour's announce names its sender; one passed on by a relay is relayed.
         let heard = view(frame(Direction::Rx, FrameKind::Announce, peer_dest, 0));
-        assert_eq!((heard.kind, heard.from_id.as_deref(), heard.to_id.as_deref()), ("announce", Some("peer"), Some("me")));
+        assert_eq!((heard.kind, heard.from_id.as_deref(), heard.to_id.as_deref()), ("announce", Some("peer"), None));
         assert_eq!(view(frame(Direction::Rx, FrameKind::Announce, peer_dest, 2)).kind, "relayed");
-        // Link data: the link id belongs to nobody we can name.
+        // Link data names the link's other end, both ways.
         let data = view(frame(Direction::Rx, FrameKind::Data, link, 0));
-        assert_eq!((data.kind, data.from_id, data.to_id.as_deref()), ("data", None, Some("me")));
-        let sent = view(frame(Direction::Tx, FrameKind::Data, peer_dest, 0));
-        assert_eq!(sent.to_id.as_deref(), Some("peer"));
-        assert_eq!(view(frame(Direction::Tx, FrameKind::Data, link, 1)).kind, "relayed");
+        assert_eq!((data.kind, data.from_id.as_deref(), data.to_id.as_deref()), ("data", Some("peer"), None));
+        let sent = view(frame(Direction::Tx, FrameKind::Data, link, 0));
+        assert_eq!((sent.from_id.as_deref(), sent.to_id.as_deref()), (None, Some("peer")));
+        // Data for our own destination: the sender is not in the packet.
+        let unnamed = view(frame(Direction::Rx, FrameKind::Data, own, 0));
+        assert_eq!((unnamed.from_id, unnamed.to_id), (None, None));
+        assert_eq!(view(frame(Direction::Tx, FrameKind::Data, AddressHash::new_from_slice(&[4; 16]), 1)).kind, "relayed");
         // Segments and corrupt frames are not packets.
         let mut segment = frame(Direction::Rx, FrameKind::Segment, link, 0);
         segment.packet = None;

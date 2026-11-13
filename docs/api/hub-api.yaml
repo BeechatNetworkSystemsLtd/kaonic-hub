@@ -1470,6 +1470,47 @@ paths:
         '502': { $ref: '#/components/responses/Upstream' }
         '504': { $ref: '#/components/responses/PeerTimeout' }
 
+  /peers/{peer_id}/remote/vpn/uplink:
+    put:
+      tags: [remote]
+      operationId: putRemoteVpnUplink
+      summary: Makes a node take internet from a gateway node, or stop, as `PUT /vpn/uplink` does on the node.
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/VpnUplinkInput' } } }
+      responses:
+        '200':
+          description: The node's uplink now.
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnUplink' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+  /peers/{peer_id}/remote/vpn/gateway:
+    put:
+      tags: [remote]
+      operationId: putRemoteVpnGateway
+      summary: Makes a node share its internet with the mesh, or stop, as `PUT /vpn/gateway` does on the node.
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/VpnGatewayInput' } } }
+      responses:
+        '200':
+          description: The node's gateway now.
+          content: { application/json: { schema: { $ref: '#/components/schemas/VpnGateway' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '504': { $ref: '#/components/responses/PeerTimeout' }
+
   # ───────────────────────────── links ─────────────────────────────
   /links:
     get:
@@ -1568,17 +1609,7 @@ paths:
       x-role: admin
       requestBody:
         required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [enabled]
-              properties:
-                enabled: { type: boolean }
-                peer_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: Null picks the first node offering to be a gateway. }
-                default_route: { type: boolean, description: 'Everything goes through the gateway, this node''s own traffic too (the board''s kernel has no policy routing). Default true.' }
-                routes: { type: array, maxItems: 32, items: { $ref: '#/components/schemas/Ipv4Cidr' }, description: Destinations sent to the gateway when default_route is off. }
+        content: { application/json: { schema: { $ref: '#/components/schemas/VpnUplinkInput' } } }
       responses:
         '200':
           description: OK
@@ -1592,20 +1623,7 @@ paths:
       x-role: admin
       requestBody:
         required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [enabled]
-              properties:
-                enabled: { type: boolean }
-                egress_interface: { type: [string, 'null'], description: Null = interface of the default route. }
-                routes:
-                  type: array
-                  maxItems: 32
-                  items: { $ref: '#/components/schemas/Ipv4Cidr' }
-                  description: Destinations to forward; 0.0.0.0/0 shares the full uplink. Required non-empty when enabled.
+        content: { application/json: { schema: { $ref: '#/components/schemas/VpnGatewayInput' } } }
       responses:
         '200':
           description: OK
@@ -2100,9 +2118,10 @@ paths:
     get:
       tags: [updates]
       operationId: getSoftware
-      summary: The hub and the installer, their updated copies, and the last hub update.
+      summary: The core programs, their updated copies, and the last hub update.
       description: |
-        The hub and the installer update each other. `release_key: false` is a development
+        The hub and the installer update each other; the hub also updates commd and the
+        factory server (`programs`). `release_key: false` is a development
         device: updates and plugins install unsigned.
       x-role: viewer
       responses:
@@ -2127,6 +2146,17 @@ paths:
                   core:
                     description: The installer's `/v1/core` (see installer-api.yaml `CoreStatus`); null if unreachable.
                     type: [array, 'null']
+                  programs:
+                    description: commd and the factory server.
+                    type: array
+                    items:
+                      type: object
+                      required: [id, running, version, from_update]
+                      properties:
+                        id: { type: string, enum: [kaonic-commd, kaonic-factory] }
+                        running: { type: boolean }
+                        version: { type: [string, 'null'], description: Null when the image's copy does not say. }
+                        from_update: { type: boolean, description: Running the updated copy, not the image's. }
                     items: { type: object }
                   hub_update:
                     description: The last hub update (installer-api.yaml `HubJob`), or null.
@@ -2203,6 +2233,39 @@ paths:
         '200':
           description: Updated and running (installer-api.yaml `CoreStatus.updated`).
           content: { application/json: { schema: { type: object } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /software/core/{id}:
+    post:
+      tags: [updates]
+      operationId: updateCoreProgram
+      summary: Update commd or the factory server (the hub restarts it and waits for it).
+      description: |
+        `id` is `kaonic-commd` or `kaonic-factory`. Answers when done (up to two minutes): the
+        update counts once its service runs the new program and has stayed up for 20 s. If it
+        does not, the previous version is back and the answer is `502 update_failed`. Signing
+        rules as for the installer.
+      x-role: admin
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, enum: [kaonic-commd, kaonic-factory] } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, password]
+              properties:
+                file: { type: string, format: binary, maxLength: 67108864 }
+                password: { type: string }
+                allow_downgrade: { type: string, enum: ['1', 'true'] }
+      responses:
+        '200':
+          description: Updated and running (installer-api.yaml `CoreStatus.updated`).
+          content: { application/json: { schema: { type: object } } }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Validation' }
         '502': { $ref: '#/components/responses/Upstream' }
@@ -3705,6 +3768,7 @@ components:
         bands: { type: array, items: { $ref: '#/components/schemas/RadioBand' } }
         metrics: { oneOf: [{ $ref: '#/components/schemas/SystemMetrics' }, { type: 'null' }] }
         ptt: { oneOf: [{ $ref: '#/components/schemas/PttSettings' }, { type: 'null' }], description: Null where talk does not run. }
+        sharing: { oneOf: [{ $ref: '#/components/schemas/VpnSharing' }, { type: 'null' }], description: Its part in internet sharing. Null from a node too old to tell. }
     RemotePlugin:
       type: object
       required: [id, name, version, running]
@@ -3989,6 +4053,34 @@ components:
               peer_id: { $ref: '#/components/schemas/Hash' }
               codename: { type: string }
               routes: { type: array, items: { $ref: '#/components/schemas/Ipv4Cidr' } }
+    VpnUplinkInput:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+        peer_id: { oneOf: [{ $ref: '#/components/schemas/Hash' }, { type: 'null' }], description: Null picks the first node offering to be a gateway. }
+        default_route: { type: boolean, description: 'Everything goes through the gateway, this node''s own traffic too (the board''s kernel has no policy routing). Default true.' }
+        routes: { type: array, maxItems: 32, items: { $ref: '#/components/schemas/Ipv4Cidr' }, description: Destinations sent to the gateway when default_route is off. }
+    VpnGatewayInput:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+        egress_interface: { type: [string, 'null'], description: Null = interface of the default route. }
+        routes:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/Ipv4Cidr' }
+          description: Destinations to forward; 0.0.0.0/0 shares the full uplink. Required non-empty when enabled.
+    VpnSharing:
+      type: object
+      required: [uplink, gateway, internet]
+      properties:
+        uplink: { $ref: '#/components/schemas/VpnUplink' }
+        gateway: { $ref: '#/components/schemas/VpnGateway' }
+        internet: { type: boolean, description: The node has internet of its own (a default route not through the tunnel). }
     VpnGateway:
       type: object
       required: [enabled, active, routes, available_interfaces]

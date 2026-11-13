@@ -102,6 +102,8 @@ pub fn router(app: App) -> Router {
         .route("/peers/{peer_id}/remote/codename", put(remote::codename))
         .route("/peers/{peer_id}/remote/radio/bands/{band}", put(remote::radio_band))
         .route("/peers/{peer_id}/remote/ptt", patch(remote::ptt))
+        .route("/peers/{peer_id}/remote/vpn/uplink", put(remote::uplink))
+        .route("/peers/{peer_id}/remote/vpn/gateway", put(remote::gateway))
         .route("/peers/{peer_id}/remote/shell", get(remote::shell))
         .route("/peers/{peer_id}/remote/shell/ticket", post(remote::shell_ticket))
         .route("/remote/jobs", post(remote::start_jobs))
@@ -157,6 +159,7 @@ pub fn router(app: App) -> Router {
         .route("/software/installer", post(software::update_installer))
         .route("/software/history", get(software::history))
         .route("/software/{id}/icon", get(core_icons::icon))
+        .route("/software/core/{id}", post(software::update_launched))
         // jobs and events
         .route("/jobs", get(jobs::list))
         .route("/jobs/{id}", get(jobs::get_job))

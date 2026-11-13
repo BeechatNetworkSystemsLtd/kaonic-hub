@@ -560,7 +560,12 @@ pub struct UplinkBody {
 
 /// `PUT /vpn/uplink`
 pub async fn put_uplink(State(app): State<App>, _: Admin, Json(body): Json<UplinkBody>) -> ApiResult<Response> {
-    let vpn = vpn_of(&app)?;
+    Ok(no_store(axum::Json(apply_uplink(&app, body).await?)))
+}
+
+/// Applies an uplink change, here or for the admin over the mesh; the new uplink state.
+pub(crate) async fn apply_uplink(app: &App, body: UplinkBody) -> ApiResult<Value> {
+    let vpn = vpn_of(app)?;
     let mut share = vpn.share_settings();
     if let Some(peer) = &body.peer_id
         && !(peer.len() == 32 && peer.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -574,7 +579,7 @@ pub async fn put_uplink(State(app): State<App>, _: Admin, Json(body): Json<Uplin
         Some(routes) => {
             let routes = parse_list("routes", &routes, 32)?;
             for route in &routes {
-                check_prefix(&app, "routes", route, true)?;
+                check_prefix(app, "routes", route, true)?;
             }
             routes
         }
@@ -585,8 +590,8 @@ pub async fn put_uplink(State(app): State<App>, _: Admin, Json(body): Json<Uplin
         return Err(ApiError::field("routes", "Name the destinations to send to the gateway, or turn on the default route."));
     }
     share.uplink = kaonic_vpn::share::UplinkSettings { enabled: body.enabled, peer: body.peer_id.map(|peer| peer.to_lowercase()), default_route, routes };
-    save_and_apply(&app, share).await?;
-    Ok(no_store(axum::Json(state(&app)["uplink"].clone())))
+    save_and_apply(app, share).await?;
+    Ok(state(app)["uplink"].clone())
 }
 
 #[derive(Deserialize)]
@@ -599,7 +604,12 @@ pub struct GatewayBody {
 
 /// `PUT /vpn/gateway`
 pub async fn put_gateway(State(app): State<App>, _: Admin, Json(body): Json<GatewayBody>) -> ApiResult<Response> {
-    let vpn = vpn_of(&app)?;
+    Ok(no_store(axum::Json(apply_gateway(&app, body).await?)))
+}
+
+/// Applies a gateway change, here or for the admin over the mesh; the new gateway state.
+pub(crate) async fn apply_gateway(app: &App, body: GatewayBody) -> ApiResult<Value> {
+    let vpn = vpn_of(app)?;
     let mut share = vpn.share_settings();
     if let Some(name) = &body.egress_interface
         && (!valid_interface(name) || name == &vpn.status().interface)
@@ -613,7 +623,7 @@ pub async fn put_gateway(State(app): State<App>, _: Admin, Json(body): Json<Gate
         Some(routes) => {
             let routes = parse_list("routes", &routes, 32)?;
             for route in &routes {
-                check_prefix(&app, "routes", route, true)?;
+                check_prefix(app, "routes", route, true)?;
             }
             routes
         }
@@ -623,8 +633,17 @@ pub async fn put_gateway(State(app): State<App>, _: Admin, Json(body): Json<Gate
         return Err(ApiError::field("routes", "Name the destinations to forward (0.0.0.0/0 for everything)."));
     }
     share.gateway = kaonic_vpn::share::GatewaySettings { enabled: body.enabled, egress_interface: body.egress_interface, routes };
-    save_and_apply(&app, share).await?;
-    Ok(no_store(axum::Json(state(&app)["gateway"].clone())))
+    save_and_apply(app, share).await?;
+    Ok(state(app)["gateway"].clone())
+}
+
+/// This node's part in internet sharing, for the admin's overview: its uplink, its gateway,
+/// and whether it has internet of its own (a default route not through the tunnel).
+pub(crate) fn sharing(app: &App) -> Value {
+    let state = state(app);
+    let tunnel = state["interface"].as_str().unwrap_or("kaonic0").to_owned();
+    let internet = kaonic_vpn::kernel::all_routes().iter().any(|route| route.prefix.prefix_len() == 0 && route.interface != tunnel);
+    json!({ "uplink": state["uplink"], "gateway": state["gateway"], "internet": internet })
 }
 
 #[cfg(test)]

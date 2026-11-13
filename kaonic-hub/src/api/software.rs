@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use axum::Extension;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -42,9 +42,46 @@ pub async fn get(State(app): State<App>, _: Viewer) -> ApiResult<Response> {
         "hub": { "version": env!("CARGO_PKG_VERSION"), "from_update": from_update },
         "installer": { "version": installer_version, "reachable": installer_version.is_some() },
         "core": core,
+        "programs": programs(&app).await,
         "hub_update": hub_job,
         "release_key": release_key,
     }))))
+}
+
+/// commd and the factory server: whether they run, their version, and whether it is the update.
+async fn programs(app: &App) -> Vec<serde_json::Value> {
+    let core_dir = app.plugins().settings.core_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        use kaonic_hub_installer::host::Host;
+        let host = kaonic_hub_installer::host::System;
+        kaonic_hub_installer::names::LAUNCHED
+            .iter()
+            .map(|id| {
+                let running = host.main_process(&format!("{id}.service")).is_some();
+                let from_update = kaonic_hub_installer::core::runs_update(&core_dir, &host, id, std::time::Duration::ZERO);
+                let record = kaonic_hub_installer::core::Core::record_in(&core_dir, id);
+                let version = if from_update { record.map(|record| record.version) } else { image_version(id) };
+                let about = kaonic_hub_installer::core::describe(&core_dir, std::path::Path::new(kaonic_hub_installer::core::IMAGE_FILES), id).map(|(manifest, _)| manifest);
+                serde_json::json!({
+                    "id": id,
+                    "name": about.as_ref().map_or_else(|| (*id).to_owned(), |manifest| manifest.name.clone()),
+                    "description": about.map(|manifest| manifest.description).unwrap_or_default(),
+                    "running": running,
+                    "version": version,
+                    "from_update": from_update,
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The version the system image's copy of `id` says it is, in `/etc/kaonic/<id>.version`
+/// (`<id>-version=...`, written by its Yocto recipe).
+fn image_version(id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/etc/kaonic/{id}.version")).ok()?;
+    text.lines().find_map(|line| line.strip_prefix(&format!("{id}-version=")).map(|version| version.trim().to_owned()))
 }
 
 /// `POST /software/hub`: multipart `file`, `password`, `allow_downgrade`. Answers 202: the
@@ -113,17 +150,61 @@ pub async fn update_installer(State(app): State<App>, peer: Option<Extension<Pee
         result
     });
     let result = task.await.map_err(|_| ApiError::internal())?.map_err(|_| ApiError::internal())?;
-    match result {
-        Ok(record) => Ok(no_store(axum::Json(record))),
-        Err(failure) => Err(match failure.kind {
-            kaonic_hub_installer::Kind::Invalid => ApiError::field("file", failure.message),
-            kaonic_hub_installer::Kind::Conflict => ApiError::conflict(failure.message),
-            kaonic_hub_installer::Kind::Downgrade => ApiError::new(StatusCode::CONFLICT, "downgrade", failure.message),
-            kaonic_hub_installer::Kind::Forbidden => ApiError::forbidden("refused", failure.message),
-            kaonic_hub_installer::Kind::NotFound => ApiError::not_found(failure.message),
-            kaonic_hub_installer::Kind::Failed => ApiError::new(StatusCode::BAD_GATEWAY, "update_failed", failure.message),
-        }),
+    result.map(|record| no_store(axum::Json(record))).map_err(core_failure)
+}
+
+fn core_failure(failure: kaonic_hub_installer::Error) -> ApiError {
+    match failure.kind {
+        kaonic_hub_installer::Kind::Invalid => ApiError::field("file", failure.message),
+        kaonic_hub_installer::Kind::Conflict => ApiError::conflict(failure.message),
+        kaonic_hub_installer::Kind::Downgrade => ApiError::new(StatusCode::CONFLICT, "downgrade", failure.message),
+        kaonic_hub_installer::Kind::Forbidden => ApiError::forbidden("refused", failure.message),
+        kaonic_hub_installer::Kind::NotFound => ApiError::not_found(failure.message),
+        kaonic_hub_installer::Kind::Failed => ApiError::new(StatusCode::BAD_GATEWAY, "update_failed", failure.message),
     }
+}
+
+/// `POST /software/core/{id}`: multipart `file`, `password`, `allow_downgrade`, for
+/// `kaonic-commd` or `kaonic-factory`. The hub swaps the program, restarts its service and
+/// waits until the service runs the update and stays up; if it does not within two minutes,
+/// the previous version goes back.
+pub async fn update_launched(State(app): State<App>, peer: Option<Extension<Peer>>, _: Admin, UrlPath(id): UrlPath<String>, headers: HeaderMap, body: Body) -> ApiResult<Response> {
+    if !kaonic_hub_installer::names::is_launched(&id) {
+        return Err(ApiError::not_found("Only kaonic-commd and kaonic-factory are updated here."));
+    }
+    let client = client(peer);
+    let form = upload::read(&app.config.state_dir, &headers, body).await?;
+    let file = form.file.ok_or_else(|| ApiError::field("file", "Choose a package."))?;
+    auth::reconfirm(&app, client, form.password.as_deref().unwrap_or_default(), "password").await?;
+    let one = UPDATING.try_lock().map_err(|_| ApiError::conflict("Another update is already running."))?;
+
+    let settings = app.plugins().settings.clone();
+    let release_keys = release_keys(&settings.release_key)?;
+    let actor = actor(client);
+    let allow_downgrade = form.allow_downgrade;
+    // On its own task, as for the installer: a cut request frees neither the lock nor loses the row.
+    let task = tokio::spawn(async move {
+        let _one = one;
+        let program = id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            use kaonic_hub_installer::{Error, Kind};
+            let mut package = std::fs::File::open(file.path()).map_err(|why| Error::new(Kind::Failed, format!("reading the upload: {why}")))?;
+            let host: Arc<dyn kaonic_hub_installer::host::Host> = Arc::new(kaonic_hub_installer::host::System);
+            let core = kaonic_hub_installer::core::Core::new(&settings.core_dir, &settings.installer_state, release_keys, host.clone())?;
+            let healthy = |_: &str| kaonic_hub_installer::core::runs_update(&settings.core_dir, host.as_ref(), &program, kaonic_hub_installer::core::LAUNCHED_SETTLE);
+            core.update(&program, &mut package, allow_downgrade, Some(&actor), &healthy, kaonic_hub_installer::core::START_TIMEOUT)
+        })
+        .await;
+        app.plugins().changed();
+        match &result {
+            Ok(Ok(record)) => audit(&app, "software.core", format!("{id} updated to {}", record.version)).await,
+            Ok(Err(failure)) => audit(&app, "software.core", format!("{id} update failed: {}", failure.message)).await,
+            Err(_) => audit(&app, "software.core", format!("{id} update failed: it stopped")).await,
+        }
+        result
+    });
+    let result = task.await.map_err(|_| ApiError::internal())?.map_err(|_| ApiError::internal())?;
+    result.map(|record| no_store(axum::Json(record))).map_err(core_failure)
 }
 
 #[derive(Deserialize)]

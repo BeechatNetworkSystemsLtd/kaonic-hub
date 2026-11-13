@@ -30,6 +30,9 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 /// a body sent one byte at a time cannot hold a connection.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Updating the installer, commd or the factory server: the upload, up to two minutes for the
+/// new one to come up, and putting the old one back if it does not.
+const CORE_UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Connections held at once, in total and from one address. Every connection is a task and
 /// a file descriptor; past the process limit nothing else in the hub can open a file.
 const MAX_CONNECTIONS: usize = 256;
@@ -167,8 +170,15 @@ async fn deadline(request: Request, next: axum::middleware::Next) -> Response {
         || (method == axum::http::Method::POST && path.ends_with("/api/v1/plugins"))
         || (method == axum::http::Method::PUT && path.ends_with("/package"))
         || (method == axum::http::Method::POST
-            && ["/api/v1/plugin-check", "/api/v1/software/hub", "/api/v1/software/installer"].iter().any(|upload| path.ends_with(upload)));
-    let limit = if upload { UPLOAD_TIMEOUT } else { REQUEST_TIMEOUT };
+            && ["/api/v1/plugin-check", "/api/v1/software/hub"].iter().any(|upload| path.ends_with(upload)));
+    let core_update = method == axum::http::Method::POST && (path.ends_with("/api/v1/software/installer") || path.starts_with("/api/v1/software/core/"));
+    let limit = if core_update {
+        CORE_UPDATE_TIMEOUT
+    } else if upload {
+        UPLOAD_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    };
     match tokio::time::timeout(limit, next.run(request)).await {
         Ok(response) => response,
         Err(_) => ApiError::new(StatusCode::REQUEST_TIMEOUT, "timeout", "The request took too long.").into_response(),
