@@ -1,0 +1,3 @@
+[submodule "kaonic-webui"]
+	path = resources/kaonic-webui
+	url = git@github.com:BeechatNetworkSystemsLtd/kaonic-webui.git
