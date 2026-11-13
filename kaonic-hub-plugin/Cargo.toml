@@ -1,0 +1,25 @@
+[package]
+name = "kaonic-hub-plugin"
+version = "0.1.0"
+description = "The SDK for Kaonic plugins: a small client for the hub's plugin API and the mesh bridge"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# base64, the HTTP and WebSocket clients.
+kaonic-hub-common = { path = "../kaonic-hub-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "sync", "fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
+# The real plugin API in the tests, with an in-process installer issuing the tokens.
+axum = { workspace = true }
+kaonic-hub = { path = "../kaonic-hub" }
+kaonic-hub-installer = { path = "../kaonic-hub-installer" }
+kaonic-keystore = { path = "../kaonic-keystore" }
+kaonic-mux = { path = "../kaonic-mux" }
+kaonic-store = { path = "../kaonic-store" }
