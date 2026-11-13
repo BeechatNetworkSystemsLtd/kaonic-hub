@@ -1,4 +1,4 @@
-//! Secure links on the emulated channel (`kaonic-air`): the nodes of one admin link up and
+//! Secure links on the emulated channel (`kaonic-sim-air`): the nodes of one admin link up and
 //! carry mux packets, through a relay where they are out of range; a node certified by
 //! another admin is refused even when it claims our admin in its announce.
 
@@ -9,7 +9,7 @@ use ed25519_dalek::SigningKey;
 use kaonic_mesh::announce::NodeInfo;
 use kaonic_mesh::links::{AllowlistSink, Auth, Links};
 use kaonic_mesh::{Mesh, MeshConfig};
-use kaonic_air::{Air, MediumConfig};
+use kaonic_sim_air::{Air, MediumConfig};
 use kaonic_handshake::Credentials;
 use kaonic_pki::{CertRequest, Certificate, Identity, IdentityHash};
 use kaonic_trust::{Allowlist, Trust};

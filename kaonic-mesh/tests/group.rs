@@ -1,4 +1,4 @@
-//! The GROUP channel on the emulated radio (`kaonic-air`): one packet reaches every neighbour
+//! The GROUP channel on the emulated radio (`kaonic-sim-air`): one packet reaches every neighbour
 //! holding the key, nobody further (relaying is the hubs' job), and after a rotation the
 //! previous epoch is still read for the grace period.
 
@@ -8,7 +8,7 @@ use std::time::Duration;
 use kaonic_mesh::announce::NodeInfo;
 use kaonic_mesh::group::{GroupChannel, GroupKeyMaterial, GroupMessage};
 use kaonic_mesh::{Mesh, MeshConfig};
-use kaonic_air::{Air, MediumConfig};
+use kaonic_sim_air::{Air, MediumConfig};
 use rand::rngs::OsRng;
 use reticulum::identity::PrivateIdentity;
 use tokio::sync::broadcast;

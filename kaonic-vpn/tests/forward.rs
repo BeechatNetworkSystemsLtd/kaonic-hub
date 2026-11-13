@@ -1,4 +1,4 @@
-//! Multicast forwarding between three nodes on the emulated channel (`kaonic-air`). A
+//! Multicast forwarding between three nodes on the emulated channel (`kaonic-sim-air`). A
 //! datagram heard on one node's LAN comes out once on the others' LANs where a rule matches,
 //! via a relay when out of range, and never comes back.
 
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use common::{ISSUED_AT, Keys, Node, all_up, auth, counters, init_log, node};
 use kaonic_vpn::forward::{Direction, Emit, Rule, presets};
-use kaonic_air::{Air, MediumConfig};
+use kaonic_sim_air::{Air, MediumConfig};
 use kaonic_pki::Certificate;
 
 const SA: Ipv4Addr = Ipv4Addr::new(239, 2, 3, 1);

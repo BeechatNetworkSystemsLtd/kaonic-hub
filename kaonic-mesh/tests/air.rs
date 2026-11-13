@@ -1,4 +1,4 @@
-//! Several meshes on one emulated channel (`kaonic-air`): they hear each other's
+//! Several meshes on one emulated channel (`kaonic-sim-air`): they hear each other's
 //! announces, and a node out of range of another learns it through a relay.
 
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use kaonic_mesh::announce::{Announced, NodeInfo};
 use kaonic_mesh::{Mesh, MeshConfig};
-use kaonic_air::{Air, MediumConfig};
+use kaonic_sim_air::{Air, MediumConfig};
 use rand::rngs::OsRng;
 use reticulum::identity::PrivateIdentity;
 

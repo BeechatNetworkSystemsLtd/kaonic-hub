@@ -12,7 +12,7 @@ use kaonic_vpn::forward::Rule;
 use kaonic_vpn::service::{Detached, VpnLimits};
 use kaonic_vpn::share::ShareSettings;
 use kaonic_vpn::{Vpn, VpnConfig};
-use kaonic_air::Air;
+use kaonic_sim_air::Air;
 use kaonic_handshake::Credentials;
 use kaonic_pki::{CertRequest, Certificate, Identity};
 use kaonic_trust::{Allowlist, Trust};

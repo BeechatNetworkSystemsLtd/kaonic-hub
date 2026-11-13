@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use common::{ISSUED_AT, Keys, Node, all_up, auth, counters, init_log, node};
 use kaonic_vpn::forward::defaults;
-use kaonic_air::{Air, MediumConfig};
+use kaonic_sim_air::{Air, MediumConfig};
 use kaonic_pki::Certificate;
 
 /// A phone: `socat` in the namespace `netns`, killed with the test.

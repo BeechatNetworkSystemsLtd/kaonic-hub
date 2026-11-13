@@ -21,7 +21,7 @@ socket2 = { version = "0.6", features = ["all"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
 # Emulated radio and test keys, to run several nodes in one test.
-kaonic-air = { path = "../kaonic-air" }
+kaonic-sim-air = { path = "../kaonic-sim-air" }
 kaonic-handshake = { path = "../kaonic-handshake" }
 kaonic-mesh = { path = "../kaonic-mesh" }
 kaonic-pki = { path = "../kaonic-pki" }

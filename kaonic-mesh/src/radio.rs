@@ -5,7 +5,7 @@
 //!   `/sys/class/net/<iface>/rf215/`. Frames go through a non-blocking `AF_PACKET` raw socket
 //!   bound to it. kaonic-commd keeps its own socket on the same interface (it drives the
 //!   radio front-end); each socket gets its own copy of every received frame.
-//! - Without a board: `air://HOST:PORT/NAME`, a node called NAME on a `kaonic-air` emulator,
+//! - Without a board: `air://HOST:PORT/NAME`, a node called NAME on a `kaonic-sim-air` emulator,
 //!   which delivers each frame to the nodes in range with time on air, loss and collisions.
 //!   Datagrams to the air: `0x00 | frame` or `0x01 | name` (register); from the air:
 //!   `rssi i8 | frame`.
@@ -119,7 +119,7 @@ impl RadioSocket {
     }
 }
 
-/// A node on a `kaonic-air` emulator.
+/// A node on a `kaonic-sim-air` emulator.
 struct AirSocket {
     socket: UdpSocket,
     hello: Vec<u8>,

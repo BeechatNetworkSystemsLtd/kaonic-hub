@@ -23,7 +23,7 @@ tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
 # The emulated radio channel, for meshes of several nodes in one test.
-kaonic-air = { path = "../kaonic-air" }
+kaonic-sim-air = { path = "../kaonic-sim-air" }
 # Certificates and keys for the secure-link tests.
 ed25519-dalek = { workspace = true }
 kaonic-pki = { path = "../kaonic-pki" }
