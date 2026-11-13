@@ -438,7 +438,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1270,7 +1270,7 @@ dependencies = [
 [[package]]
 name = "reticulum"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#1c2efb761db1afbdfe709d22169f76153036a397"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#206baa4d0ff4809ee69fad32c5a6c981f0664387"
 dependencies = [
  "log",
  "rand_core 0.6.4",
@@ -1284,7 +1284,7 @@ dependencies = [
 [[package]]
 name = "reticulum-core"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#1c2efb761db1afbdfe709d22169f76153036a397"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#206baa4d0ff4809ee69fad32c5a6c981f0664387"
 dependencies = [
  "aes",
  "cbc",
