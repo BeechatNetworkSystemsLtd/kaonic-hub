@@ -3,6 +3,7 @@
 //! - [`radio`]: a transceiver of the `kaonic_rf215` kernel driver, as a packet socket.
 //! - [`group`]: a Reticulum GROUP channel (one packet to every neighbour), for push-to-talk.
 //! - [`iface`]: the Reticulum interface on it, as LDPC-coded `kaonic-net` frames.
+//! - [`commd`]: the radio daemon's control messages the hub uses (the sub-GHz filter).
 //! - [`announce`]: what a node says about itself when it announces.
 //! - [`radio_config`]: everything the driver lets us configure on a band, and the network-wide switch.
 //! - [`settings`]: the radio's frequency, channel and modulation, kept by the hub.
@@ -12,6 +13,7 @@
 //! - [`log_limit`]: a log line written at most once per interval.
 
 pub mod announce;
+pub mod commd;
 pub mod group;
 pub mod iface;
 pub mod link;
