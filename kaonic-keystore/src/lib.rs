@@ -36,9 +36,9 @@
 //!
 //! # On the device
 //!
-//! Keep the store on `userfs` (`/usr/local`), not the A/B rootfs, so updates keep it.
-//! - Both slots share it: a release must not write what the previous slot cannot read
-//!   until its own slot is confirmed.
+//! Keep the store on `userfs` (`/usr/local`), not the root filesystem, so updates keep it.
+//! - After an upgrade the previous release may open it again (a rollback): a release must
+//!   not write what the previous one cannot read until it is confirmed.
 //! - The hub unit needs `RequiresMountsFor=/usr/local`; otherwise an unmounted userfs
 //!   makes `open_or_create` start a fresh store with a new identity.
 //!

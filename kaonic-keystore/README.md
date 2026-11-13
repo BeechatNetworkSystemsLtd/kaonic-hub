@@ -64,9 +64,9 @@ dropped. Values are `Secret`s: wiped on drop and hidden in `Debug` output.
 
 ## On the device
 
-- Keep the store on `/usr/local` (userfs), not the A/B rootfs, so updates keep it.
-- Both slots share it: a new release must not write a format the previous one cannot
-  read until its slot is confirmed.
+- Keep the store on `/usr/local` (userfs), not the root filesystem, so updates keep it.
+- After an upgrade the previous release may open it again (a rollback): a new release
+  must not write a format the previous one cannot read until it is confirmed.
 - The hub service needs `RequiresMountsFor=/usr/local`. Otherwise, if userfs fails to
   mount, `open_or_create` makes a fresh store with a new identity.
 
