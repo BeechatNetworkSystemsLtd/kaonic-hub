@@ -1,0 +1,11 @@
+[package]
+name = "kaonic-ptt"
+version = "0.1.0"
+description = "Kaonic push-to-talk core: voice packets, group relaying, floor control and playout. Pure, no I/O."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
