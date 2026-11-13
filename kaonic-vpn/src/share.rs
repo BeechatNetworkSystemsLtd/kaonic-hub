@@ -63,6 +63,12 @@ const OPTS_FILE: &str = "/run/kaonic-hub-dhcp/dhcp-opts";
 const NETWORKD_DROPIN: &str = "kaonic-hub-dhcp.conf";
 /// dnsmasq tag for clients that ignore classless routes.
 const NO_ROUTES: &str = "kh-noroutes";
+/// Our own dnsmasq exiting by itself is started again after this, doubled each time it exits
+/// soon after starting, up to `DNSMASQ_BACKOFF_MAX`.
+const DNSMASQ_BACKOFF_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+const DNSMASQ_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+/// A dnsmasq that ran this long before exiting starts the backoff afresh.
+const DNSMASQ_STABLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanRouter {
@@ -533,13 +539,38 @@ fn systemd_dnsmasq() -> bool {
 }
 
 /// DHCP for clients: the system dnsmasq service, or our own dnsmasq if there is none.
+#[derive(Default)]
 struct Dnsmasq {
     child: Option<std::process::Child>,
+    started: Option<std::time::Instant>,
+    /// Exits soon after starting, in a row.
+    exits: u32,
+    /// Not started again before this, after it exited by itself.
+    retry_at: Option<std::time::Instant>,
 }
 
 impl Dnsmasq {
+    /// Reaps our dnsmasq if it exited by itself, and backs off starting it again.
+    fn reap(&mut self, now: std::time::Instant) {
+        let Some(child) = self.child.as_mut() else { return };
+        let status = match child.try_wait() {
+            Ok(None) => return,
+            Ok(Some(status)) => status.to_string(),
+            Err(error) => error.to_string(),
+        };
+        self.child = None;
+        let ran = self.started.map_or(std::time::Duration::ZERO, |started| now.saturating_duration_since(started));
+        self.exits = if ran >= DNSMASQ_STABLE { 1 } else { self.exits.saturating_add(1) };
+        let wait = DNSMASQ_BACKOFF_FIRST.saturating_mul(1 << self.exits.saturating_sub(1).min(16)).min(DNSMASQ_BACKOFF_MAX);
+        self.retry_at = Some(now + wait);
+        log::warn!("vpn: dnsmasq exited ({status}); starting it again in {}s", wait.as_secs());
+    }
+
     fn apply(&mut self, wanted: Option<&Dhcp>, previous: Option<&Dhcp>, all_interfaces: &[String]) -> io::Result<()> {
-        if wanted == previous && (wanted.is_none() || systemd_dnsmasq() || self.child.is_some()) {
+        let now = std::time::Instant::now();
+        self.reap(now);
+        let backing_off = self.retry_at.is_some_and(|at| now < at);
+        if wanted == previous && (wanted.is_none() || systemd_dnsmasq() || self.child.is_some() || backing_off) {
             return Ok(());
         }
         std::fs::create_dir_all(RUN_DIR)?;
@@ -638,6 +669,8 @@ impl Dnsmasq {
                     .stderr(Stdio::null())
                     .spawn()?;
                 self.child = Some(child);
+                self.started = Some(now);
+                self.retry_at = None;
             }
             None => self.stop(),
         }
@@ -653,18 +686,23 @@ impl Dnsmasq {
 }
 
 /// Applies plans and remembers what it did.
+#[derive(Default)]
 pub struct Applier {
     applied: Plan,
     dnsmasq: Dnsmasq,
 }
 
-impl Default for Applier {
-    fn default() -> Self {
-        Self { applied: Plan::default(), dnsmasq: Dnsmasq { child: None } }
-    }
-}
-
 impl Applier {
+    /// Between plans: restarts our own dnsmasq if it exited by itself.
+    pub fn tend(&mut self, lan_interfaces: &[String]) -> io::Result<()> {
+        self.dnsmasq.reap(std::time::Instant::now());
+        if self.dnsmasq.child.is_some() || self.dnsmasq.retry_at.is_none() {
+            return Ok(());
+        }
+        let dhcp = self.applied.dhcp.clone();
+        self.dnsmasq.apply(dhcp.as_ref(), dhcp.as_ref(), lan_interfaces)
+    }
+
     /// Adds the wanted pool addresses on client interfaces and removes other pool addresses.
     fn addresses(&self, plan: &Plan, lan_interfaces: &[String]) -> io::Result<()> {
         let Some(pool) = plan.pool.or(self.applied.pool) else { return Ok(()) };
@@ -869,5 +907,33 @@ mod tests {
         let settings = ShareSettings { share_lans: false, ..ShareSettings::default() };
         let plan = plan(&input(&[], &settings, None, &[], None));
         assert_eq!(plan, Plan::default());
+    }
+
+    #[test]
+    fn a_dnsmasq_that_exits_is_reaped_and_backed_off() {
+        let mut dnsmasq = Dnsmasq::default();
+        let start = std::time::Instant::now();
+        for exits in 1..=8u32 {
+            let mut child = Command::new("true").spawn().unwrap();
+            while child.try_wait().unwrap().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // try_wait already reaped it; reap sees the stored status.
+            dnsmasq.child = Some(child);
+            dnsmasq.started = Some(start);
+            dnsmasq.reap(start);
+            assert!(dnsmasq.child.is_none());
+            assert_eq!(dnsmasq.exits, exits);
+            let wait = dnsmasq.retry_at.unwrap() - start;
+            assert_eq!(wait, (DNSMASQ_BACKOFF_FIRST * 2u32.pow(exits - 1)).min(DNSMASQ_BACKOFF_MAX));
+        }
+        // One that ran a while starts the backoff afresh.
+        dnsmasq.child = Some(Command::new("true").spawn().unwrap());
+        let later = start + DNSMASQ_STABLE;
+        while dnsmasq.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        dnsmasq.reap(later);
+        assert_eq!((dnsmasq.exits, dnsmasq.retry_at), (1, Some(later + DNSMASQ_BACKOFF_FIRST)));
     }
 }

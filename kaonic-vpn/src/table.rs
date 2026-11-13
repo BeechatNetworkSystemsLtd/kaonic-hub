@@ -26,6 +26,9 @@ const HELLO: &[u8; 4] = b"KVH1";
 pub const MAX_PREFIXES_PER_PEER: usize = 32;
 /// Min seconds between changes to a peer's prefixes, so routes don't flap.
 pub const CHANGE_COOLDOWN_SECS: i64 = 5;
+/// A peer changing its prefixes again soon after the last change waits twice as long, up to
+/// this (each change costs route and firewall updates).
+pub const CHANGE_COOLDOWN_MAX_SECS: i64 = 320;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hello {
@@ -78,6 +81,8 @@ pub struct PeerEntry {
     pub last_seen: i64,
     /// Unix seconds of the last prefix change.
     pub changed_at: i64,
+    /// Seconds before the next change is taken.
+    pub cooldown: i64,
 }
 
 /// A remote prefix and whether it is usable.
@@ -179,12 +184,16 @@ impl Table {
                 entry.last_seen = now;
                 Update::Unchanged
             }
-            Some(entry) if now - entry.changed_at < CHANGE_COOLDOWN_SECS => {
+            Some(entry) if now - entry.changed_at < entry.cooldown => {
                 entry.last_seen = now;
                 Update::Throttled
             }
-            _ => {
-                self.peers.insert(peer.to_owned(), PeerEntry { tunnel: expected, advertised, last_seen: now, changed_at: now });
+            known => {
+                let cooldown = match known {
+                    Some(entry) if now - entry.changed_at < 2 * entry.cooldown => (entry.cooldown * 2).min(CHANGE_COOLDOWN_MAX_SECS),
+                    _ => CHANGE_COOLDOWN_SECS,
+                };
+                self.peers.insert(peer.to_owned(), PeerEntry { tunnel: expected, advertised, last_seen: now, changed_at: now, cooldown });
                 self.rebuild();
                 Update::Changed
             }
@@ -447,6 +456,30 @@ mod tests {
         assert_eq!(table.route(Ipv4Addr::new(192, 168, 20, 1)), Some(B));
         assert_eq!(table.update(B, hello(B, &["192.168.21.0/24"]), 106), Update::Changed);
         assert_eq!(table.route(Ipv4Addr::new(192, 168, 21, 1)), Some(B));
+    }
+
+    #[test]
+    fn a_flapping_peer_waits_longer_each_time() {
+        let mut table = table(&[]);
+        let prefixes = [&["192.168.20.0/24"][..], &["192.168.21.0/24"][..]];
+        // It changes every HELLO it can: few changes are taken, further and further apart.
+        let mut taken = Vec::new();
+        for now in 0..3600i64 {
+            if table.update(B, hello(B, prefixes[now as usize % 2]), now) == Update::Changed {
+                taken.push(now);
+            }
+        }
+        assert!(taken.len() < 20, "{taken:?}");
+        let gaps: Vec<i64> = taken.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(gaps.windows(2).all(|pair| pair[1] >= pair[0]), "{gaps:?}");
+        assert!(gaps.last().is_some_and(|gap| *gap >= CHANGE_COOLDOWN_MAX_SECS));
+        // Once it settles, the next change is taken after the short cooldown again.
+        let last = *taken.last().unwrap();
+        let calm = last + 2 * CHANGE_COOLDOWN_MAX_SECS;
+        let current = table.peer(B).unwrap().advertised.clone();
+        let other = if current == vec!["192.168.20.0/24".parse().unwrap()] { prefixes[1] } else { prefixes[0] };
+        assert_eq!(table.update(B, hello(B, other), calm), Update::Changed);
+        assert_eq!(table.peer(B).unwrap().cooldown, CHANGE_COOLDOWN_SECS);
     }
 
     #[test]

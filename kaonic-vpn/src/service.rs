@@ -5,10 +5,11 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use kaonic_mesh::links::{Links, Received};
+use kaonic_mesh::log_limit::LogLimit;
 use kaonic_mux::{Kind, Message};
 use tokio::sync::{Notify, broadcast, mpsc};
 
@@ -33,6 +34,10 @@ const BATCH: usize = 64;
 const LOG: usize = 256;
 /// Max datagrams queued for the LAN sockets; more are dropped and counted.
 const EMIT_QUEUE: usize = 256;
+/// A fault that repeats for every packet (TUN reads and writes) is logged at most this often.
+const FAULT_LOG_EVERY: Duration = Duration::from_secs(10);
+/// How often the route and network threads look for work besides new plans (exit, dnsmasq).
+const WORKER_POLL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct VpnConfig {
@@ -74,10 +79,29 @@ impl Default for VpnLimits {
     }
 }
 
-/// A kernel route change, applied off the async runtime.
-enum RouteOp {
-    Add(Cidr),
-    Remove(Cidr),
+/// The newest value for a worker thread. Values set while it is busy replace each other, so
+/// nothing queues up however often they change.
+struct Latest<T> {
+    value: Mutex<Option<T>>,
+    ready: Condvar,
+}
+
+impl<T> Latest<T> {
+    fn new() -> Self {
+        Self { value: Mutex::new(None), ready: Condvar::new() }
+    }
+
+    fn set(&self, value: T) {
+        *self.value.lock().expect("latest lock") = Some(value);
+        self.ready.notify_one();
+    }
+
+    /// The newest value, or None if none came within `wait`.
+    fn take(&self, wait: Duration) -> Option<T> {
+        let value = self.value.lock().expect("latest lock");
+        let (mut value, _) = self.ready.wait_timeout_while(value, wait, |value| value.is_none()).expect("latest lock");
+        value.take()
+    }
 }
 
 impl VpnConfig {
@@ -198,14 +222,18 @@ pub struct Vpn {
     config: VpnConfig,
     tun: Tun,
     state: Mutex<State>,
-    routes: std::sync::mpsc::Sender<RouteOp>,
+    /// The routes the kernel should have, for the route thread.
+    routes: Arc<Latest<BTreeSet<Cidr>>>,
+    /// TUN read and write failures, logged at most every [`FAULT_LOG_EVERY`].
+    fault_log: Mutex<LogLimit>,
     /// Packet capture (off until started).
     pub capture: crate::capture::Capture,
     /// Retransmission between hubs.
     pub reliable: Arc<crate::reliable::Reliable>,
     identity: String,
     share: Mutex<Share>,
-    net: std::sync::mpsc::Sender<Plan>,
+    /// The newest sharing plan, for the network thread.
+    net: Arc<Latest<Plan>>,
     /// Forwarding rules and counters. Taken only after `state` is released, except in the
     /// flood checks, which take `state` then this.
     forward: Mutex<Forward>,
@@ -301,8 +329,8 @@ impl Vpn {
             flood_in: flood::Limiter::new(config.limits.flood_rate, config.limits.flood_burst),
             wrong_tunnel: HashSet::new(),
         };
-        let (routes, route_ops) = std::sync::mpsc::channel();
-        let (net, plans) = std::sync::mpsc::channel();
+        let routes = Arc::new(Latest::new());
+        let net = Arc::new(Latest::new());
         let share = Share {
             settings: config.share.clone(),
             lans: Vec::new(),
@@ -320,12 +348,13 @@ impl Vpn {
             config,
             tun,
             state: Mutex::new(state),
-            routes,
+            routes: routes.clone(),
+            fault_log: Mutex::new(LogLimit::new(FAULT_LOG_EVERY)),
             capture: Default::default(),
             reliable,
             identity: identity_hash.to_owned(),
             share: Mutex::new(share),
-            net,
+            net: net.clone(),
             forward: Mutex::new(forward),
             emits,
             forward_changed: Notify::new(),
@@ -333,10 +362,10 @@ impl Vpn {
         if system {
             let worker = Arc::downgrade(&vpn);
             let interface = vpn.config.interface.clone();
-            std::thread::Builder::new().name("vpn-routes".into()).spawn(move || route_worker(interface, route_ops, worker))?;
+            std::thread::Builder::new().name("vpn-routes".into()).spawn(move || route_worker(interface, routes, worker))?;
             let worker = Arc::downgrade(&vpn);
             let interface = vpn.config.interface.clone();
-            std::thread::Builder::new().name("vpn-net".into()).spawn(move || net_worker(interface, plans, worker))?;
+            std::thread::Builder::new().name("vpn-net".into()).spawn(move || net_worker(interface, net, worker))?;
         }
         vpn.refresh_share();
 
@@ -355,6 +384,14 @@ impl Vpn {
         self.state.lock().expect("vpn lock").last_error = Some(error);
     }
 
+    /// Like [`Self::error`], for a fault that may repeat for every packet.
+    fn packet_error(&self, error: String) {
+        if let Some(skipped) = self.fault_log.lock().expect("vpn fault log lock").allow(Instant::now()) {
+            log::warn!("vpn: {error} ({skipped} more not logged)");
+        }
+        self.state.lock().expect("vpn lock").last_error = Some(error);
+    }
+
     /// TUN → links.
     async fn carry_out(&self) {
         let mut buffer = vec![0u8; 65536];
@@ -363,7 +400,7 @@ impl Vpn {
             let first = match self.tun.read(&mut buffer).await {
                 Ok(length) => length,
                 Err(error) => {
-                    self.error(format!("reading {}: {error}", self.config.interface));
+                    self.packet_error(format!("reading {}: {error}", self.config.interface));
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -545,7 +582,7 @@ impl Vpn {
                             }
                         };
                         if accepted.is_some() && let Err(error) = self.tun.write(frame.payload).await {
-                            self.error(format!("writing {}: {error}", self.config.interface));
+                            self.packet_error(format!("writing {}: {error}", self.config.interface));
                         }
                         // Also to client networks if a rule says so. Never to another peer.
                         if accepted == Some(true) {
@@ -573,9 +610,12 @@ impl Vpn {
                         if let Some(hello) = Hello::decode(frame.payload) {
                             let mut state = self.state.lock().expect("vpn lock");
                             let described = format!("{}{}", hello.tunnel, if hello.advertised.is_empty() { String::new() } else { format!(", routes {:?}", hello.advertised.iter().map(ToString::to_string).collect::<Vec<_>>()) });
+                            let known = state.table.peer(&message.peer).is_some();
                             match state.table.update(&message.peer, hello, now_ms() / 1000) {
                                 Update::Changed => {
-                                    log::info!("vpn: {} is {described}", message.peer);
+                                    // A peer's first HELLO is news; its later changes are route churn.
+                                    let level = if known { log::Level::Debug } else { log::Level::Info };
+                                    log::log!(level, "vpn: {} is {described}", message.peer);
                                     routes_changed = true;
                                 }
                                 Update::WrongTunnel { claimed, expected } => {
@@ -606,15 +646,20 @@ impl Vpn {
             let to: Vec<String> = tokio::select! {
                 change = changes.recv() => match change {
                     Ok(peer) => {
-                        if self.links.established().contains(&peer) {
+                        let established = self.links.established();
+                        if established.contains(&peer) {
                             vec![peer]
                         } else {
-                            self.state.lock().expect("vpn lock").table.remove(&peer);
-                            self.sync_routes();
+                            self.forget_closed(&established);
                             Vec::new()
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => self.links.established(),
+                    // A missed close would leave its peer's routes: check every peer.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let established = self.links.established();
+                        self.forget_closed(&established);
+                        established
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
                 _ = every.tick() => {
@@ -624,11 +669,27 @@ impl Vpn {
                         self.sync_routes();
                     }
                     self.refresh_share();
+                    self.capture.tidy();
                     self.links.established()
                 }
             };
             self.send_hello(to).await;
         }
+    }
+
+    /// Forgets the routes, counters and retransmission state of peers whose link is down.
+    fn forget_closed(&self, established: &[String]) {
+        {
+            let mut state = self.state.lock().expect("vpn lock");
+            let gone: Vec<String> = state.table.peers().map(|(peer, _)| peer.clone()).filter(|peer| !established.contains(peer)).collect();
+            for peer in &gone {
+                state.table.remove(peer);
+            }
+            state.peers.retain(|peer, _| established.contains(peer));
+            state.wrong_tunnel.retain(|peer| established.contains(peer));
+        }
+        self.reliable.forget_closed(established);
+        self.sync_routes();
     }
 
     /// Sends our HELLO and gateway announcement to `to`.
@@ -771,6 +832,9 @@ impl Vpn {
         };
         state.table.set_uplink(uplink.as_ref().map(|uplink| (uplink.peer.clone(), uplink.routes.clone())));
 
+        // Clash counts of client subnets that are gone.
+        share.attempts.retain(|prefix, _| routes.iter().any(|route| route.prefix == *prefix && route.connected && settings.lan_interfaces.contains(&route.interface)));
+
         let remote_sources: Vec<Cidr> = state.table.installed().into_iter().collect();
         let plan = share::plan(&PlanInput {
             tun,
@@ -788,7 +852,7 @@ impl Vpn {
         let missing = plan.addresses.iter().any(|(interface, wanted, _)| !addresses.iter().any(|(name, address)| name == interface && address == wanted));
         if plan != share.planned || missing {
             share.planned = plan.clone();
-            let _ = self.net.send(plan);
+            self.net.set(plan);
         }
         let changed = hello_changed || gateway_was != share.gateway.active;
         drop(state);
@@ -799,18 +863,16 @@ impl Vpn {
 
     /// Syncs kernel routes to the TUN device with the table.
     fn sync_routes(&self) {
-        let (add, remove) = {
+        let wanted = {
             let mut state = self.state.lock().expect("vpn lock");
             let wanted = state.table.installed();
-            let add: Vec<Cidr> = wanted.difference(&state.installed).copied().collect();
-            let remove: Vec<Cidr> = state.installed.difference(&wanted).copied().collect();
-            state.installed = wanted;
-            (add, remove)
+            if wanted == state.installed {
+                return;
+            }
+            state.installed = wanted.clone();
+            wanted
         };
-        // Removals first, so a prefix moving between peers never has two routes.
-        for op in remove.into_iter().map(RouteOp::Remove).chain(add.into_iter().map(RouteOp::Add)) {
-            let _ = self.routes.send(op);
-        }
+        self.routes.set(wanted);
     }
 
     pub fn status(&self) -> Status {
@@ -863,24 +925,36 @@ impl Vpn {
     }
 }
 
-/// Applies sharing plans in order on its own thread, since the tools it runs are slow.
-fn net_worker(interface: String, plans: std::sync::mpsc::Receiver<Plan>, vpn: Weak<Vpn>) {
+/// Applies the newest sharing plan on its own thread, since the tools it runs are slow.
+/// Restarts our own dnsmasq if it exits.
+fn net_worker(interface: String, plans: Arc<Latest<Plan>>, vpn: Weak<Vpn>) {
     let mut applier = share::Applier::default();
-    for mut plan in plans.iter() {
-        // Only the newest plan matters.
-        while let Ok(newer) = plans.try_recv() {
-            plan = newer;
-        }
+    let mut logged = String::new();
+    loop {
+        let plan = plans.take(WORKER_POLL);
         let Some(lan_interfaces) = vpn.upgrade().map(|vpn| vpn.share.lock().expect("vpn share lock").settings.lan_interfaces.clone()) else { return };
+        let Some(plan) = plan else {
+            if let Err(error) = applier.tend(&lan_interfaces) {
+                match vpn.upgrade() {
+                    Some(vpn) => vpn.error(format!("sharing: {error}")),
+                    None => return,
+                }
+            }
+            continue;
+        };
         match applier.apply(&interface, &plan, &lan_interfaces) {
             Ok(()) => {
-                log::info!(
-                    "vpn: sharing: {} client network(s), routes pushed by DHCP {}, gateway {}, uplink {}",
+                let summary = format!(
+                    "{} client network(s), routes pushed by DHCP {}, gateway {}, uplink {}",
                     plan.dhcp.as_ref().map_or(0, |dhcp| dhcp.nets.len()),
                     plan.dhcp.as_ref().map_or("off".to_owned(), |dhcp| format!("{} ({}router)", dhcp.routes.len(), if dhcp.router { "" } else { "no " })),
                     if plan.nat_post.iter().any(|rule| rule.iter().any(|part| part == "MASQUERADE") && !rule.iter().any(|part| part == &interface)) { "on" } else { "off" },
                     if plan.uplink.is_some() { "on" } else { "off" },
                 );
+                // Remote routes changing alone is route churn.
+                let level = if summary == logged { log::Level::Debug } else { log::Level::Info };
+                log::log!(level, "vpn: sharing: {summary}");
+                logged = summary;
             }
             Err(error) => match vpn.upgrade() {
                 Some(vpn) => vpn.error(format!("sharing: {error}")),
@@ -890,18 +964,80 @@ fn net_worker(interface: String, plans: std::sync::mpsc::Receiver<Plan>, vpn: We
     }
 }
 
-/// Applies route changes in order on its own thread, so `ip` never stalls packet handling.
-fn route_worker(interface: String, ops: std::sync::mpsc::Receiver<RouteOp>, vpn: Weak<Vpn>) {
-    for op in ops {
-        let result = match &op {
-            RouteOp::Add(prefix) => tun::add_route(&interface, prefix).map(|()| log::info!("vpn: route {prefix} via {interface}")),
-            RouteOp::Remove(prefix) => tun::remove_route(&interface, prefix),
+/// Routes to remove and to add to go from `applied` to `wanted`.
+fn route_changes(applied: &BTreeSet<Cidr>, wanted: &BTreeSet<Cidr>) -> (Vec<Cidr>, Vec<Cidr>) {
+    (applied.difference(wanted).copied().collect(), wanted.difference(applied).copied().collect())
+}
+
+/// Makes the kernel's routes match the newest wanted set on its own thread, so `ip` never
+/// stalls packet handling. Sets that come while it works are merged into the next one.
+fn route_worker(interface: String, wanted: Arc<Latest<BTreeSet<Cidr>>>, vpn: Weak<Vpn>) {
+    let mut applied: BTreeSet<Cidr> = BTreeSet::new();
+    loop {
+        let Some(wanted) = wanted.take(WORKER_POLL) else {
+            if vpn.strong_count() == 0 {
+                return;
+            }
+            continue;
         };
-        if let Err(error) = result {
+        let (remove, add) = route_changes(&applied, &wanted);
+        let mut errors: Vec<String> = Vec::new();
+        // Removals first, so a prefix moving between peers never has two routes.
+        for prefix in remove {
+            if let Err(error) = tun::remove_route(&interface, &prefix) {
+                errors.push(error.to_string());
+            }
+            applied.remove(&prefix);
+        }
+        for prefix in add {
+            // One that fails is tried again with the next set.
+            match tun::add_route(&interface, &prefix) {
+                Ok(()) => {
+                    log::debug!("vpn: route {prefix} via {interface}");
+                    applied.insert(prefix);
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if let Some(first) = errors.first() {
             match vpn.upgrade() {
-                Some(vpn) => vpn.error(error.to_string()),
+                Some(vpn) => vpn.error(if errors.len() == 1 { first.clone() } else { format!("{first} (and {} more route errors)", errors.len() - 1) }),
                 None => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_worker_gets_only_the_newest_value() {
+        let latest = Latest::new();
+        for n in 0..10_000 {
+            latest.set(n);
+        }
+        assert_eq!(latest.take(Duration::ZERO), Some(9_999));
+        assert_eq!(latest.take(Duration::from_millis(10)), None);
+        let latest = Arc::new(latest);
+        let setter = latest.clone();
+        std::thread::spawn(move || setter.set(7));
+        assert_eq!(latest.take(Duration::from_secs(5)), Some(7));
+    }
+
+    #[test]
+    fn routes_change_by_difference() {
+        let set = |prefixes: &[&str]| prefixes.iter().map(|prefix| prefix.parse().unwrap()).collect::<BTreeSet<Cidr>>();
+        let (remove, add) = route_changes(&set(&["192.168.20.0/24", "192.168.30.0/24"]), &set(&["192.168.30.0/24", "192.168.40.0/24"]));
+        assert_eq!(remove, vec!["192.168.20.0/24".parse().unwrap()]);
+        assert_eq!(add, vec!["192.168.40.0/24".parse().unwrap()]);
+        // A peer flapping between two sets many times while the worker was busy: one change.
+        let latest = Latest::new();
+        for n in 0..64 {
+            latest.set(if n % 2 == 0 { set(&["192.168.20.0/24"]) } else { set(&["192.168.21.0/24"]) });
+        }
+        let (remove, add) = route_changes(&set(&["192.168.21.0/24"]), &latest.take(Duration::ZERO).unwrap());
+        assert!(remove.is_empty() && add.is_empty());
     }
 }

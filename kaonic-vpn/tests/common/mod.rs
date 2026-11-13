@@ -77,6 +77,7 @@ pub fn auth(admin: &Keys, root: &Certificate, keys: &Keys, listed: &[&Keys]) -> 
 pub struct Node {
     pub vpn: Arc<Vpn>,
     pub ends: Detached,
+    pub links: Arc<Links>,
     _mesh: Arc<Mesh>,
 }
 
@@ -88,6 +89,12 @@ pub async fn node(air: &Air, name: &str, keys: &Keys, admin_id: [u8; 16], auth: 
 
 /// A node with these sharing settings (not applied to the system).
 pub async fn node_sharing(air: &Air, name: &str, keys: &Keys, admin_id: [u8; 16], auth: Auth, share: ShareSettings, rules: Vec<Rule>) -> Node {
+    node_limited(air, name, keys, admin_id, auth, share, rules, VpnLimits::default()).await
+}
+
+/// A node with these sharing settings and limits.
+#[allow(clippy::too_many_arguments)]
+pub async fn node_limited(air: &Air, name: &str, keys: &Keys, admin_id: [u8; 16], auth: Auth, share: ShareSettings, rules: Vec<Rule>, limits: VpnLimits) -> Node {
     let info = NodeInfo { codename: name.to_owned(), version: "test".into(), is_admin: keys.identity().hash().0 == admin_id, admin_id: Some(admin_id) };
     let config = MeshConfig { radio: format!("air://{}/{name}", air.local_addr()), announce_secs: 5, offline_secs: 60, settings: None, ..MeshConfig::default() };
     let mesh = Mesh::start(PrivateIdentity::new(keys.x25519.clone(), keys.ed25519.clone()), info, config).await.expect("mesh starts");
@@ -97,13 +104,13 @@ pub async fn node_sharing(air: &Air, name: &str, keys: &Keys, admin_id: [u8; 16]
         interface: "kaonic0".into(),
         advertise: Vec::new(),
         max_packet: 799,
-        limits: VpnLimits::default(),
+        limits,
         share,
         forward: rules,
     };
     let id = keys.identity().hash().to_hex();
-    let (vpn, ends) = Vpn::start_detached(links, &id, config).expect("the VPN starts");
-    Node { vpn, ends, _mesh: mesh }
+    let (vpn, ends) = Vpn::start_detached(links.clone(), &id, config).expect("the VPN starts");
+    Node { vpn, ends, links, _mesh: mesh }
 }
 
 /// Waits until every node has heard every other node's HELLO.

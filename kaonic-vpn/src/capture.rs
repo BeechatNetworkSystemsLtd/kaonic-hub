@@ -12,6 +12,8 @@ use crate::service::Direction;
 
 /// Max bytes of packet data held.
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+/// A stopped capture's packets are freed this long after it stopped (time to download it).
+pub const KEEP_STOPPED: Duration = Duration::from_secs(30 * 60);
 /// pcap link type for raw IPv4 packets.
 pub const LINKTYPE_IPV4: u32 = 228;
 
@@ -84,6 +86,7 @@ struct Inner {
     started: Option<Instant>,
     started_ts_ms: Option<i64>,
     stopped_ts_ms: Option<i64>,
+    stopped: Option<Instant>,
     packets: VecDeque<CapturedPacket>,
     next_seq: u64,
     dropped: u64,
@@ -129,6 +132,7 @@ impl Capture {
     fn stop_locked(&self, inner: &mut Inner) {
         if self.running.swap(false, Ordering::AcqRel) {
             inner.stopped_ts_ms = Some(now_us() / 1000);
+            inner.stopped = Some(Instant::now());
         }
     }
 
@@ -149,6 +153,17 @@ impl Capture {
     fn expire(&self, inner: &mut Inner) {
         if inner.started.is_some_and(|started| started.elapsed() >= Duration::from_secs(inner.config.max_secs)) {
             self.stop_locked(inner);
+        }
+    }
+
+    /// Stops a capture whose time is up, and frees one stopped for [`KEEP_STOPPED`]. Called
+    /// now and then: a capture nobody looks at must not hold its memory for good.
+    pub fn tidy(&self) {
+        let mut inner = self.inner.lock().expect("capture lock");
+        self.expire(&mut inner);
+        if inner.stopped.is_some_and(|stopped| stopped.elapsed() >= KEEP_STOPPED) && !inner.packets.is_empty() {
+            inner.packets = VecDeque::new();
+            inner.bytes = 0;
         }
     }
 
@@ -306,6 +321,28 @@ mod tests {
         let state = capture.state();
         assert!(!state.running);
         assert_eq!(state.packets, 0);
+    }
+
+    #[test]
+    fn a_stopped_capture_is_freed_after_a_while() {
+        let capture = Capture::default();
+        capture.start(CaptureConfig::default());
+        for _ in 0..100 {
+            capture.record(Direction::Tx, None, false, &packet(70), Verdict::Sent, None);
+        }
+        capture.stop();
+        capture.tidy();
+        assert_eq!(capture.state().packets, 100, "kept for downloading");
+        capture.inner.lock().unwrap().stopped = Instant::now().checked_sub(KEEP_STOPPED);
+        capture.tidy();
+        let state = capture.state();
+        assert_eq!((state.packets, state.bytes, state.running), (0, 0, false));
+        assert_eq!(capture.inner.lock().unwrap().packets.capacity(), 0);
+        // A capture past its time with no packets coming is stopped too.
+        capture.start(CaptureConfig::default());
+        capture.inner.lock().unwrap().started = Instant::now().checked_sub(Duration::from_secs(700));
+        capture.tidy();
+        assert!(!capture.is_running());
     }
 
     #[test]

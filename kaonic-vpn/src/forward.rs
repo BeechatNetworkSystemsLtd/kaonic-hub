@@ -53,6 +53,9 @@ const MAX_SEEN: usize = 1024;
 /// Max datagrams being reassembled at once, and the timeout.
 const MAX_PARTIALS: usize = 16;
 const PARTIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Fragments one datagram may take (a 2 KB datagram is 3 at the tunnel MTU); past this it is
+/// dropped.
+const MAX_FRAGMENTS: u8 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -367,8 +370,10 @@ pub struct Lan {
 struct Partial {
     started: Instant,
     data: Vec<u8>,
-    /// Byte ranges received.
+    /// Byte ranges received, sorted, merged where they touch.
     have: Vec<(usize, usize)>,
+    /// Fragments taken (repeats not counted).
+    fragments: u8,
     total: Option<usize>,
     ttl: u8,
 }
@@ -479,6 +484,20 @@ fn header(packet: &[u8]) -> Option<Header<'_>> {
         offset: usize::from(fragment & 0x1fff) * 8,
         body: &packet[header_len..total],
     })
+}
+
+/// Adds `from..to` to sorted ranges that do not touch, merging those it touches.
+fn merge(have: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    let mut merged = (from, to);
+    have.retain(|&(start, end)| {
+        let apart = end < merged.0 || start > merged.1;
+        if !apart {
+            merged = (merged.0.min(start), merged.1.max(end));
+        }
+        apart
+    });
+    let at = have.partition_point(|&(start, _)| start < merged.0);
+    have.insert(at, merged);
 }
 
 /// Source port, destination port and payload of a whole UDP datagram.
@@ -711,26 +730,27 @@ impl Forward {
             let oldest = self.partials.iter().min_by_key(|(_, partial)| partial.started).map(|(key, _)| *key)?;
             self.partials.remove(&oldest);
         }
-        let partial = self.partials.entry(key).or_insert_with(|| Partial { started: now, data: Vec::new(), have: Vec::new(), total: None, ttl: header.ttl });
+        let partial = self.partials.entry(key).or_insert_with(|| Partial { started: now, data: Vec::new(), have: Vec::new(), fragments: 0, total: None, ttl: header.ttl });
+        if partial.have.iter().any(|&(from, to)| from <= header.offset && end <= to) {
+            // A repeat (the link layer resent it): nothing new.
+            return None;
+        }
+        partial.fragments += 1;
+        if partial.fragments > MAX_FRAGMENTS {
+            self.partials.remove(&key);
+            return None;
+        }
         if partial.data.len() < end {
             partial.data.resize(end, 0);
         }
         partial.data[header.offset..end].copy_from_slice(header.body);
-        partial.have.push((header.offset, end));
+        merge(&mut partial.have, header.offset, end);
         partial.ttl = partial.ttl.min(header.ttl);
         if !header.more {
             partial.total = Some(end);
         }
         let total = partial.total?;
-        partial.have.sort_unstable();
-        let mut covered = 0;
-        for &(from, to) in &partial.have {
-            if from > covered {
-                return None;
-            }
-            covered = covered.max(to);
-        }
-        if covered < total {
+        if partial.have.first().is_none_or(|&(from, to)| from > 0 || to < total) {
             return None;
         }
         let partial = self.partials.remove(&key)?;
@@ -980,6 +1000,38 @@ mod tests {
             b.seen(u64::from(n), Duration::from_secs(5), now, true);
         }
         assert!(b.seen.len() <= MAX_SEEN);
+    }
+
+    #[test]
+    fn a_datagram_keeps_few_ranges_whatever_its_fragments() {
+        let rule = Rule { max_bytes: 2048, ..Rule::new("big", SA, 6969) };
+        let mut b = node(2, vec![rule]);
+        let now = Instant::now();
+        let src = SocketAddrV4::new(Ipv4Addr::new(10, 77, 0, 1), 1);
+        let first = packets(src, SocketAddrV4::new(SA, 6969), &[0u8; 1500], 7, 1, 792).remove(0);
+        let key = (Ipv4Addr::new(10, 77, 0, 1), SA, 7);
+        // The same fragment again and again is one range.
+        for _ in 0..10_000 {
+            assert!(b.from_mesh(&first, now).is_none());
+        }
+        assert_eq!(b.partials[&key].have.len(), 1);
+        assert_eq!(b.partials[&key].fragments, 1);
+        // Many small distinct fragments: the datagram is dropped past the limit.
+        let mut small = first.clone();
+        small.truncate(20 + 8);
+        small[2..4].copy_from_slice(&28u16.to_be_bytes());
+        for n in 1..200u16 {
+            small[6..8].copy_from_slice(&(0x2000 | (n * 2)).to_be_bytes());
+            assert!(b.from_mesh(&small, now).is_none());
+            assert!(b.partials.get(&key).is_none_or(|partial| partial.have.len() <= usize::from(MAX_FRAGMENTS)));
+        }
+        assert!(!b.partials.contains_key(&key));
+
+        let mut have = Vec::new();
+        for (from, to) in [(16, 24), (0, 8), (32, 40), (8, 16), (24, 32)] {
+            merge(&mut have, from, to);
+        }
+        assert_eq!(have, vec![(0, 40)]);
     }
 
     #[test]

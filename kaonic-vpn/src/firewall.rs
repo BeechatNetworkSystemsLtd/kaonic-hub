@@ -51,12 +51,14 @@ pub fn protect(interface: &str, tcp: &[u16], udp: &[u16]) -> io::Result<&'static
         // Delete our old table first so rules do not stack.
         let _ = run(&nft, &["delete".into(), "table".into(), "inet".into(), TABLE.into()]);
         let mut child = Command::new(&nft).args(["-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
-        child.stdin.take().expect("piped").write_all(nft_script(interface, tcp, udp).as_bytes())?;
+        // Always waited for, even if writing failed, so no zombie is left.
+        let written = child.stdin.take().expect("piped").write_all(nft_script(interface, tcp, udp).as_bytes());
         let output = child.wait_with_output()?;
-        if output.status.success() {
-            return Ok("nftables");
+        match written {
+            Ok(()) if output.status.success() => return Ok("nftables"),
+            Ok(()) => log::warn!("vpn: nft refused the rules ({}); trying iptables", String::from_utf8_lossy(&output.stderr).trim()),
+            Err(error) => log::warn!("vpn: could not give nft the rules ({error}); trying iptables"),
         }
-        log::warn!("vpn: nft refused the rules ({}); trying iptables", String::from_utf8_lossy(&output.stderr).trim());
     }
     let Some(iptables) = find("iptables") else {
         return Err(io::Error::new(io::ErrorKind::NotFound, "neither nft nor iptables: the hub's API is reachable through the VPN"));

@@ -204,6 +204,12 @@ impl Reliable {
         }
     }
 
+    /// Forgets the state of peers whose link is down (a new link starts afresh, as after a
+    /// restart).
+    pub fn forget_closed(&self, established: &[String]) {
+        self.peers.lock().expect("arq lock").retain(|peer, _| established.contains(peer));
+    }
+
     /// ARQ figures per peer.
     pub fn stats(&self) -> HashMap<String, PeerArq> {
         let peers = self.peers.lock().expect("arq lock");

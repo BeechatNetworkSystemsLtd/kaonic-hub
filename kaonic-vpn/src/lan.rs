@@ -20,6 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kaonic_mesh::log_limit::LogLimit;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
@@ -35,6 +36,8 @@ use crate::service::Vpn;
 const RECHECK: Duration = Duration::from_secs(5);
 /// Receive buffer size; larger than any packet a rule carries.
 const BUFFER: usize = 4096;
+/// A failing read repeats every second: logged at most this often.
+const READ_FAULT_LOG_EVERY: Duration = Duration::from_secs(60);
 
 /// This node's addresses and networks, refreshed on each check.
 #[derive(Default)]
@@ -169,6 +172,7 @@ fn snooping_warning(interface: &str) -> Option<String> {
 
 async fn listen(vpn: Arc<Vpn>, socket: AsyncFd<OwnedFd>, interface: String, known: Arc<Mutex<Known>>) {
     let mut buffer = vec![0u8; BUFFER];
+    let mut fault_log = LogLimit::new(READ_FAULT_LOG_EVERY);
     loop {
         let Ok(mut ready) = socket.readable().await else { return };
         // SAFETY: sockaddr_ll is plain data, filled by the kernel up to the length given.
@@ -183,7 +187,9 @@ async fn listen(vpn: Arc<Vpn>, socket: AsyncFd<OwnedFd>, interface: String, know
             Ok(Ok(length)) => length,
             Ok(Err(error)) => {
                 // The interface may be going away; the next check replaces this socket.
-                log::warn!("vpn: forward: reading {interface}: {error}");
+                if let Some(skipped) = fault_log.allow(std::time::Instant::now()) {
+                    log::warn!("vpn: forward: reading {interface}: {error} ({skipped} more not logged)");
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
