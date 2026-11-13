@@ -1,7 +1,7 @@
 [package]
 name = "kaonic-store"
 version = "0.1.0"
-description = "kaonic-hub's SQLite store: account, sessions, settings, saved Wi-Fi networks, audit log."
+description = "kaonic-hub's SQLite store: account, sessions, settings, saved Wi-Fi networks, audit log, plugin stores."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

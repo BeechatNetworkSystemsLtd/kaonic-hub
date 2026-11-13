@@ -1,6 +1,7 @@
 //! kaonic-hub's SQLite database: `hub.db` on userfs.
 //!
-//! It holds the UI password hash, sessions, settings, saved Wi-Fi networks and an audit log.
+//! It holds the UI password hash, sessions, settings, saved Wi-Fi networks, an audit log and
+//! the plugins' own key/value stores.
 //! No secrets: passwords, keys and certificates are in `kaonic-keystore`.
 //!
 //! SQLite runs on its own thread. [`Store::call`] runs a closure there, so async code never
@@ -18,6 +19,7 @@
 
 pub mod account;
 pub mod audit;
+pub mod plugin_store;
 pub mod sessions;
 pub mod settings;
 pub mod wifi;
@@ -54,6 +56,8 @@ const MIGRATIONS: &[Migration] = &[
     Migration { sql: include_str!("../sql/migrations/0001_initial_schema.sql"), change: Change::Compatible },
     // 2: `schema_info`: the oldest release that can open the file.
     Migration { sql: include_str!("../sql/migrations/0002_schema_info.sql"), change: Change::Compatible },
+    // 3: `plugin_store`: each plugin's key/value store.
+    Migration { sql: include_str!("../sql/migrations/0003_plugin_store.sql"), change: Change::Compatible },
 ];
 
 /// The migration that creates `schema_info`.

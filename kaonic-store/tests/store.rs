@@ -1,4 +1,4 @@
-use kaonic_store::{Store, account, audit, sessions, settings, wifi};
+use kaonic_store::{Store, account, audit, plugin_store, sessions, settings, wifi};
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("kaonic-store-{}-{name}", std::process::id()));
@@ -34,7 +34,7 @@ async fn upgrades_a_database_from_before_schema_info() {
     {
         // What the first release left: schema 1, no `schema_info`.
         let connection = kaonic_store::Connection::open(&path).unwrap();
-        connection.execute_batch("DROP TABLE schema_info; PRAGMA user_version = 1;").unwrap();
+        connection.execute_batch("DROP TABLE schema_info; DROP TABLE plugin_store; PRAGMA user_version = 1;").unwrap();
     }
     let store = Store::open(&path).unwrap();
     let min_reader: i64 = store.call(|c| c.query_row("SELECT min_reader FROM schema_info", [], |row| row.get(0))).await.unwrap();
@@ -128,4 +128,40 @@ async fn settings_and_audit() {
     store.call(|c| audit::record(c, 2, "admin", "wifi.forget", "Office")).await.unwrap();
     let recent = store.call(|c| audit::recent(c, 10)).await.unwrap();
     assert_eq!(recent.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(), vec!["wifi.forget", "wifi.join"]);
+}
+
+#[tokio::test]
+async fn plugin_stores_are_separate_and_limited() {
+    use plugin_store::{MAX_BYTES, MAX_KEYS, MAX_VALUE, Put};
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.call(|c| plugin_store::put(c, "a", "k", b"from a")).await.unwrap(), Put::Stored);
+    assert_eq!(store.call(|c| plugin_store::put(c, "b", "k", b"from b")).await.unwrap(), Put::Stored);
+    // The same key, two plugins: each reads only its own.
+    assert_eq!(store.call(|c| plugin_store::get(c, "a", "k")).await.unwrap().as_deref(), Some(&b"from a"[..]));
+    assert_eq!(store.call(|c| plugin_store::get(c, "b", "k")).await.unwrap().as_deref(), Some(&b"from b"[..]));
+    assert!(store.call(|c| plugin_store::delete(c, "a", "k")).await.unwrap());
+    assert!(store.call(|c| plugin_store::get(c, "a", "k")).await.unwrap().is_none());
+    assert_eq!(store.call(|c| plugin_store::keys(c, "b")).await.unwrap(), vec!["k".to_owned()]);
+
+    let big = vec![7u8; MAX_VALUE + 1];
+    assert_eq!(store.call(move |c| plugin_store::put(c, "a", "big", &big)).await.unwrap(), Put::TooLarge);
+    // Up to the byte budget, and no further; replacing a value counts only the new one.
+    let full = vec![1u8; MAX_VALUE];
+    let fits = MAX_BYTES / (MAX_VALUE + 2);
+    for n in 0..fits {
+        let value = full.clone();
+        assert_eq!(store.call(move |c| plugin_store::put(c, "a", &format!("{n:02}"), &value)).await.unwrap(), Put::Stored);
+    }
+    let value = full.clone();
+    assert_eq!(store.call(move |c| plugin_store::put(c, "a", "xx", &value)).await.unwrap(), Put::Full);
+    let value = full.clone();
+    assert_eq!(store.call(move |c| plugin_store::put(c, "a", "00", &value)).await.unwrap(), Put::Stored);
+    // Plugin b is not affected by a's use.
+    assert_eq!(store.call(|c| plugin_store::put(c, "b", "more", b"x")).await.unwrap(), Put::Stored);
+    // At most so many keys.
+    for n in 0..MAX_KEYS - 2 {
+        assert_eq!(store.call(move |c| plugin_store::put(c, "b", &format!("key{n}"), b"v")).await.unwrap(), Put::Stored);
+    }
+    assert_eq!(store.call(|c| plugin_store::put(c, "b", "one-too-many", b"v")).await.unwrap(), Put::Full);
+    assert_eq!(store.call(|c| plugin_store::delete_all(c, "b")).await.unwrap(), MAX_KEYS);
 }
