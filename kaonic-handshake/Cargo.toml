@@ -1,0 +1,16 @@
+[package]
+name = "kaonic-handshake"
+version = "0.1.0"
+description = "Kaonic link authentication: AUTH and ALLOWLIST messages and the per-link state machine"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+kaonic-trust = { path = "../kaonic-trust" }
+sha2.workspace = true
+
+[dev-dependencies]
+kaonic-pki = { path = "../kaonic-pki" }
