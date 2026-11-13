@@ -1,0 +1,11 @@
+[package]
+name = "kaonic-sim-air"
+version = "0.1.0"
+description = "An emulated radio channel for kaonic-hub nodes without boards: range, loss, collisions, half duplex."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
