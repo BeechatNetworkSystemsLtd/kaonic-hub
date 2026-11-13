@@ -1,0 +1,24 @@
+[package]
+name = "kaonic-hub-installer"
+version = "0.1.0"
+description = "Installs, runs and upgrades Kaonic plugins; driven by kaonic-hub over loopback"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+ed25519-dalek = { workspace = true }
+kaonic-hub-common = { path = "../kaonic-hub-common" }
+libc = { workspace = true }
+log = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "net", "time", "sync", "signal", "fs", "io-util"] }
+
+[dev-dependencies]
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http-body-util = "0.1"

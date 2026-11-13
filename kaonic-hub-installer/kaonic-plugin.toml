@@ -1,0 +1,10 @@
+[kaonic-plugin]
+format = 2
+id = "kaonic-hub-installer"
+name = "Kaonic Hub Installer"
+description = "Installs, runs and updates plugins and the hub"
+version = "{version}"
+developer = "Beechat Network Systems Ltd"
+channel = "stable"
+url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-hub"
+icon = "files/icon.png"
