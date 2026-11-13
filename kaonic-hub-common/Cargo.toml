@@ -1,0 +1,18 @@
+[package]
+name = "kaonic-hub-common"
+version = "0.1.0"
+description = "Code shared by the hub, its installer and the plugin SDK: base64, a small HTTP/1.1 client and a WebSocket client"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The peer's uid on a Unix socket.
+libc = { workspace = true }
+# Sec-WebSocket-Accept only (RustCrypto); already in the tree under axum.
+sha1 = { version = "0.10.7", default-features = false }
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
