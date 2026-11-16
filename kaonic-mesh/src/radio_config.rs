@@ -23,6 +23,20 @@ pub const G24_RANGES: [(u64, u64); 1] = [(2_400_000_000, 2_483_500_000)];
 const EDD_US_MAX: u32 = 8064;
 const BACKOFF_US_MAX: u32 = 2000;
 const SPACING_MAX: u32 = 6_375_000;
+/// The TX power register goes to 31; the hub allows less on the modulations that run at high
+/// duty (a safe starting point agreed for the boards' amplifier): OFDM 25, O-QPSK 20.
+pub const TX_POWER_REGISTER_MAX: u8 = 31;
+pub const TX_POWER_MAX_OFDM: u8 = 25;
+pub const TX_POWER_MAX_QPSK: u8 = 20;
+
+/// The highest TX power register value the hub sets with this modulation.
+pub fn max_tx_power(modulation: Modulation) -> u8 {
+    match modulation {
+        Modulation::Ofdm { .. } => TX_POWER_MAX_OFDM,
+        Modulation::Qpsk { .. } => TX_POWER_MAX_QPSK,
+        Modulation::Fsk { .. } | Modulation::Off => TX_POWER_REGISTER_MAX,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modulation {
@@ -90,8 +104,9 @@ impl BandConfig {
         if self.channel_spacing_hz == 0 || self.channel_spacing_hz > SPACING_MAX {
             problems.push(("channel_spacing_hz", format!("Use 1 Hz to {} kHz.", SPACING_MAX / 1000)));
         }
-        if self.tx_power > 31 {
-            problems.push(("tx_power", "Use 0 to 31.".into()));
+        let max_power = max_tx_power(self.modulation);
+        if self.tx_power > max_power {
+            problems.push(("tx_power", format!("Use 0 to {max_power} with this modulation.")));
         }
         match self.modulation {
             Modulation::Off => {}
@@ -188,6 +203,13 @@ impl BandConfig {
         out.push(("frontend/agc_target", self.frontend.agc_target.to_string()));
         out.push(("frontend/lna_bypass", bool_text(self.frontend.lna_bypass).to_owned()));
         out
+    }
+
+    /// The same with the TX power brought down to the modulation's limit (records saved before
+    /// the limits, or a driver set by something else).
+    pub fn capped(mut self) -> Self {
+        self.tx_power = self.tx_power.min(max_tx_power(self.modulation));
+        self
     }
 
     /// The mesh's view (bit rate, airtime, centre), for OFDM bands.
@@ -387,6 +409,24 @@ mod tests {
 
     fn sample() -> BandConfig {
         BandConfig::default_for(true)
+    }
+
+    #[test]
+    fn tx_power_is_limited_by_modulation() {
+        let power = |modulation, tx_power| BandConfig { modulation, tx_power, ..sample() }.validate(&SUB_GHZ_RANGES).iter().any(|(field, _)| *field == "tx_power");
+        let ofdm = Modulation::Ofdm { mcs: 6, opt: 0 };
+        let qpsk = Modulation::Qpsk { fchip: 2, mode: 2 };
+        let fsk = Modulation::Fsk { srate: 3, midx: 3, mord: 0, bt: 0, fec: false, dw: true, preamble: 8 };
+        assert!(!power(ofdm, 25));
+        assert!(power(ofdm, 26));
+        assert!(!power(qpsk, 20));
+        assert!(power(qpsk, 21));
+        assert!(!power(fsk, 31));
+        assert!(power(fsk, 32));
+        // Saved before the limits: brought down, not refused.
+        assert_eq!(BandConfig { modulation: ofdm, tx_power: 31, ..sample() }.capped().tx_power, 25);
+        assert_eq!(BandConfig { modulation: qpsk, tx_power: 31, ..sample() }.capped().tx_power, 20);
+        assert_eq!(BandConfig { modulation: qpsk, tx_power: 7, ..sample() }.capped().tx_power, 7);
     }
 
     #[test]

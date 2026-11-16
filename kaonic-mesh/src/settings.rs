@@ -16,7 +16,7 @@ pub struct RadioSettings {
     pub ofdm_mcs: u8,
     /// OFDM bandwidth option as the driver numbers it.
     pub ofdm_opt: u8,
-    /// Transceiver TX power register, 0..=31.
+    /// Transceiver TX power register, 0..=25 (the hub's OFDM limit).
     pub tx_power: u8,
 }
 
@@ -100,7 +100,7 @@ pub fn sysfs_dir(iface: &str) -> PathBuf {
 
 /// Writes every setting that differs from what the driver has. Returns the names written.
 pub fn apply(dir: &Path, settings: &RadioSettings) -> io::Result<Vec<&'static str>> {
-    if settings.ofdm_mcs > 6 || settings.tx_power > 31 {
+    if settings.ofdm_mcs > 6 || settings.tx_power > crate::radio_config::TX_POWER_MAX_OFDM {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "radio setting out of range"));
     }
     let mut written = Vec::new();
@@ -135,6 +135,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("channel")).unwrap(), "11");
         assert!(apply(&dir, &want).unwrap().is_empty());
         assert!(apply(&dir, &RadioSettings { tx_power: 40, ..want }).is_err());
+        assert!(apply(&dir, &RadioSettings { tx_power: 26, ..want }).is_err());
         assert_eq!(read(&dir).unwrap(), want);
         std::fs::remove_dir_all(dir).unwrap();
     }

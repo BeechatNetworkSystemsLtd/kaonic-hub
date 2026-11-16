@@ -911,13 +911,30 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/Validation' }
   /radio/bands/{band}/test:
+    parameters:
+      - $ref: '#/components/parameters/Band'
+    get:
+      tags: [radio]
+      operationId: getRadioTest
+      summary: 'The band''s last test message run (`{"running": false}` alone if none ran since the hub started).'
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/RadioTest' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
     post:
       tags: [radio]
       operationId: sendRadioTestFrame
-      summary: Send one test frame on a band.
+      summary: Send a test message on a band, once or repeatedly.
+      description: >-
+        The message goes out as one raw frame with the band's current settings, below the mesh (for
+        a receiver or spectrum analyser). Without `interval_ms` it is sent once before the answer
+        (`200`; a refusal by the radio is `502`). With `interval_ms` it is sent again every interval
+        until stopped, or `count` times (`202`); progress is read with `GET`. Each band runs at most
+        one test; a new one replaces it. Switching the band off stops it. On the mesh band the frames
+        share the air with the mesh. Not offered on the emulator or without the radio driver (`503`).
       x-role: admin
-      parameters:
-        - $ref: '#/components/parameters/Band'
       requestBody:
         required: true
         content:
@@ -927,10 +944,66 @@ paths:
               additionalProperties: false
               required: [message]
               properties:
-                message: { type: string, minLength: 1, maxLength: 2047 }
+                message: { type: string, minLength: 1, description: 'The payload, 1 to 2047 bytes: UTF-8 text, or hex digits with `format: hex` (spaces, colons and commas allowed between bytes; an optional 0x prefix).' }
+                format: { type: string, enum: [text, hex], default: text }
+                interval_ms: { type: integer, minimum: 100, maximum: 3600000, description: 'Left out: one message. Given: repeat at this interval until stopped.' }
+                count: { type: integer, minimum: 1, maximum: 1000000, description: With `interval_ms` only; stop after this many. Left out, until stopped. }
       responses:
-        '204': { description: Frame queued for transmission. }
+        '200':
+          description: 'Sent once.'
+          content: { application/json: { schema: { $ref: '#/components/schemas/RadioTest' } } }
+        '202':
+          description: 'Repeating; read progress with GET.'
+          content: { application/json: { schema: { $ref: '#/components/schemas/RadioTest' } } }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '502': { $ref: '#/components/responses/Upstream' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /radio/bands/{band}/test/stop:
+    post:
+      tags: [radio]
+      operationId: stopRadioTest
+      summary: Stop the band's repeating test message.
+      x-role: admin
+      parameters:
+        - $ref: '#/components/parameters/Band'
+      responses:
+        '200':
+          description: 'The run as it stopped (`{"running": false}` alone if none ran).'
+          content: { application/json: { schema: { $ref: '#/components/schemas/RadioTest' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /radio/mesh:
+    put:
+      tags: [radio]
+      operationId: putMeshRadio
+      summary: Move the mesh to radio A or radio B.
+      description: >-
+        The mesh (and the links, VPN and push-to-talk on it) runs on one radio module. This copies the
+        mesh band's settings and filter choice to the same band (sub-GHz or 2.4 GHz) of the chosen
+        module, saves the choice (`mesh.radio`, which wins over the hub's `--radio`) and restarts the
+        hub on it about 2 s after answering (`202`). Choosing the module the mesh is on already
+        changes nothing (`200`). Other nodes are not changed. Refused while a change of the mesh band
+        is pending (`409`), and without a mesh, on the emulator or on a board without that module (`503`).
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [module]
+              properties:
+                module: { $ref: '#/components/schemas/ModuleIndex' }
+      responses:
+        '200':
+          description: Already on that module.
+          content: { application/json: { schema: { $ref: '#/components/schemas/MeshRadio' } } }
+        '202':
+          description: Saved; the hub restarts on the new module.
+          content: { application/json: { schema: { $ref: '#/components/schemas/MeshRadio' } } }
+        '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Validation' }
         '503': { $ref: '#/components/responses/Unavailable' }
   /radio/stats:
@@ -3334,10 +3407,35 @@ components:
           description: 'The board''s sub-GHz filters for this band, in a fixed order (a filter is known by its index). Empty on the 2.4 GHz bands and when commd cannot be asked.'
           items: { $ref: '#/components/schemas/RadioFilter' }
         active_filter: { type: [integer, 'null'], description: The index of the filter in use now. }
+        test:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/RadioTest'
+          description: The band's last test message run; null if none ran since the hub started.
         filter_state:
           type: string
           enum: [ok, unavailable, none]
           description: '`unavailable`: commd cannot be asked (the choice is kept). `none`: the band has no filter to choose.'
+    RadioTest:
+      type: object
+      required: [running]
+      description: A band's test message run. Only `running` is present when no test ran since the hub started.
+      properties:
+        running: { type: boolean }
+        sent: { type: integer }
+        failed: { type: integer }
+        bytes: { type: integer, description: Bytes per message. }
+        interval_ms: { type: [integer, 'null'], description: Null for a single message. }
+        count: { type: [integer, 'null'] }
+        started_ts_ms: { $ref: '#/components/schemas/TimestampMs' }
+        last_error: { type: [string, 'null'] }
+    MeshRadio:
+      type: object
+      required: [module, interface, restarting]
+      properties:
+        module: { $ref: '#/components/schemas/ModuleIndex' }
+        interface: { type: string, example: rf09_b }
+        restarting: { type: boolean }
     RadioFilter:
       type: object
       required: [index, label, min_mhz, max_mhz]
@@ -3359,7 +3457,7 @@ components:
         channel_spacing_hz: { type: integer, minimum: 1, example: 200000 }
         channel: { type: integer, minimum: 0, maximum: 65535 }
         modulation: { $ref: '#/components/schemas/Modulation' }
-        tx_power: { type: integer, minimum: 0, maximum: 31, description: RF215 TX power register value. }
+        tx_power: { type: integer, minimum: 0, maximum: 31, description: 'RF215 TX power register value. The hub allows at most 25 with OFDM and 20 with QPSK (31 with FSK); a saved or running value above the limit is brought down to it.' }
         fcs: { type: boolean, description: 'The chip appends a frame check sequence (changes the interface MTU; the mesh runs without it). Left out: unchanged.' }
         cca:
           type: object

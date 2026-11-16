@@ -3,8 +3,10 @@
 //! ```text
 //! kaonic-hub [--state-dir DIR] [--webui-dir DIR] [--run-dir DIR] [--root DIR]
 //!            [--https ADDR] [--http ADDR] [--dev ADDR]
-//!            [--installer-socket PATH] [--plugin-api-dir DIR]
+//!            [--installer-socket PATH] [--plugin-api-dir DIR] [--radio IFACE]
 //! ```
+//! `--radio` names the mesh's radio (`rf09_a` by default); a radio chosen on the Radio page
+//! (`PUT /radio/mesh`, saved as `mesh.radio`) wins over it.
 //! On a device the defaults are right: state on userfs (`/usr/local/kaonic-hub`),
 //! the web UI built in, HTTPS on :443 and a redirect on :80. `--webui-dir` serves the UI
 //! from a directory instead, for working on it.
@@ -216,7 +218,7 @@ fn main() {
     }
 }
 
-async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     private_dir(&args.state_dir)?;
     private_dir(&args.run_dir)?;
     if args.plugins.api_dir.starts_with(&args.run_dir) {
@@ -229,6 +231,14 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let dev = args.dev.is_some();
 
     let store = kaonic_store::Store::open(&args.state_dir.join("hub.db"))?;
+    // The radio chosen on the Radio page wins over --radio (the emulator's air keeps its own).
+    if !kaonic_mesh::radio::is_emulated(&args.radio)
+        && let Some(saved) = kaonic_hub::api::radio_bands::saved_mesh_radio(&store).await
+        && saved != args.radio
+    {
+        log::info!("mesh: on {saved}, as chosen on the Radio page (instead of {})", args.radio);
+        args.radio = saved.to_owned();
+    }
     // Interim root of trust: a random key file next to the keystore. To move to an
     // OTP- or OP-TEE-bound key.
     let key_path = args.state_dir.join("keystore.key");
@@ -435,7 +445,8 @@ async fn radio_settings(app: &App, iface: &str) -> kaonic_mesh::settings::RadioS
             channel_spacing_hz,
             ofdm_mcs: u8::try_from(ofdm_mcs).ok()?,
             ofdm_opt: u8::try_from(ofdm_opt).ok()?,
-            tx_power: u8::try_from(tx_power).ok()?,
+            // Saved before the OFDM limit: brought down to it.
+            tx_power: u8::try_from(tx_power).ok()?.min(kaonic_mesh::radio_config::TX_POWER_MAX_OFDM),
         })
     });
     let settings = parsed.unwrap_or_else(kaonic_mesh::settings::RadioSettings::sub_ghz_default);

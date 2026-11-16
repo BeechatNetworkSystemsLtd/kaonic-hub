@@ -49,6 +49,23 @@ fn band(id: &str) -> ApiResult<&'static Band> {
     BANDS.iter().find(|band| band.id == id).ok_or_else(|| ApiError::not_found("There is no such band."))
 }
 
+/// The band's id as `'static` (for the test runs' table).
+pub(crate) fn band_id(id: &str) -> ApiResult<&'static str> {
+    band(id).map(|band| band.id)
+}
+
+/// The band a test message goes out on: its id and interface, if it is on and has a radio.
+pub(crate) async fn test_target(app: &App, id: &str) -> ApiResult<(&'static str, &'static str)> {
+    let band = band(id)?;
+    if emulated(app) {
+        return Err(ApiError::unavailable("radio_unavailable", "Test messages need the board's radio; the emulator has none."));
+    }
+    if current(app, band).await.modulation == Modulation::Off {
+        return Err(ApiError::conflict("This band is switched off. Choose a modulation to turn it on first."));
+    }
+    Ok((band.id, band.interface))
+}
+
 fn ranges(band: &Band) -> &'static [(u64, u64)] {
     if band.sub_ghz { &SUB_GHZ_RANGES } else { &G24_RANGES }
 }
@@ -78,18 +95,25 @@ fn store_key(band: &Band) -> String {
     format!("radio.band.{}", band.interface)
 }
 
+/// The saved record, with its TX power brought down to today's limit (records saved before it).
 async fn stored(app: &App, band: &Band) -> Option<BandConfig> {
     let key = store_key(band);
     let text = app.store.call(move |c| kaonic_store::settings::get(c, &key)).await.ok().flatten()?;
-    BandConfig::decode(&text)
+    let saved = BandConfig::decode(&text)?;
+    let capped = saved.capped();
+    if capped.tx_power != saved.tx_power {
+        log::info!("radio {}: saved TX power {} is above the limit, using {}", band.interface, saved.tx_power, capped.tx_power);
+    }
+    Some(capped)
 }
 
-/// What the band runs now: the driver's view, or (emulator) what was stored.
+/// What the band runs now: the driver's view, or (emulator) what was stored. The TX power is
+/// capped to the hub's limit, so a change kept or gone back to is one the hub will apply.
 async fn current(app: &App, band: &Band) -> BandConfig {
     if !emulated(app)
         && let Ok(config) = radio_config::read(&sysfs(band), is_up(band))
     {
-        return config;
+        return config.capped();
     }
     stored(app, band).await.unwrap_or_else(|| BandConfig::default_for(band.sub_ghz))
 }
@@ -108,6 +132,9 @@ async fn apply(app: &App, band: &'static Band, config: BandConfig, filter: Optio
     let is_mesh = mesh_band(app).is_some_and(|mesh| std::ptr::eq(mesh, band));
     if is_mesh && config.modulation == Modulation::Off {
         return Err(ApiError::field("modulation", "The mesh runs on this band: it cannot be switched off."));
+    }
+    if config.modulation == Modulation::Off {
+        super::radio_test::stop_band(band.id);
     }
     if !emulated(app) {
         let written = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<&'static str>> {
@@ -432,6 +459,7 @@ async fn band_view(app: &App, band: &'static Band) -> Value {
         "last_rssi": if is_mesh { app.mesh.as_ref().and_then(|mesh| mesh.counters().last_rssi) } else { None },
         "capabilities": ["fcs", "cca", "frontend", "fsk", "qpsk", "off"],
         "pending_switch": pending,
+        "test": super::radio_test::view_of(band.id),
     });
     if let (Value::Object(view), Value::Object(filter)) = (&mut view, filter_view(app, band).await) {
         view.extend(filter);
@@ -724,6 +752,8 @@ async fn on_message(app: &App, peer: &str, packet: &[u8]) {
             continue;
         }
         let Some((in_secs, config)) = radio_config::decode_switch(frame.payload) else { continue };
+        // An admin on older software may ask for more power than this node allows.
+        let config = config.capped();
         let Some(band) = mesh_band(app) else { continue };
         if !config.validate(ranges(band)).is_empty() || config.modulation == Modulation::Off {
             log::warn!("radio: ignored an invalid radio change from the admin");
@@ -777,9 +807,90 @@ async fn step(app: &App) {
     }
 }
 
+/* ── which radio module carries the mesh ── */
+
+/// The settings key of the mesh's radio interface, chosen on the Radio page.
+pub const MESH_RADIO_KEY: &str = "mesh.radio";
+
+/// The mesh radio chosen on the Radio page, if one was and it is a band of this board.
+pub async fn saved_mesh_radio(store: &kaonic_store::Store) -> Option<&'static str> {
+    let text = store.call(|c| kaonic_store::settings::get(c, MESH_RADIO_KEY)).await.ok().flatten()?;
+    BANDS.iter().find(|band| band.interface == text.trim()).map(|band| band.interface)
+}
+
+/// The band on `module` in the same range (sub-GHz or 2.4 GHz) as `from`.
+fn same_band_on(module: u8, from: &Band) -> Option<&'static Band> {
+    BANDS.iter().find(|band| band.module == module && band.sub_ghz == from.sub_ghz)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshRadioInput {
+    /// 0 = radio A, 1 = radio B.
+    module: u8,
+}
+
+#[derive(Serialize)]
+struct MeshRadioView {
+    module: u8,
+    interface: &'static str,
+    restarting: bool,
+}
+
+/// `PUT /radio/mesh`: moves the mesh (and the links, VPN and push-to-talk on it) to the other
+/// radio module. The mesh band's settings and filter choice go to the same band of that module,
+/// so the node stays on the network's frequency; the choice is saved and the hub restarts on it.
+pub async fn put_mesh_radio(State(app): State<App>, Admin(_): Admin, Json(input): Json<MeshRadioInput>) -> ApiResult<Response> {
+    if input.module > 1 {
+        return Err(ApiError::field("module", "Use 0 (radio A) or 1 (radio B)."));
+    }
+    let Some(from) = mesh_band(&app) else {
+        return Err(ApiError::unavailable("mesh_unavailable", "The mesh is not running on this hub, so there is nothing to move."));
+    };
+    if emulated(&app) {
+        return Err(ApiError::unavailable("radio_unavailable", "The emulator's nodes have one radio; there is nothing to move."));
+    }
+    let to = same_band_on(input.module, from).ok_or_else(ApiError::internal)?;
+    if std::ptr::eq(from, to) {
+        return Ok(no_store(axum::Json(MeshRadioView { module: to.module, interface: to.interface, restarting: false })));
+    }
+    if PENDING.lock().expect("radio pending lock").is_some() {
+        return Err(ApiError::conflict("A change of the mesh band is in progress; wait until it ends."));
+    }
+    if !std::path::Path::new(&format!("/sys/class/net/{}", to.interface)).exists() {
+        return Err(ApiError::unavailable("radio_unavailable", format!("This board has no radio {} ({}).", if to.module == 0 { "A" } else { "B" }, to.interface)));
+    }
+    super::radio_test::stop_band(to.id);
+    let config = current(&app, from).await;
+    let filter = stored_filter(&app, from).await;
+    apply(&app, to, config, Some(filter)).await?;
+    let interface = to.interface.to_owned();
+    app.store.call(move |c| kaonic_store::settings::set(c, MESH_RADIO_KEY, &interface)).await?;
+    let detail = format!("{} to {}", from.interface, to.interface);
+    let stamp = crate::clock::now();
+    let _ = app.store.call(move |c| kaonic_store::audit::record(c, stamp, "admin", "radio.mesh", &detail)).await;
+    log::info!("radio: the mesh moves from {} to {}; restarting", from.interface, to.interface);
+    // Answer first; systemd (Restart=always) starts the hub again on the new radio.
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        std::process::exit(0);
+    });
+    Ok((StatusCode::ACCEPTED, no_store(axum::Json(MeshRadioView { module: to.module, interface: to.interface, restarting: true }))).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mesh_moves_to_the_same_range_on_the_other_module() {
+        let a_sub = band("a_sub").unwrap();
+        let b_24 = band("b_24").unwrap();
+        assert_eq!(same_band_on(1, a_sub).unwrap().interface, "rf09_b");
+        assert_eq!(same_band_on(0, a_sub).unwrap().interface, "rf09_a");
+        assert_eq!(same_band_on(0, b_24).unwrap().interface, "rf24_a");
+        assert!(same_band_on(2, a_sub).is_none());
+    }
 
     fn input(json: &str) -> ConfigInput {
         serde_json::from_str(json).unwrap()

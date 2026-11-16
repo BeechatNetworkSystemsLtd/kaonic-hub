@@ -16,6 +16,7 @@ pub mod software;
 mod ptt;
 pub mod radio;
 pub mod radio_bands;
+mod radio_test;
 mod remote;
 pub mod vpn;
 mod wifi;
@@ -111,6 +112,9 @@ pub fn router(app: App) -> Router {
         .route("/radio/bands", get(radio_bands::list))
         .route("/radio/bands/{band}", get(radio_bands::get).put(radio_bands::put))
         .route("/radio/bands/{band}/filter", put(radio_bands::put_filter))
+        .route("/radio/bands/{band}/test", get(radio_test::get).post(radio_test::start))
+        .route("/radio/bands/{band}/test/stop", post(radio_test::stop))
+        .route("/radio/mesh", put(radio_bands::put_mesh_radio))
         .route("/radio/stats", get(radio::stats))
         .route("/radio/frames", get(radio::frames))
         .route("/links", get(links::list))

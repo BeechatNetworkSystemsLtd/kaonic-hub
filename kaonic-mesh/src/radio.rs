@@ -79,10 +79,25 @@ impl RadioSocket {
         }
         #[cfg(target_os = "linux")]
         {
-            Ok(Self { bearer: Bearer::Packet(PacketSocket::open(spec)?), iface: spec.to_owned() })
+            Ok(Self { bearer: Bearer::Packet(PacketSocket::open_with(spec, true)?), iface: spec.to_owned() })
         }
         #[cfg(not(target_os = "linux"))]
         Err(io::Error::new(io::ErrorKind::Unsupported, format!("no radio {spec}: radios need Linux and the kaonic_rf215 driver")))
+    }
+
+    /// Opens an interface for sending only (test frames beside the mesh): it hears nothing, so
+    /// frames the mesh receives do not pile up in it. Not offered on the emulator, where a
+    /// second node on the air would take the mesh node's name.
+    pub fn open_sender(iface: &str) -> io::Result<Self> {
+        if is_emulated(iface) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "test frames are not offered on the emulator"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self { bearer: Bearer::Packet(PacketSocket::open_with(iface, false)?), iface: iface.to_owned() })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(io::Error::new(io::ErrorKind::Unsupported, format!("no radio {iface}: radios need Linux and the kaonic_rf215 driver")))
     }
 
     /// The interface name, or the node name on the air.
@@ -227,7 +242,8 @@ fn set_option(fd: libc::c_int, level: libc::c_int, name: libc::c_int, value: lib
 
 #[cfg(target_os = "linux")]
 impl PacketSocket {
-    fn open(iface: &str) -> io::Result<Self> {
+    /// `listen`: receive every frame on the interface; without it, the socket only sends.
+    fn open_with(iface: &str, listen: bool) -> io::Result<Self> {
         let name = std::ffi::CString::new(iface).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: `name` is a valid C string.
         let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
@@ -245,7 +261,8 @@ impl PacketSocket {
         // SAFETY: all-zero is a valid sockaddr_ll.
         let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         address.sll_family = libc::AF_PACKET as libc::c_ushort;
-        address.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+        // Bound with protocol zero, the socket sends on the interface and receives nothing.
+        address.sll_protocol = if listen { (libc::ETH_P_ALL as u16).to_be() } else { 0 };
         address.sll_ifindex = index as libc::c_int;
         // SAFETY: the address is initialised and sized correctly.
         cvt(unsafe {

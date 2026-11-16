@@ -733,3 +733,60 @@ async fn without_commd_the_filter_choice_is_kept_and_shown_unavailable() {
     assert_eq!(band(&bands, "a_sub")["filter_state"], "unavailable");
     assert_eq!(band(&bands, "a_sub")["filter"], "auto");
 }
+
+#[tokio::test]
+async fn tx_power_is_limited_per_modulation() {
+    let mut hub = self::hub("tx-power");
+    hub.set_up().await;
+    let config = |modulation: Value, tx_power: u8| json!({ "frequency_hz": 868_000_000u64, "channel_spacing_hz": 200_000, "channel": 0, "modulation": modulation, "tx_power": tx_power });
+    let ofdm = json!({ "kind": "ofdm", "mcs": 3, "option": 2 });
+    let qpsk = json!({ "kind": "qpsk", "chip_rate_khz": 1000, "rate_mode": 2 });
+    for (modulation, power) in [(ofdm.clone(), 26), (qpsk.clone(), 21), (ofdm, 31)] {
+        let (status, error) = hub.write("PUT", "/api/v1/radio/bands/b_sub", config(modulation.clone(), power)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{modulation} at {power}: {error}");
+        assert!(error["details"]["fields"]["tx_power"].is_string(), "{error}");
+    }
+    // Within the limit it passes validation and reaches the driver (none on a laptop).
+    let (status, error) = hub.write("PUT", "/api/v1/radio/bands/b_sub", config(qpsk, 20)).await;
+    assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+}
+
+#[tokio::test]
+async fn test_messages_are_checked_and_need_a_radio() {
+    let mut hub = self::hub("radio-test");
+    let (status, _) = hub.write("POST", "/api/v1/radio/bands/a_sub/test", json!({ "message": "hello" })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    hub.set_up().await;
+
+    let (status, view) = hub.get("/api/v1/radio/bands/a_sub/test").await;
+    assert_eq!((status, view["running"].as_bool()), (StatusCode::OK, Some(false)));
+    let (status, _) = hub.get("/api/v1/radio/bands/c_sub/test").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for (body, field) in [
+        (json!({ "message": "4b4", "format": "hex" }), "message"),
+        (json!({ "message": "" }), "message"),
+        (json!({ "message": "x".repeat(2048) }), "message"),
+        (json!({ "message": "hi", "interval_ms": 10 }), "interval_ms"),
+        (json!({ "message": "hi", "count": 3 }), "count"),
+    ] {
+        let (status, error) = hub.write("POST", "/api/v1/radio/bands/a_sub/test", body.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}: {error}");
+        assert!(error["details"]["fields"][field].is_string(), "{body}: {error}");
+    }
+    // A good message, but a laptop has no radio to send it on.
+    let (status, error) = hub.write("POST", "/api/v1/radio/bands/a_sub/test", json!({ "message": "4b 41 4f", "format": "hex", "interval_ms": 1000 })).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+    let (status, view) = hub.write("POST", "/api/v1/radio/bands/a_sub/test/stop", json!({})).await;
+    assert_eq!((status, view["running"].as_bool()), (StatusCode::OK, Some(false)));
+}
+
+#[tokio::test]
+async fn moving_the_mesh_needs_a_mesh() {
+    let mut hub = self::hub("mesh-radio");
+    hub.set_up().await;
+    let (status, error) = hub.write("PUT", "/api/v1/radio/mesh", json!({ "module": 2 })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    let (status, error) = hub.write("PUT", "/api/v1/radio/mesh", json!({ "module": 1 })).await;
+    assert_eq!((status, error["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("mesh_unavailable")), "{error}");
+}
