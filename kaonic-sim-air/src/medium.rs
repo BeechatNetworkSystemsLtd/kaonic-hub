@@ -112,6 +112,8 @@ pub struct Medium {
     config: MediumConfig,
     links: HashMap<(String, String), LinkParams>,
     blocked: HashSet<(String, String)>,
+    /// (from, to): `to` does not hear `from`, but `from` may hear `to`.
+    one_way: HashSet<(String, String)>,
     nodes: HashMap<String, Node>,
     receptions: HashMap<u64, Reception>,
     next_id: u64,
@@ -119,7 +121,7 @@ pub struct Medium {
 
 impl Medium {
     pub fn new(config: MediumConfig) -> Self {
-        Self { config, links: HashMap::new(), blocked: HashSet::new(), nodes: HashMap::new(), receptions: HashMap::new(), next_id: 1 }
+        Self { config, links: HashMap::new(), blocked: HashSet::new(), one_way: HashSet::new(), nodes: HashMap::new(), receptions: HashMap::new(), next_id: 1 }
     }
 
     pub fn config(&self) -> &MediumConfig {
@@ -148,8 +150,18 @@ impl Medium {
         self.blocked.remove(&pair(a, b));
     }
 
+    /// `to` stops hearing `from`; `from` still hears `to` (an asymmetric link).
+    pub fn block_one_way(&mut self, from: &str, to: &str) {
+        self.one_way.insert((from.to_owned(), to.to_owned()));
+    }
+
+    pub fn unblock_one_way(&mut self, from: &str, to: &str) {
+        self.one_way.remove(&(from.to_owned(), to.to_owned()));
+    }
+
+    /// Whether `b` hears what `a` sends.
     pub fn hears(&self, a: &str, b: &str) -> bool {
-        a != b && !self.blocked.contains(&pair(a, b))
+        a != b && !self.blocked.contains(&pair(a, b)) && !self.one_way.contains(&(a.to_owned(), b.to_owned()))
     }
 
     pub fn link(&self, a: &str, b: &str) -> LinkParams {
@@ -277,6 +289,19 @@ mod tests {
         let sent = medium.transmit("a", 1000, 300, &mut never());
         let Transmission::OnAir { start, end, .. } = sent else { panic!() };
         assert_eq!((start, end), (1000, 1000 + 1080 + 1000));
+        assert_eq!(fates(&mut medium, &sent), vec![("b".to_owned(), Fate::Received)]);
+    }
+
+    #[test]
+    fn a_one_way_block_silences_one_direction_only() {
+        let mut medium = medium(&["a", "b"], false);
+        medium.block_one_way("a", "b");
+        let sent = medium.transmit("a", 0, 100, &mut never());
+        assert!(fates(&mut medium, &sent).is_empty(), "b does not hear a");
+        let sent = medium.transmit("b", 1_000_000, 100, &mut never());
+        assert_eq!(fates(&mut medium, &sent), vec![("a".to_owned(), Fate::Received)], "a still hears b");
+        medium.unblock_one_way("a", "b");
+        let sent = medium.transmit("a", 2_000_000, 100, &mut never());
         assert_eq!(fates(&mut medium, &sent), vec![("b".to_owned(), Fate::Received)]);
     }
 

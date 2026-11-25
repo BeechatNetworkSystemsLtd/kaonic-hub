@@ -85,6 +85,15 @@ impl Air {
         self.with(|state| state.medium.unblock(a, b));
     }
 
+    /// `to` stops hearing `from`; `from` still hears `to`.
+    pub fn block_one_way(&self, from: &str, to: &str) {
+        self.with(|state| state.medium.block_one_way(from, to));
+    }
+
+    pub fn unblock_one_way(&self, from: &str, to: &str) {
+        self.with(|state| state.medium.unblock_one_way(from, to));
+    }
+
     /// Counters per node, by name.
     pub fn stats(&self) -> Vec<(String, NodeStats)> {
         self.with(|state| state.medium.stats())
