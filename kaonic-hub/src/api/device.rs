@@ -234,6 +234,37 @@ pub async fn metrics(State(app): State<App>, _: Viewer) -> ApiResult<Response> {
     )))
 }
 
+/// `GET /system/time`: the clock in UTC and whether it is valid.
+pub async fn time(_: Viewer) -> ApiResult<Response> {
+    Ok(no_store(axum::Json(crate::timesync::view())))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeBody {
+    /// UTC, unix milliseconds (the browser's `Date.now()`).
+    now_ms: i64,
+}
+
+/// `PUT /system/time`: sets the clock from the browser. On the admin device it becomes the
+/// network's time.
+pub async fn set_time(State(app): State<App>, _: Admin, Json(body): Json<TimeBody>) -> ApiResult<Response> {
+    if !crate::timesync::in_range(body.now_ms) {
+        return Err(ApiError::field("now_ms", "Send a UTC time between 2026 and 2100, in unix milliseconds."));
+    }
+    let before = clock::now();
+    crate::timesync::set(&app, body.now_ms, crate::timesync::Source::Browser).await.map_err(|error| {
+        log::warn!("time: cannot set the clock: {error}");
+        ApiError::unavailable("unavailable", "This device cannot set its clock.")
+    })?;
+    let now = clock::now();
+    let detail = format!("{:+} s", now - before);
+    app.store
+        .call(move |c| kaonic_store::audit::record(c, now, "admin", "device.time", &detail))
+        .await?;
+    Ok(no_store(axum::Json(crate::timesync::view())))
+}
+
 #[derive(Serialize)]
 struct Service {
     unit: &'static str,

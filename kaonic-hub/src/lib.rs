@@ -18,6 +18,7 @@ pub mod random;
 pub mod remote;
 pub mod server;
 pub mod system;
+pub mod timesync;
 pub mod tls;
 pub mod web;
 pub mod wifi;

@@ -404,6 +404,47 @@ paths:
         '200':
           description: OK
           content: { application/json: { schema: { $ref: '#/components/schemas/SystemMetrics' } } }
+  /system/time:
+    get:
+      tags: [system]
+      operationId: getTime
+      summary: The clock, in UTC, and whether it is valid.
+      description: >-
+        The hub keeps UTC only; the web UI shows it in the browser's time zone. Boards have no
+        battery clock: at boot the clock is moved to the last time saved, a guess that is not
+        valid until it is set this boot (from a browser, the admin or a peer over an
+        authenticated link) or kept by NTP.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/TimeState' } } }
+    put:
+      tags: [system]
+      operationId: setTime
+      summary: Set the clock from the browser (`Date.now()`, UTC).
+      description: >-
+        On the admin device this becomes the network's time: the admin sends its time to every
+        linked node each minute, and nodes follow it when off by more than 2 s. On a node, the
+        admin's next time wins. Stored sessions move with the clock, so nobody is signed out.
+        Emits `system`/`time.changed` (a TimeState) when the clock steps or its source changes.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [now_ms]
+              properties:
+                now_ms: { type: integer, format: int64, description: 'UTC, unix milliseconds, from 2026-01-01 to before 2100-01-01.' }
+      responses:
+        '200':
+          description: The clock now.
+          content: { application/json: { schema: { $ref: '#/components/schemas/TimeState' } } }
+        '422': { $ref: '#/components/responses/Validation' }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /system/boot:
     get:
       tags: [system]
@@ -2519,7 +2560,7 @@ paths:
       x-role: admin
       responses:
         '204': { description: Keyed. }
-        '409': { description: 'The floor is taken: `{"code":"ptt_busy","talker":PttTalker}`.' }
+        '409': { description: 'The floor is taken: `{"code":"ptt_busy","talker":PttTalker}`. Asked less than 300 ms after someone talked, the hub waits (up to 400 ms) before it answers.' }
         '503': { $ref: '#/components/responses/Unavailable' }
   /ptt/unkey:
     post:
@@ -3087,6 +3128,15 @@ components:
       properties:
         percent: { type: integer, minimum: 0, maximum: 100 }
         charging: { type: boolean }
+    TimeState:
+      type: object
+      required: [now_ms, valid, source, peer, synced_ms]
+      properties:
+        now_ms: { type: integer, format: int64, description: 'UTC, unix milliseconds. Convert to local time in the browser.' }
+        valid: { type: boolean, description: 'Set this boot or kept by NTP; false while it is only the boot-time guess.' }
+        source: { type: [string, 'null'], enum: [browser, admin, peer, ntp, null], description: Where the valid clock came from; null while not valid. }
+        peer: { type: [string, 'null'], description: 'The peer''s identity hash, for `peer`.' }
+        synced_ms: { type: [integer, 'null'], format: int64, description: When it was last set or confirmed (unix ms). }
     SystemMetrics:
       type: object
       required: [cpu_percent, ram_used_mb, ram_total_mb, fs_free_mb, fs_total_mb, uptime_secs, battery]
@@ -3457,7 +3507,7 @@ components:
         channel_spacing_hz: { type: integer, minimum: 1, example: 200000 }
         channel: { type: integer, minimum: 0, maximum: 65535 }
         modulation: { $ref: '#/components/schemas/Modulation' }
-        tx_power: { type: integer, minimum: 0, maximum: 31, description: 'RF215 TX power register value. The hub allows at most 25 with OFDM and 20 with QPSK (31 with FSK); a saved or running value above the limit is brought down to it.' }
+        tx_power: { type: integer, minimum: 0, maximum: 31, description: 'RF215 TX power register value. The hub allows at most 25 with OFDM and 20 with QPSK and FSK; a saved or running value above the limit is brought down to it.' }
         fcs: { type: boolean, description: 'The chip appends a frame check sequence (changes the interface MTU; the mesh runs without it). Left out: unchanged.' }
         cca:
           type: object
@@ -4389,12 +4439,23 @@ components:
       required: [talker, started_ts_ms, duration_ms, frames, lost_frames, hops, ended]
       properties:
         talker: { $ref: '#/components/schemas/PttTalker' }
-        ended: { type: string, enum: [released, preempted, timeout], description: 'How it ended: the talker let go, the admin took the floor, or it went silent (500 ms).' }
+        ended: { type: string, enum: [released, preempted, timeout], description: 'How it ended: the talker let go, someone else took the floor (the admin, or a member who keyed at the same time and won the tie on talker id), or it went silent (500 ms).' }
         started_ts_ms: { $ref: '#/components/schemas/TimestampMs' }
         duration_ms: { type: integer }
         frames: { type: integer, description: '20 ms frames played; for our own bursts (`talker.local`), frames sent.' }
         lost_frames: { type: integer, description: Frames concealed because they never arrived. }
         hops: { type: [integer, 'null'], description: Fewest relays the burst came through; null for our own. }
+        gaps: { type: integer, description: 'Runs of concealed frames between played ones (frames lost after the last played one, before a timeout, are not counted). 0 for our own.' }
+        longest_gap_ms: { type: integer, description: The longest of those runs. }
+        audible_gaps: { type: integer, description: 'Runs of 3 frames (60 ms) or more: longer than concealment hides.' }
+        depth_ms:
+          type: [object, 'null']
+          description: 'The jitter buffer''s depth: the average over the first and the last second played, and the most. null for our own bursts.'
+          required: [start, end, max]
+          properties:
+            start: { type: integer }
+            end: { type: integer }
+            max: { type: integer }
     PttSettings:
       type: object
       description: >-
@@ -4408,7 +4469,7 @@ components:
         talk_input: { type: string, enum: [device, browser], description: 'What the Talk page button keys: this device''s microphone (POST /ptt/key) or the browser''s (the audio WebSocket). Default device.' }
         play_on_device: { type: boolean, description: Play the group on this device's speaker. }
         rx_while_tx: { type: boolean, description: 'Keep playing received audio on the device while it talks. Off: the device''s speaker and microphone have no echo canceller between them.' }
-        auto_arm: { type: boolean, description: 'Keep the device microphone armed so the squelch keys it. The Kaonic hardware PTT button only unmutes the microphone and is invisible to software: this is how it keys the radio.' }
+        auto_arm: { type: boolean, description: 'Keep the device microphone armed so the squelch keys it. The Kaonic hardware PTT button only unmutes the microphone and is invisible to software: this is how it keys the radio. Talk that begins while the floor is taken is sent from the moment the floor is free, if it still goes on.' }
         squelch_enabled: { type: boolean, description: Key only while the device microphone hears sound (silence closes it). }
         squelch_open_dbfs: { type: number, minimum: -90, maximum: 0, description: Frame level above which the squelch opens. }
         squelch_hysteresis_db: { type: number, minimum: 0, maximum: 30, description: How far below the open level it must fall before closing. }
@@ -4425,8 +4486,8 @@ components:
         packet_frames: { type: integer, minimum: 1, maximum: 8, description: Frames a voice packet holds before it is sent (the latency floor). }
         packet_frames_max: { type: integer, minimum: 1, maximum: 16, description: 'Frames a packet may grow to while they still fit the radio frame already paid for (packet_align_ldpc); at least packet_frames.' }
         packet_align_ldpc: { type: boolean }
-        relay: { type: boolean, description: Re-send voice heard from others so it reaches further nodes. }
-        ttl: { type: integer, minimum: 1, maximum: 8, description: Relays a burst may cross. }
+        relay: { type: boolean, deprecated: true, description: 'Ignored: the mesh relays every GROUP packet (Reticulum, at most 3 relays, cancelled when enough neighbours relayed it). Kept so older clients still work.' }
+        ttl: { type: integer, minimum: 1, maximum: 8, deprecated: true, description: 'Updated nodes ignore it (the mesh carries voice 4 hops); still sent in packets, and still how far nodes on 0.2.0 relay.' }
         spectrum_enabled: { type: boolean, description: Show the live level animation on the Talk page. }
         spectrum_bands: { type: integer, minimum: 4, maximum: 64 }
     PttSettingsPatch:
@@ -4507,6 +4568,9 @@ components:
             relayed: { type: integer, description: Packets we re-sent for others. }
             suppressed: { type: integer, description: Relays dropped because enough others relayed. }
             duplicates: { type: integer }
+            refused: { type: integer, description: 'Packets refused: a bad admin signature, unsigned in an admin burst, or a replay.' }
+            late: { type: integer, description: Frames that arrived after their turn to play. }
+            shed: { type: integer, description: Frames dropped because the jitter queue grew past jitter_max_ms. }
     PttAudioDevice:
       type: object
       required: [name, description]

@@ -65,6 +65,7 @@ pub fn router(app: App) -> Router {
         .route("/device/reboot", post(device::reboot))
         .route("/device/factory-reset", post(device::factory_reset))
         .route("/system/metrics", get(device::metrics))
+        .route("/system/time", get(device::time).put(device::set_time))
         .route("/system/services", get(device::services))
         .route("/system/report", get(report::get))
         // A/B boot slots and kernel install

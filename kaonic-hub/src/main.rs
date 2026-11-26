@@ -324,6 +324,8 @@ async fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
         plugins: Default::default(),
         commd: commd_addr(&args, dev).map(|addr| std::sync::Arc::new(kaonic_mesh::commd::Commd::new(addr))),
     });
+    // Before anything is stored with a time: a board without a battery clock boots unset.
+    kaonic_hub::timesync::restore(&app).await;
     let app = match (dev, node_identity) {
         (false, Some(identity)) => start_mesh(app, identity, &args).await,
         _ => app,
@@ -337,6 +339,7 @@ async fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     kaonic_hub::remote::spawn(app.clone());
     if kaonic_hub::secure::start_links(&app).await.is_some() {
         kaonic_hub::secure::start_group(&app).await;
+        kaonic_hub::timesync::spawn(&app);
         let _ = app.ptt.set(kaonic_hub::ptt::Ptt::start(&app, args.ptt_udp_port).await);
         if let Some(config) = app.vpn_config.clone() {
             let config = kaonic_hub::api::vpn::with_stored_share(&app, config).await;

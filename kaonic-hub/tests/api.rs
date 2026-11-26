@@ -741,7 +741,8 @@ async fn tx_power_is_limited_per_modulation() {
     let config = |modulation: Value, tx_power: u8| json!({ "frequency_hz": 868_000_000u64, "channel_spacing_hz": 200_000, "channel": 0, "modulation": modulation, "tx_power": tx_power });
     let ofdm = json!({ "kind": "ofdm", "mcs": 3, "option": 2 });
     let qpsk = json!({ "kind": "qpsk", "chip_rate_khz": 1000, "rate_mode": 2 });
-    for (modulation, power) in [(ofdm.clone(), 26), (qpsk.clone(), 21), (ofdm, 31)] {
+    let fsk = json!({ "kind": "fsk" });
+    for (modulation, power) in [(ofdm.clone(), 26), (qpsk.clone(), 21), (fsk, 21), (ofdm, 31)] {
         let (status, error) = hub.write("PUT", "/api/v1/radio/bands/b_sub", config(modulation.clone(), power)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{modulation} at {power}: {error}");
         assert!(error["details"]["fields"]["tx_power"].is_string(), "{error}");
@@ -789,4 +790,24 @@ async fn moving_the_mesh_needs_a_mesh() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
     let (status, error) = hub.write("PUT", "/api/v1/radio/mesh", json!({ "module": 1 })).await;
     assert_eq!((status, error["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("mesh_unavailable")), "{error}");
+}
+
+#[tokio::test]
+async fn the_clock_is_read_by_viewers_and_set_only_within_range() {
+    let mut hub = hub("time");
+    assert_eq!(hub.get("/api/v1/system/time").await.0, StatusCode::UNAUTHORIZED);
+    hub.set_up().await;
+    let (status, time) = hub.get("/api/v1/system/time").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(time["now_ms"].as_i64().unwrap() > 0);
+    assert!(time["valid"].is_boolean());
+    // Out of range, or seconds instead of milliseconds: a field error.
+    for bad in [0_i64, 1_767_225_600, 4_102_444_800_000] {
+        let (status, body) = hub.write("PUT", "/api/v1/system/time", json!({ "now_ms": bad })).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
+    }
+    assert_eq!(hub.write("PUT", "/api/v1/system/time", json!({ "now_ms": 1_800_000_000_000_i64, "tz": "x" })).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    // A development hub never sets its host's clock.
+    let (status, body) = hub.write("PUT", "/api/v1/system/time", json!({ "now_ms": 1_800_000_000_000_i64 })).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
 }
