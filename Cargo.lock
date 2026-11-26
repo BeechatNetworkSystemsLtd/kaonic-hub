@@ -1273,7 +1273,7 @@ dependencies = [
 [[package]]
 name = "reticulum"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#212b4fbce9b395118c2d8bb819ea5b55e9ce325e"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#4305cc1511a3ece9463741dc3e5d6c9720f776e4"
 dependencies = [
  "log",
  "rand_core 0.6.4",
@@ -1287,7 +1287,7 @@ dependencies = [
 [[package]]
 name = "reticulum-core"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#212b4fbce9b395118c2d8bb819ea5b55e9ce325e"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#4305cc1511a3ece9463741dc3e5d6c9720f776e4"
 dependencies = [
  "aes",
  "cbc",
