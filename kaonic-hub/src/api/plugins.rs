@@ -286,6 +286,7 @@ pub async fn check(State(app): State<App>, _: Admin, headers: HeaderMap, body: B
 #[serde(deny_unknown_fields)]
 pub struct PolicyChange {
     require_signed: bool,
+    #[serde(default)]
     password: String,
 }
 

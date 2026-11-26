@@ -17,7 +17,9 @@ async fn creates_a_private_file_and_keeps_data_across_opens() {
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
 
     let store = Store::open(&path).unwrap();
-    assert!(store.call(|c| account::is_set_up(c)).await.unwrap());
+    assert!(store.call(|c| account::has_password(c)).await.unwrap());
+    store.call(|c| account::clear_password(c)).await.unwrap();
+    assert!(!store.call(|c| account::has_password(c)).await.unwrap());
     let version: i64 = store.call(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0))).await.unwrap();
     assert_eq!(version as usize, kaonic_store::SCHEMA_VERSION);
 }

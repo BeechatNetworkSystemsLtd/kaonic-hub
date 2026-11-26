@@ -9,6 +9,7 @@ pub mod error;
 pub mod events;
 pub mod group_key;
 pub mod identity;
+pub mod mnemonic;
 pub mod plugin_api;
 pub mod plugins;
 pub mod provision;
@@ -31,7 +32,7 @@ use axum::extract::DefaultBodyLimit;
 pub fn router(app: app::App) -> Router {
     let webui = app.config.webui.clone();
     Router::new()
-        .nest("/api/v1", api::router(app.clone()))
+        .nest("/api/v1", api::router(app.clone()).layer(axum::middleware::from_fn_with_state(app.clone(), auth::require_own_host)))
         .merge(plugins::proxy::router(app))
         .fallback_service(axum::routing::get(web::files).with_state(webui))
         .layer(DefaultBodyLimit::max(64 * 1024))

@@ -1,4 +1,7 @@
 //! First-boot setup and the UI password: `/setup*` and `/auth/*`.
+//!
+//! The password is optional and off by default. Without one, `GET /auth/state` signs the
+//! caller in as admin, and operations that ask for the password again go ahead.
 
 use axum::Extension;
 use axum::extract::State;
@@ -14,7 +17,9 @@ use crate::app::App;
 use crate::auth::{self, Admin, Role, Viewer};
 use crate::error::{ApiError, ApiResult};
 use crate::identity::NodeIdentity;
+use crate::mnemonic::{self, PhraseError};
 use crate::{clock, random};
+use zeroize::Zeroizing;
 
 /// Keystore names for identity and trust.
 pub const BOOT_IDENTITY: &str = "identity/boot";
@@ -54,6 +59,7 @@ const COMMON: &[&str] = &[
 #[derive(Serialize)]
 pub struct AuthState {
     setup_required: bool,
+    password_set: bool,
     authenticated: bool,
     role: Option<&'static str>,
     csrf_token: Option<String>,
@@ -91,8 +97,63 @@ pub async fn node_info(app: &App) -> ApiResult<kaonic_mesh::announce::NodeInfo> 
     })
 }
 
+const CODENAME_ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Gives a fresh device a random codename at first boot, so it is named on the mesh before
+/// anyone sets it up.
+pub async fn ensure_codename(app: &App) -> ApiResult<()> {
+    if app.store.call(|c| settings::get(c, CODENAME)).await?.is_some() {
+        return Ok(());
+    }
+    let mut codename = String::with_capacity(8);
+    while codename.len() < 8 {
+        for byte in random::bytes::<16>()? {
+            // 252 is the largest multiple of 36 below 256: above it the first characters would win.
+            if byte < 252 && codename.len() < 8 {
+                codename.push(char::from(CODENAME_ALPHABET[usize::from(byte % 36)]));
+            }
+        }
+    }
+    log::info!("named {codename} at first boot");
+    app.store.call(move |c| settings::set(c, CODENAME, &codename)).await?;
+    Ok(())
+}
+
+/// A device provisioned by an admin over the air is set up as a member of its network, with
+/// no password: nobody has to open its UI.
+pub async fn become_member(app: &App) {
+    let now = clock::now();
+    let result = app
+        .store
+        .call(move |c| {
+            if settings::get(c, ROLE)?.is_some() {
+                return Ok(false);
+            }
+            kaonic_store::audit::record(c, now, "admin", "device.setup", "member, provisioned over the air")?;
+            settings::set(c, ROLE, "member")?;
+            Ok(true)
+        })
+        .await;
+    match result {
+        Ok(true) => log::info!("set up as member by the admin's provisioning"),
+        Ok(false) => {}
+        Err(error) => log::warn!("could not save the member role: {error}"),
+    }
+}
+
+/// Setup is done once the role is saved; devices set up before the password became optional
+/// have a password instead.
 async fn is_set_up(app: &App) -> ApiResult<bool> {
-    Ok(app.store.call(|c| account::is_set_up(c)).await?)
+    Ok(app.store.call(|c| Ok(settings::get(c, ROLE)?.is_some() || account::has_password(c)?)).await?)
+}
+
+async fn has_password(app: &App) -> ApiResult<bool> {
+    Ok(app.store.call(|c| account::has_password(c)).await?)
+}
+
+/// An empty password means none.
+fn given(password: Option<String>) -> Option<String> {
+    password.filter(|password| !password.is_empty())
 }
 
 fn check_new_password(password: &str, field: &'static str) -> ApiResult<()> {
@@ -108,23 +169,23 @@ fn check_new_password(password: &str, field: &'static str) -> ApiResult<()> {
     Ok(())
 }
 
-fn check_seed(seed: &str) -> ApiResult<()> {
-    if seed.chars().count() < 16 || seed.len() > 256 {
-        return Err(ApiError::field(
-            "seed_password",
-            "Use at least 16 characters: the admin key is only as strong as this.",
-        ));
-    }
-    if COMMON
-        .iter()
-        .any(|common| seed.to_lowercase().contains(common))
-    {
-        return Err(ApiError::field(
-            "seed_password",
-            "This contains a common password. Choose another.",
-        ));
-    }
-    Ok(())
+/// The seed phrase the admin keys are derived from, checked and normalised.
+fn admin_seed(phrase: Option<String>) -> ApiResult<Zeroizing<String>> {
+    let Some(phrase) = phrase.map(Zeroizing::new).filter(|text| !text.trim().is_empty()) else {
+        return Err(ApiError::field("seed_phrase", "Enter the seed phrase."));
+    };
+    mnemonic::parse(&phrase).map_err(|error| {
+        let message = match error {
+            PhraseError::Length(_) => "Enter all 12 or 24 words.".to_owned(),
+            PhraseError::Unknown(at) => {
+                let at: Vec<String> = at.iter().map(usize::to_string).collect();
+                format!("Not on the word list: word {}.", at.join(", "))
+            }
+            PhraseError::Checksum => "These words do not fit together: one is mistyped or out of order.".to_owned(),
+            PhraseError::Example => "This is a published example phrase: anyone could make its keys. Use the words this device made.".to_owned(),
+        };
+        ApiError::field("seed_phrase", message)
+    })
 }
 
 fn valid_codename(codename: &str) -> bool {
@@ -213,16 +274,15 @@ pub async fn setup_identity(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedBody {
-    seed_password: String,
+    #[serde(default)]
+    seed_phrase: Option<String>,
 }
 
-/// Runs a slow derivation with the shared Argon2 permit and the login limiter.
-async fn derive(app: &App, ip: std::net::IpAddr, seed: String) -> ApiResult<NodeIdentity> {
-    // Each derivation costs 64 MiB and seconds of CPU: count it like a login try (and
-    // never forgive it: a seed is not a password to be right about).
+/// Derives the admin identity of a checked phrase, under the login limiter.
+async fn derive(app: &App, ip: std::net::IpAddr, phrase: Zeroizing<String>) -> ApiResult<NodeIdentity> {
+    // Counted like a login try and never forgiven: a phrase is not a password to be right about.
     let _attempt = app.limiter.begin(ip)?;
-    let _permit = app.argon.try_acquire().map_err(|_| auth::busy())?;
-    tokio::task::spawn_blocking(move || NodeIdentity::from_seed(&seed))
+    tokio::task::spawn_blocking(move || NodeIdentity::from_phrase(&phrase))
         .await
         .map_err(|_| ApiError::internal())
 }
@@ -238,24 +298,56 @@ pub async fn derive_identity(
     Json(body): Json<SeedBody>,
 ) -> ApiResult<Response> {
     before_setup(&app, peer).await?;
-    check_seed(&body.seed_password)?;
-    let identity = derive(&app, client(peer), body.seed_password).await?;
+    let seed = admin_seed(body.seed_phrase)?;
+    let identity = derive(&app, client(peer), seed).await?;
     Ok(no_store(axum::Json(Derived {
         identity_hash: identity.public().hash().to_hex(),
     })))
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhraseRequest {
+    words: usize,
+}
+
+#[derive(Serialize)]
+pub struct Phrase<'a> {
+    words: Vec<&'a str>,
+}
+
+/// `POST /setup/seed-phrase`: a new admin's phrase, from the kernel's random source. The
+/// hub keeps nothing: the phrase comes back with setup, and the identity is derived from it.
+pub async fn new_seed_phrase(State(app): State<App>, peer: Option<Extension<Peer>>, Json(body): Json<PhraseRequest>) -> ApiResult<Response> {
+    before_setup(&app, peer).await?;
+    if body.words != 12 && body.words != 24 {
+        return Err(ApiError::field("words", "Use 12 or 24."));
+    }
+    let phrase = mnemonic::generate(body.words)?;
+    // The words are borrowed from the phrase, which is wiped when it goes.
+    Ok(no_store(axum::Json(Phrase { words: phrase.split(' ').collect() })))
+}
+
+/// `GET /setup/wordlist`: the words a seed phrase is made of, for typing one in.
+pub async fn wordlist() -> Response {
+    axum::Json(mnemonic::wordlist()).into_response()
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SetupInput {
     Member {
-        password: String,
+        #[serde(default)]
+        password: Option<String>,
         codename: String,
     },
     Admin {
-        password: String,
+        #[serde(default)]
+        password: Option<String>,
         codename: String,
-        seed_password: String,
+        /// 12 or 24 words from `POST /setup/seed-phrase`, or typed to recover an admin.
+        #[serde(default)]
+        seed_phrase: Option<String>,
     },
 }
 
@@ -270,11 +362,14 @@ pub async fn setup(
         SetupInput::Admin {
             password,
             codename,
-            seed_password,
-        } => (password, codename, Some(seed_password)),
+            seed_phrase,
+        } => (password, codename, Some(seed_phrase)),
     };
+    let password = given(password);
     let mut problems = Vec::new();
-    if let Err(error) = check_new_password(&password, "password") {
+    if let Some(password) = &password
+        && let Err(error) = check_new_password(password, "password")
+    {
         problems.extend(
             error
                 .fields
@@ -288,16 +383,14 @@ pub async fn setup(
             "Use exactly 8 lowercase letters or digits.".to_owned(),
         ));
     }
-    if let Some(seed) = &seed
-        && let Err(error) = check_seed(seed)
-    {
-        problems.extend(
-            error
-                .fields
-                .into_values()
-                .map(|message| ("seed_password", message)),
-        );
-    }
+    let seed = match seed.map(admin_seed) {
+        Some(Ok(seed)) => Some(seed),
+        Some(Err(error)) => {
+            problems.extend(error.fields.into_values().map(|message| ("seed_phrase", message)));
+            None
+        }
+        None => None,
+    };
     if !problems.is_empty() {
         return Err(ApiError::invalid(problems));
     }
@@ -307,19 +400,13 @@ pub async fn setup(
         Some(seed) => Some(derive(&app, ip, seed).await?),
         None => None,
     };
-    let hash = {
-        let _permit = app
-            .argon
-            .acquire()
-            .await
-            .map_err(|_| ApiError::internal())?;
-        tokio::task::spawn_blocking(move || auth::hash_password(&password))
-            .await
-            .map_err(|_| ApiError::internal())??
+    let hash = match password {
+        Some(password) => Some(hash_new(&app, password).await?),
+        None => None,
     };
 
-    // Secrets first, the account last: until the account exists the device is still in setup,
-    // so a crash in between is repaired by doing setup again.
+    // Secrets first, the role last: until the role is saved the device is still in setup, so
+    // a crash in between is repaired by doing setup again.
     let role = if admin.is_some() { "admin" } else { "member" };
     let now = clock::now() as u64;
     app.secrets(move |keys| {
@@ -351,10 +438,12 @@ pub async fn setup(
     let now = clock::now();
     app.store
         .call(move |c| {
+            if let Some(hash) = &hash {
+                account::set_password_hash(c, hash, now)?;
+            }
             settings::set(c, CODENAME, &codename)?;
-            settings::set(c, ROLE, role)?;
             kaonic_store::audit::record(c, now, "setup", "device.setup", role)?;
-            account::set_password_hash(c, &hash, now)
+            settings::set(c, ROLE, role)
         })
         .await?;
     app.limiter.succeeded(ip);
@@ -376,10 +465,16 @@ pub async fn setup(
     signed_in(&app, Role::Admin).await
 }
 
+async fn hash_new(app: &App, password: String) -> ApiResult<String> {
+    let _permit = app.argon.acquire().await.map_err(|_| ApiError::internal())?;
+    tokio::task::spawn_blocking(move || auth::hash_password(&password)).await.map_err(|_| ApiError::internal())?
+}
+
 async fn signed_in(app: &App, role: Role) -> ApiResult<Response> {
     let (cookie, csrf) = auth::start_session(app, role).await?;
     let state = AuthState {
         setup_required: false,
+        password_set: has_password(app).await?,
         authenticated: true,
         role: Some(role.as_str()),
         csrf_token: Some(csrf),
@@ -391,9 +486,14 @@ async fn signed_in(app: &App, role: Role) -> ApiResult<Response> {
 
 pub async fn state(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
     let setup_required = !is_set_up(&app).await?;
+    let password_set = has_password(&app).await?;
     let caller = auth::current(&app, &headers).await?;
+    if !setup_required && !password_set && caller.is_none() {
+        return signed_in(&app, Role::Admin).await;
+    }
     Ok(no_store(axum::Json(AuthState {
         setup_required,
+        password_set,
         authenticated: caller.is_some(),
         role: caller.as_ref().map(|caller| caller.role.as_str()),
         csrf_token: caller.map(|caller| caller.csrf_token),
@@ -403,6 +503,7 @@ pub async fn state(State(app): State<App>, headers: HeaderMap) -> ApiResult<Resp
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PasswordBody {
+    #[serde(default)]
     pub password: String,
 }
 
@@ -413,6 +514,9 @@ pub async fn login(
     Json(body): Json<PasswordBody>,
 ) -> ApiResult<Response> {
     auth::check_origin(&headers)?;
+    if is_set_up(&app).await? && !has_password(&app).await? {
+        return signed_in(&app, Role::Admin).await;
+    }
     let ip = client(peer);
     // Counted before anything is awaited: concurrent requests cannot all pass the check.
     let attempt = app.limiter.begin(ip)?;
@@ -451,8 +555,12 @@ pub async fn logout(State(app): State<App>, Viewer(caller): Viewer) -> ApiResult
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangePassword {
+    /// Needed while a password is set.
+    #[serde(default)]
     current: String,
-    new: String,
+    /// None or empty turns the password off.
+    #[serde(default)]
+    new: Option<String>,
 }
 
 pub async fn change_password(
@@ -462,25 +570,30 @@ pub async fn change_password(
     Json(body): Json<ChangePassword>,
 ) -> ApiResult<impl IntoResponse> {
     auth::reconfirm(&app, client(peer), &body.current, "current").await?;
-    check_new_password(&body.new, "new")?;
-    let new = body.new;
-    let hash = {
-        let _permit = app
-            .argon
-            .acquire()
-            .await
-            .map_err(|_| ApiError::internal())?;
-        tokio::task::spawn_blocking(move || auth::hash_password(&new))
-            .await
-            .map_err(|_| ApiError::internal())??
+    let new = given(body.new);
+    if let Some(new) = &new {
+        check_new_password(new, "new")?;
+    }
+    let hash = match new {
+        Some(new) => Some(hash_new(&app, new).await?),
+        None => None,
     };
     let now = clock::now();
     app.store
         .call(move |c| {
-            account::set_password_hash(c, &hash, now)?;
-            // Every session ends, this one too: the UI signs in again with the new password.
+            let detail = match &hash {
+                Some(hash) => {
+                    account::set_password_hash(c, hash, now)?;
+                    "set"
+                }
+                None => {
+                    account::clear_password(c)?;
+                    "off"
+                }
+            };
+            // Every session ends, this one too: the UI signs in again.
             sessions::delete_all(c)?;
-            kaonic_store::audit::record(c, now, "admin", "auth.password", "")
+            kaonic_store::audit::record(c, now, "admin", "auth.password", detail)
         })
         .await?;
     let mut response = no_store(axum::http::StatusCode::NO_CONTENT);
@@ -497,7 +610,7 @@ pub async fn change_password(
 pub struct ForgotMethods {
     /// The client is on the USB cable (usb0): the serial number and ERASE are enough.
     usb: bool,
-    /// This is the Kaonic Admin device: its seed password proves the owner.
+    /// This is the Kaonic Admin device: its seed phrase proves the owner.
     seed: bool,
     /// Nothing to reset before setup.
     set_up: bool,
@@ -513,7 +626,8 @@ enum ForgotMethod {
 #[serde(deny_unknown_fields)]
 pub struct ForgotBody {
     method: String,
-    seed_password: Option<String>,
+    #[serde(default)]
+    seed_phrase: Option<String>,
     serial: Option<String>,
     confirm: String,
 }
@@ -548,19 +662,20 @@ fn check_forgot(body: &ForgotBody, usb: bool, seed: bool, serial: &str) -> ApiRe
             if !seed {
                 return Err(ApiError::forbidden(
                     "seed_unavailable",
-                    "Only the Kaonic Admin device is reset with a seed password. Connect a computer to this device by USB cable to reset it.",
+                    "Only the Kaonic Admin device is reset with a seed phrase. Connect a computer to this device by USB cable to reset it.",
                 ));
             }
-            match body.seed_password.as_deref() {
-                Some(seed) if !seed.is_empty() && seed.len() <= 256 => Ok(ForgotMethod::Seed),
-                _ => Err(ApiError::field("seed_password", "Enter the admin's seed password.")),
+            if body.seed_phrase.as_deref().is_some_and(|text| !text.trim().is_empty() && text.len() <= 512) {
+                Ok(ForgotMethod::Seed)
+            } else {
+                Err(ApiError::field("seed_phrase", "Enter the admin's seed phrase."))
             }
         }
         "usb" => {
             if !usb {
                 return Err(ApiError::forbidden(
                     "usb_required",
-                    "From the hotspot this device can only be reset with the admin's seed password. Connect a computer by USB cable and try again.",
+                    "From the hotspot this device can only be reset with the admin's seed phrase. Connect a computer by USB cable and try again.",
                 ));
             }
             let given = body.serial.as_deref().map(str::trim).unwrap_or_default();
@@ -583,7 +698,7 @@ pub async fn forgot_methods(State(app): State<App>, peer: Option<Extension<Peer>
 }
 
 /// `POST /auth/forgot/factory-reset`: erase the device without its password.
-pub async fn forgot_reset(State(app): State<App>, peer: Option<Extension<Peer>>, Json(body): Json<ForgotBody>) -> ApiResult<Response> {
+pub async fn forgot_reset(State(app): State<App>, peer: Option<Extension<Peer>>, Json(mut body): Json<ForgotBody>) -> ApiResult<Response> {
     if !is_set_up(&app).await? {
         return Err(ApiError::conflict("This device is not set up: there is nothing to reset."));
     }
@@ -593,15 +708,16 @@ pub async fn forgot_reset(State(app): State<App>, peer: Option<Extension<Peer>>,
     match check_forgot(&body, usb, seed, &app.device.serial()) {
         Ok(ForgotMethod::Seed) => {
             // Counted like a login and never forgiven; one Argon2 at a time.
-            let derived = derive(&app, ip, body.seed_password.clone().unwrap_or_default()).await?;
+            let seed = admin_seed(body.seed_phrase.take())?;
+            let derived = derive(&app, ip, seed).await?;
             let stored = app.secrets(|keys| Ok(keys.get(NODE_IDENTITY).map(|secret| secret.expose().to_vec()))).await?;
             let matches = stored
                 .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
                 .is_some_and(|bytes| NodeIdentity::from_bytes(&bytes).public().hash() == derived.public().hash());
             if !matches {
-                return Err(ApiError::field("seed_password", "This is not the seed password of this device's admin."));
+                return Err(ApiError::field("seed_phrase", "This is not the seed phrase of this device's admin."));
             }
-            super::device::schedule_factory_reset(&app, &format!("the admin's seed password, from {ip}"));
+            super::device::schedule_factory_reset(&app, &format!("the admin's seed phrase, from {ip}"));
         }
         Ok(ForgotMethod::Usb) => {
             let _attempt = app.limiter.begin(ip)?;
@@ -651,7 +767,7 @@ mod setup_tests {
     }
 
     fn forgot(method: &str, seed: Option<&str>, serial: Option<&str>, confirm: &str) -> ForgotBody {
-        ForgotBody { method: method.into(), seed_password: seed.map(Into::into), serial: serial.map(Into::into), confirm: confirm.into() }
+        ForgotBody { method: method.into(), seed_phrase: seed.map(Into::into), serial: serial.map(Into::into), confirm: confirm.into() }
     }
 
     #[test]

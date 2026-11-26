@@ -326,6 +326,9 @@ async fn run(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
     });
     // Before anything is stored with a time: a board without a battery clock boots unset.
     kaonic_hub::timesync::restore(&app).await;
+    if let Err(error) = kaonic_hub::api::ensure_codename(&app).await {
+        log::warn!("could not name this device: {}", error.message);
+    }
     let app = match (dev, node_identity) {
         (false, Some(identity)) => start_mesh(app, identity, &args).await,
         _ => app,

@@ -31,7 +31,8 @@ use axum::{Extension, Router};
 use serde::de::DeserializeOwned;
 
 pub use account::{BOOT_IDENTITY, NODE_IDENTITY, TRUST_ALLOWLIST, TRUST_OWN, TRUST_ROOT};
-pub use account::{node_info, our_admin};
+pub use account::{become_member, ensure_codename, node_info, our_admin};
+pub(crate) use device::schedule_factory_reset;
 pub use jobs::Jobs;
 pub use network::state as network_state;
 pub use peers::publish as publish_peer;
@@ -51,6 +52,8 @@ pub fn router(app: App) -> Router {
         // setup and auth
         .route("/setup/identity", get(account::setup_identity))
         .route("/setup/derive-identity", post(account::derive_identity))
+        .route("/setup/seed-phrase", post(account::new_seed_phrase))
+        .route("/setup/wordlist", get(account::wordlist))
         .route("/setup", post(account::setup))
         .route("/auth/state", get(account::state))
         .route("/auth/login", post(account::login))
@@ -108,6 +111,7 @@ pub fn router(app: App) -> Router {
         .route("/peers/{peer_id}/remote/vpn/gateway", put(remote::gateway))
         .route("/peers/{peer_id}/remote/shell", get(remote::shell))
         .route("/peers/{peer_id}/remote/shell/ticket", post(remote::shell_ticket))
+        .route("/peers/{peer_id}/remote/factory-reset", post(remote::factory_reset))
         .route("/remote/jobs", post(remote::start_jobs))
         .route("/bearers", get(peers::bearers))
         .route("/radio/bands", get(radio_bands::list))

@@ -124,6 +124,7 @@ pub async fn get(State(app): State<App>, _: Viewer, Query(query): Query<StatusQu
 pub struct NextBody {
     slot: String,
     mode: String,
+    #[serde(default)]
     password: String,
 }
 
@@ -203,6 +204,7 @@ pub async fn discard(State(_app): State<App>, _: Admin) -> ApiResult<Response> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallBody {
+    #[serde(default)]
     password: String,
     /// Defaults to the slot that is not running.
     slot: Option<String>,

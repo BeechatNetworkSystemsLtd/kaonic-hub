@@ -18,6 +18,9 @@ info:
       a Kaonic Admin device can perform.
     - Mutating requests authenticated by the session cookie must carry
       `X-Kaonic-CSRF` (see the `session` security scheme).
+    - Requests must be addressed to the device: an IP address, one of its own
+      names (`<hostname>`, `<hostname>.local`, `kaonic.local`) or `localhost`.
+      Any other `Host` is refused with 421 `wrong_host` (DNS rebinding).
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -75,11 +78,11 @@ paths:
     post:
       tags: [setup]
       operationId: deriveAdminIdentity
-      summary: The admin identity a seed password gives. Changes nothing.
+      summary: The admin identity a seed phrase gives. Changes nothing.
       description: |
         Lets a recovery be checked against the known admin identity before it is
-        applied. Runs the same Argon2id derivation as `POST /setup`, so it is
-        rate limited like a login.
+        applied. Runs the same derivation as `POST /setup` (the BIP39 seed, then
+        HKDF-SHA256 per key), and is rate limited like a login.
       security: []
       requestBody:
         required: true
@@ -88,9 +91,9 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [seed_password]
+              required: [seed_phrase]
               properties:
-                seed_password: { $ref: '#/components/schemas/SeedPassword' }
+                seed_phrase: { $ref: '#/components/schemas/SeedPhrase' }
       responses:
         '200':
           description: OK
@@ -104,6 +107,50 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Validation' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+  /setup/seed-phrase:
+    post:
+      tags: [setup]
+      operationId: newSeedPhrase
+      summary: A new admin's seed phrase, 12 or 24 words.
+      description: |
+        BIP39 English words encoding 128 or 256 bits from the kernel's random
+        source, with a checksum. The hub keeps nothing: the phrase is sent back
+        with `POST /setup`. Only before setup, from the device's own networks.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [words]
+              properties:
+                words: { type: integer, enum: [12, 24] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [words]
+                properties:
+                  words: { type: array, items: { type: string }, minItems: 12, maxItems: 24 }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /setup/wordlist:
+    get:
+      tags: [setup]
+      operationId: getWordlist
+      summary: The 2048 BIP39 English words a seed phrase is made of, in order, for typing one in.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { type: string }, minItems: 2048, maxItems: 2048 }
   /setup:
     post:
       tags: [setup]
@@ -112,7 +159,8 @@ paths:
       description: |
         Atomic: either everything is applied (UI password, codename, identity,
         and for an admin the root certificate and an empty allowlist) or
-        nothing is. On success the caller holds an admin session.
+        nothing is. On success the caller holds an admin session. The
+        password is optional: without one the device opens without signing in.
       security: []
       requestBody:
         required: true
@@ -129,6 +177,9 @@ paths:
       tags: [auth]
       operationId: getAuthState
       summary: Whether setup is required, who the caller is, and the CSRF token of the session.
+      description: |
+        On a device set up without a password, a caller with no session gets
+        an admin session here (the cookie is set, as by `POST /auth/login`).
       security: []
       responses:
         '200':
@@ -139,6 +190,7 @@ paths:
       tags: [auth]
       operationId: login
       summary: Sign in with the UI password.
+      description: Without a password set, signs in whatever is sent.
       security: []
       requestBody:
         required: true
@@ -164,7 +216,7 @@ paths:
       description: >-
         Unauthenticated. `usb`: the client is on the USB cable (both ends of the connection on
         usb0): typing the device's serial number and ERASE is enough. `seed`: this is the Kaonic
-        Admin device; its admin's seed password works from any of its own networks. A member
+        Admin device; its admin's seed phrase works from any of its own networks. A member
         reached over the hotspot offers neither: it must be reset over USB.
       security: []
       responses:
@@ -189,7 +241,7 @@ paths:
         attempt). Erases everything the hub keeps — identity, certificates and allowlist, the PTT
         group key, the password, settings and saved Wi-Fi networks — and restarts it in setup.
         Logged to the system journal first. A member must then be provisioned again by its admin;
-        an admin device set up again with the same seed password gets the same admin identity.
+        an admin device set up again with the same seed phrase gets the same admin identity.
       security: []
       requestBody:
         required: true
@@ -202,7 +254,7 @@ paths:
               properties:
                 method: { type: string, enum: [usb, seed] }
                 serial: { type: string, description: 'method usb: the serial number on the label (and the System page).' }
-                seed_password: { type: string, maxLength: 256, description: 'method seed: the admin''s seed password.' }
+                seed_phrase: { type: string, maxLength: 512, description: 'method seed: the admin''s seed phrase.' }
                 confirm: { type: string, enum: [ERASE] }
       responses:
         '202': { description: Erasing; the device restarts in setup within seconds. }
@@ -214,7 +266,7 @@ paths:
     put:
       tags: [auth]
       operationId: changePassword
-      summary: Change the UI password.
+      summary: Set, change or turn off the UI password.
       x-role: admin
       requestBody:
         required: true
@@ -223,12 +275,13 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [current, new]
               properties:
-                current: { type: string, maxLength: 256 }
-                new: { $ref: '#/components/schemas/NewPassword' }
+                current: { type: string, maxLength: 256, description: Needed while a password is set. }
+                new:
+                  oneOf: [{ $ref: '#/components/schemas/NewPassword' }, { type: 'null' }]
+                  description: Null, empty or absent turns the password off.
       responses:
-        '204': { description: Changed. Every other session and every token is revoked. }
+        '204': { description: Changed. Every session, this one too, and every token is revoked. }
         '422': { $ref: '#/components/responses/Validation' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
   /auth/tokens:
@@ -253,7 +306,7 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [name, role, password]
+              required: [name, role]
               properties:
                 name: { type: string, minLength: 1, maxLength: 48 }
                 role: { $ref: '#/components/schemas/Role' }
@@ -476,7 +529,7 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [slot, mode, password]
+              required: [slot, mode]
               properties:
                 slot: { type: string, enum: [a, b] }
                 mode: { type: string, enum: [once, permanent] }
@@ -552,7 +605,6 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [password]
               properties:
                 password: { type: string }
                 slot: { type: string, enum: [a, b], description: Defaults to the slot that is not running. }
@@ -643,7 +695,7 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [script, password]
+              required: [script]
               properties:
                 name: { type: string, maxLength: 48, pattern: '^[A-Za-z0-9._-]*$' }
                 script: { type: string, maxLength: 1048576 }
@@ -1475,6 +1527,34 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '502': { $ref: '#/components/responses/Upstream' }
         '504': { $ref: '#/components/responses/PeerTimeout' }
+  /peers/{peer_id}/remote/factory-reset:
+    post:
+      tags: [remote]
+      operationId: remoteFactoryReset
+      summary: Erase the node and return it to setup, so another admin may provision it.
+      description: |
+        A provisioned node takes provisioning only from its own admin; this, or a factory
+        reset on the node itself, is the way to release it. The node must be whitelisted
+        and its secure link up. Recorded in the audit log.
+      x-role: admin
+      x-admin-device: true
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirm]
+              properties:
+                password: { type: string, maxLength: 256, description: The UI password again, when one is set. }
+                confirm: { type: string, enum: [ERASE] }
+      responses:
+        '202': { description: The node is erasing; it restarts in setup within seconds. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Validation' }
   /peers/{peer_id}/remote/shell/ticket:
     post:
       tags: [remote]
@@ -1495,7 +1575,6 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [password]
               properties:
                 password: { type: string, maxLength: 256 }
       responses:
@@ -2020,7 +2099,7 @@ paths:
           multipart/form-data:
             schema:
               type: object
-              required: [file, password]
+              required: [file]
               properties:
                 file: { type: string, format: binary, maxLength: 67108864 }
                 password: { type: string, description: The UI password again; a wrong one is a field error. }
@@ -2081,7 +2160,7 @@ paths:
           multipart/form-data:
             schema:
               type: object
-              required: [file, password]
+              required: [file]
               properties:
                 file: { type: string, format: binary, maxLength: 67108864 }
                 password: { type: string }
@@ -2180,7 +2259,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [require_signed, password]
+              required: [require_signed]
               additionalProperties: false
               properties:
                 require_signed: { type: boolean }
@@ -2299,7 +2378,7 @@ paths:
           multipart/form-data:
             schema:
               type: object
-              required: [file, password]
+              required: [file]
               properties:
                 file: { type: string, format: binary, maxLength: 67108864 }
                 password: { type: string }
@@ -2338,7 +2417,7 @@ paths:
           multipart/form-data:
             schema:
               type: object
-              required: [file, password]
+              required: [file]
               properties:
                 file: { type: string, format: binary, maxLength: 67108864 }
                 password: { type: string }
@@ -2370,7 +2449,7 @@ paths:
           multipart/form-data:
             schema:
               type: object
-              required: [file, password]
+              required: [file]
               properties:
                 file: { type: string, format: binary, maxLength: 67108864 }
                 password: { type: string }
@@ -2744,7 +2823,9 @@ components:
         Set by `POST /setup` and `POST /auth/login`: HttpOnly, Secure,
         SameSite=Strict, Path=/, no Domain. The hub stores only a SHA-256 of the
         token. A session ends after 12 h without use or 7 days in all, on
-        logout, and on a password change.
+        logout, and on a password change. Without a UI password,
+        `GET /auth/state` starts one, and operations that ask for the
+        password again take it left out.
 
         Every request authenticated by this cookie other than GET/HEAD must
         send `X-Kaonic-CSRF` with the session's `csrf_token` (from
@@ -2941,13 +3022,14 @@ components:
       minLength: 8
       maxLength: 256
       description: The UI password. Checked against a list of common passwords; stored as Argon2id.
-    SeedPassword:
+    SeedPhrase:
       type: string
-      minLength: 16
-      maxLength: 256
+      maxLength: 512
       description: |
-        Derives the admin key. Anyone who hears the admin's announce can try to
-        guess it offline, so it must be long; the hub refuses common phrases.
+        12 or 24 BIP39 English words separated by spaces; case and extra
+        whitespace are ignored. A word off the list, a failed checksum or a
+        published example (every entropy byte the same, as BIP39's test
+        vectors) is a field error naming the problem, before any key is derived.
 
     # ── setup / auth ──
     SetupIdentity:
@@ -2961,27 +3043,31 @@ components:
         - type: object
           title: MemberSetup
           additionalProperties: false
-          required: [mode, password, codename]
+          required: [mode, codename]
           properties:
             mode: { type: string, const: member }
-            password: { $ref: '#/components/schemas/NewPassword' }
+            password: { $ref: '#/components/schemas/OptionalPassword' }
             codename: { $ref: '#/components/schemas/Codename' }
         - type: object
           title: AdminSetup
           additionalProperties: false
-          required: [mode, password, codename, seed_password]
+          required: [mode, codename, seed_phrase]
           properties:
             mode: { type: string, const: admin }
-            password: { $ref: '#/components/schemas/NewPassword' }
+            password: { $ref: '#/components/schemas/OptionalPassword' }
             codename: { $ref: '#/components/schemas/Codename' }
-            seed_password: { $ref: '#/components/schemas/SeedPassword' }
+            seed_phrase: { $ref: '#/components/schemas/SeedPhrase' }
       discriminator:
         propertyName: mode
+    OptionalPassword:
+      description: The UI password; null, empty or absent sets none (the default).
+      oneOf: [{ $ref: '#/components/schemas/NewPassword' }, { type: 'null' }, { type: string, maxLength: 0 }]
     AuthState:
       type: object
-      required: [setup_required, authenticated, role, csrf_token]
+      required: [setup_required, password_set, authenticated, role, csrf_token]
       properties:
         setup_required: { type: boolean, description: True on a factory-fresh device. }
+        password_set: { type: boolean, description: False when the UI opens without a password. }
         authenticated: { type: boolean }
         role: { oneOf: [{ $ref: '#/components/schemas/Role' }, { type: 'null' }] }
         csrf_token:
@@ -2990,9 +3076,8 @@ components:
     PasswordBody:
       type: object
       additionalProperties: false
-      required: [password]
       properties:
-        password: { type: string, maxLength: 256 }
+        password: { type: string, maxLength: 256, description: May be left out when no password is set. }
     ApiToken:
       type: object
       required: [id, name, role, created_ts, expires_ts, last_used_ts]
@@ -4464,8 +4549,8 @@ components:
       properties:
         volume: { type: [integer, 'null'], minimum: 0, maximum: 100, description: 'Speaker volume, % of the sound card''s playback control; re-applied at start. null leaves the card as the system set it.' }
         mic_gain: { type: [integer, 'null'], minimum: 0, maximum: 100, description: 'Microphone gain, % of the card''s Capture control, like volume.' }
-        capture_device: { type: string, maxLength: 64, example: default, description: 'ALSA capture device (see GET /ptt/devices).' }
-        playback_device: { type: string, maxLength: 64, example: default }
+        capture_device: { type: string, maxLength: 64, example: auto, description: 'ALSA capture device (see GET /ptt/devices). `auto` (the default) uses a USB headset while one is plugged in, else the board''s audio, and follows it as it is plugged in and out.' }
+        playback_device: { type: string, maxLength: 64, example: auto }
         talk_input: { type: string, enum: [device, browser], description: 'What the Talk page button keys: this device''s microphone (POST /ptt/key) or the browser''s (the audio WebSocket). Default device.' }
         play_on_device: { type: boolean, description: Play the group on this device's speaker. }
         rx_while_tx: { type: boolean, description: 'Keep playing received audio on the device while it talks. Off: the device''s speaker and microphone have no echo canceller between them.' }
@@ -4497,8 +4582,8 @@ components:
       properties:
         volume: { type: [integer, 'null'], minimum: 0, maximum: 100 }
         mic_gain: { type: [integer, 'null'], minimum: 0, maximum: 100 }
-        capture_device: { type: string, maxLength: 64, example: default }
-        playback_device: { type: string, maxLength: 64, example: default }
+        capture_device: { type: string, maxLength: 64, example: auto }
+        playback_device: { type: string, maxLength: 64, example: auto }
         talk_input: { type: string, enum: [device, browser] }
         play_on_device: { type: boolean }
         rx_while_tx: { type: boolean }

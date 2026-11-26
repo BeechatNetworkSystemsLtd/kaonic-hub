@@ -386,6 +386,7 @@ pub async fn answer(
                     .flatten()
                     .unwrap_or_default()
             );
+            crate::api::become_member(app).await;
             announce_change(app).await;
             // The group key travels with the first provisioning only (trust on first use, like
             // the root). A provisioned node gets later keys on its admin's authenticated link:

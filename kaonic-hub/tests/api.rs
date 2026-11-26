@@ -165,7 +165,7 @@ async fn setup_signs_in_once_and_only_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         state,
-        json!({ "setup_required": true, "authenticated": false, "role": null, "csrf_token": null })
+        json!({ "setup_required": true, "password_set": false, "authenticated": false, "role": null, "csrf_token": null })
     );
 
     let (_, identity) = hub.get("/api/v1/setup/identity").await;
@@ -173,14 +173,14 @@ async fn setup_signs_in_once_and_only_once() {
     assert_eq!(identity["public_identity"].as_str().unwrap().len(), 128);
 
     // Field errors come back per field, in the hub's field names.
-    let (status, error) = hub.write("POST", "/api/v1/setup", json!({ "mode": "admin", "password": "password", "codename": "BAD", "seed_password": "short" })).await;
+    let (status, error) = hub.write("POST", "/api/v1/setup", json!({ "mode": "admin", "password": "password", "codename": "BAD", "seed_phrase": "short" })).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(error["code"], "validation_failed");
     let fields = error["details"]["fields"].as_object().unwrap();
     assert!(
         fields.contains_key("password")
             && fields.contains_key("codename")
-            && fields.contains_key("seed_password")
+            && fields.contains_key("seed_phrase")
     );
 
     // Unknown fields are refused, not ignored.
@@ -211,6 +211,80 @@ async fn setup_signs_in_once_and_only_once() {
         hub.get("/api/v1/setup/identity").await.0,
         StatusCode::CONFLICT
     );
+}
+
+#[tokio::test]
+async fn a_new_admin_gets_a_seed_phrase_that_gives_its_identity() {
+    let mut hub = hub("phrase");
+    let (status, list) = hub.get("/api/v1/setup/wordlist").await;
+    assert_eq!((status, list.as_array().map(Vec::len)), (StatusCode::OK, Some(2048)));
+    assert_eq!(hub.write("POST", "/api/v1/setup/seed-phrase", json!({ "words": 18 })).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, phrase) = hub.write("POST", "/api/v1/setup/seed-phrase", json!({ "words": 12 })).await;
+    assert_eq!(status, StatusCode::OK);
+    let words: Vec<&str> = phrase["words"].as_array().unwrap().iter().map(|word| word.as_str().unwrap()).collect();
+    assert_eq!(words.len(), 12);
+    let (_, other) = hub.write("POST", "/api/v1/setup/seed-phrase", json!({ "words": 24 })).await;
+    assert_eq!(other["words"].as_array().unwrap().len(), 24);
+
+    // A mistyped word is named before anything slow runs; swapped words fail the checksum.
+    let mut typo = words.clone();
+    typo[4] = "notaword";
+    let (status, error) = hub.write("POST", "/api/v1/setup/derive-identity", json!({ "seed_phrase": typo.join(" ") })).await;
+    assert_eq!((status, error["details"]["fields"]["seed_phrase"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("Not on the word list: word 5.")));
+    let typed = words.join("  ").to_uppercase();
+    let (status, derived) = hub.write("POST", "/api/v1/setup/derive-identity", json!({ "seed_phrase": typed })).await;
+    assert_eq!(status, StatusCode::OK, "{derived}");
+
+    let (status, body) = hub.write("POST", "/api/v1/setup", json!({ "mode": "admin", "codename": "kaonadm1", "seed_phrase": words.join(" ") })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, device) = hub.get("/api/v1/device").await;
+    assert_eq!(device["identity_hash"], derived["identity_hash"], "the words give the admin");
+    // No more phrases once set up.
+    assert_eq!(hub.write("POST", "/api/v1/setup/seed-phrase", json!({ "words": 12 })).await.0, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn the_password_is_optional_and_can_be_turned_on_and_off() {
+    let mut hub = hub("no-password");
+    let (status, body) = hub.write("POST", "/api/v1/setup", json!({ "mode": "member", "codename": "kaon7qjt" })).await;
+    assert_eq!((status, body["password_set"].as_bool()), (StatusCode::OK, Some(false)), "{body}");
+    // Without a password, opening the UI signs in as admin, also after signing out.
+    hub.write("POST", "/api/v1/auth/logout", json!({})).await;
+    assert_eq!(hub.get("/api/v1/device").await.0, StatusCode::UNAUTHORIZED);
+    let (_, state) = hub.get("/api/v1/auth/state").await;
+    assert_eq!((state["authenticated"].as_bool(), state["role"].as_str()), (Some(true), Some("admin")));
+    assert_eq!(hub.get("/api/v1/device").await.0, StatusCode::OK);
+    // Writes still need the session's CSRF token.
+    let (status, _, _) = hub.send("PUT", "/api/v1/device/codename", Some(json!({ "codename": "abcd1234" })), false).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Turned on: every session ends and the UI asks for it.
+    let (status, _) = hub.write("PUT", "/api/v1/auth/password", json!({ "new": "correct-horse-1" })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, state) = hub.get("/api/v1/auth/state").await;
+    assert_eq!((state["authenticated"].as_bool(), state["password_set"].as_bool()), (Some(false), Some(true)));
+    assert_eq!(hub.write("POST", "/api/v1/auth/login", json!({ "password": "correct-horse-1" })).await.0, StatusCode::OK);
+
+    // Turning it off needs the current one.
+    let (status, error) = hub.write("PUT", "/api/v1/auth/password", json!({ "new": null })).await;
+    assert_eq!((status, error["details"]["fields"]["current"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("Wrong password.")));
+    let (status, _) = hub.write("PUT", "/api/v1/auth/password", json!({ "current": "correct-horse-1", "new": null })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, state) = hub.get("/api/v1/auth/state").await;
+    assert_eq!((state["authenticated"].as_bool(), state["password_set"].as_bool()), (Some(true), Some(false)));
+}
+
+#[tokio::test]
+async fn the_api_answers_only_requests_addressed_to_the_device() {
+    let mut hub = hub("host");
+    hub.write("POST", "/api/v1/setup", json!({ "mode": "member", "codename": "kaon7qjt" })).await;
+    // A page that pointed its own name at the device (DNS rebinding) gets no session.
+    let request = Request::builder().uri("/api/v1/auth/state").header(header::HOST, "evil.example").body(Body::empty()).unwrap();
+    let response = hub.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    assert!(response.headers().get(header::SET_COOKIE).is_none());
+    let request = Request::builder().uri("/api/v1/auth/state").header(header::HOST, "kaonic.local").body(Body::empty()).unwrap();
+    assert_eq!(hub.router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -504,6 +578,14 @@ async fn remote_management_is_for_the_admin_device_and_the_shell_needs_the_passw
     // The right password still finds no node to open a shell on: this device is no admin.
     let (status, error) = hub.write("POST", &ticket, json!({ "password": "correct-horse-1" })).await;
     assert_eq!((status, error["code"].as_str()), (StatusCode::FORBIDDEN, Some("not_admin_device")), "{error}");
+    // A node's factory reset: ERASE and the password again, and only from the admin device.
+    let reset = format!("/api/v1/peers/{node}/remote/factory-reset");
+    let (status, error) = hub.write("POST", &reset, json!({ "password": "correct-horse-1", "confirm": "erase" })).await;
+    assert_eq!((status, error["details"]["fields"]["confirm"].is_string()), (StatusCode::UNPROCESSABLE_ENTITY, true), "{error}");
+    let (status, _) = hub.write("POST", &reset, json!({ "password": "wrong-password", "confirm": "ERASE" })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, error) = hub.write("POST", &reset, json!({ "password": "correct-horse-1", "confirm": "ERASE" })).await;
+    assert_eq!((status, error["code"].as_str()), (StatusCode::FORBIDDEN, Some("not_admin_device")), "{error}");
     // The socket itself needs a ticket (the request is no upgrade here, so only the checks before it run).
     let (status, _) = hub.get(&format!("/api/v1/peers/{node}/remote/shell?ticket=00")).await;
     assert!(status.is_client_error(), "{status}");
@@ -588,7 +670,7 @@ async fn a_forgotten_password_reset_needs_the_serial_over_usb_and_wrong_guesses_
     assert_eq!((methods["usb"].clone(), methods["seed"].clone()), (json!(true), json!(false)));
 
     let reset = |method: &str, serial: &str, confirm: &str| json!({ "method": method, "serial": serial, "confirm": confirm });
-    let (status, error) = hub.write("POST", "/api/v1/auth/forgot/factory-reset", json!({ "method": "seed", "seed_password": "a long admin seed", "confirm": "ERASE" })).await;
+    let (status, error) = hub.write("POST", "/api/v1/auth/forgot/factory-reset", json!({ "method": "seed", "seed_phrase": "a long admin seed", "confirm": "ERASE" })).await;
     assert_eq!((status, error["code"].clone()), (StatusCode::FORBIDDEN, json!("seed_unavailable")));
     let (status, error) = hub.write("POST", "/api/v1/auth/forgot/factory-reset", reset("usb", "K1S-30-004217", "erase")).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);

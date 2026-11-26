@@ -142,6 +142,29 @@ async fn a_provisioned_node_takes_no_group_key_from_a_repeated_provision() {
 }
 
 #[tokio::test]
+async fn a_fresh_device_is_named_at_boot_and_set_up_as_a_member_by_provisioning() {
+    let (app, _dir) = app("headless");
+    let setting = |key: &'static str| {
+        let app = app.clone();
+        async move { app.store.call(move |c| kaonic_store::settings::get(c, key)).await.unwrap() }
+    };
+    kaonic_hub::api::ensure_codename(&app).await.unwrap();
+    let codename = setting("device.codename").await.unwrap();
+    assert!(codename.len() == 8 && codename.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()), "{codename}");
+    kaonic_hub::api::ensure_codename(&app).await.unwrap();
+    assert_eq!(setting("device.codename").await.as_deref(), Some(codename.as_str()), "named once");
+    assert_eq!(setting("device.role").await, None, "not set up yet");
+
+    let admin = Admin::new();
+    let node = node_identity(&app).await;
+    let key = GroupKeyMaterial::generate(1);
+    assert!(ok(&provision(&app, &admin, &node, AddressHash::new([1; 16]), &mut Offered::new(), Some(&key)).await));
+    assert_eq!(setting("device.role").await.as_deref(), Some("member"), "provisioning sets it up, with nobody at the device");
+    assert_eq!(group_key::stored(&app).await.unwrap().key, key.key, "and brings the PTT key");
+    assert!(!app.store.call(|c| kaonic_store::account::has_password(c)).await.unwrap(), "no password: its UI opens");
+}
+
+#[tokio::test]
 async fn old_epochs_never_replace_a_newer_key() {
     let (app, _dir) = app("epochs");
     let admin = Admin::new();

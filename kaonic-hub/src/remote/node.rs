@@ -46,6 +46,8 @@ pub(crate) enum Op {
     Restart {},
     Reboot {},
     Update {},
+    /// Erase the node and return it to setup, so another admin may provision it.
+    FactoryReset {},
 }
 
 enum Input {
@@ -207,6 +209,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Restart {} => "restart",
         Op::Reboot {} => "reboot",
         Op::Update {} => "update",
+        Op::FactoryReset {} => "factory_reset",
     }
 }
 
@@ -258,6 +261,15 @@ async fn run(app: &App, op: Op) -> ApiResult<Value> {
                     }
                 });
             }
+            Ok(json!({}))
+        }
+        Op::FactoryReset {} => {
+            // Answer first: the erase ends this process.
+            let app = app.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                crate::api::schedule_factory_reset(&app, "its admin, over the mesh");
+            });
             Ok(json!({}))
         }
         Op::Update {} => Err(ApiError::unavailable("not_available", "Updating other nodes over the mesh is not available in this release.")),
@@ -377,6 +389,7 @@ mod tests {
     #[test]
     fn only_known_operations_with_exact_fields_are_accepted() {
         assert!(matches!(serde_json::from_str::<Op>(r#"{"op":"info"}"#), Ok(Op::Info {})));
+        assert!(matches!(serde_json::from_str::<Op>(r#"{"op":"factory_reset"}"#), Ok(Op::FactoryReset {})));
         assert!(matches!(serde_json::from_str::<Op>(r#"{"op":"codename","codename":"abcd1234"}"#), Ok(Op::Codename { .. })));
         assert!(serde_json::from_str::<Op>(r#"{"op":"shell","command":"rm -rf /"}"#).is_err());
         assert!(serde_json::from_str::<Op>(r#"{"op":"restart","now":true}"#).is_err());

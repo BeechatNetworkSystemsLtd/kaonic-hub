@@ -64,6 +64,26 @@ pub async fn codename(State(app): State<App>, _: Admin, Path(id): Path<String>, 
     Ok(no_store(axum::Json(device)))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactoryResetBody {
+    #[serde(default)]
+    password: String,
+    confirm: String,
+}
+
+/// `POST /peers/{id}/remote/factory-reset`: the node erases itself and returns to setup, free
+/// to be provisioned by another admin. The password again, and ERASE.
+pub async fn factory_reset(State(app): State<App>, peer: Option<Extension<Peer>>, _: Admin, Path(id): Path<String>, Json(body): Json<FactoryResetBody>) -> ApiResult<Response> {
+    if body.confirm != "ERASE" {
+        return Err(ApiError::field("confirm", "Type ERASE to confirm."));
+    }
+    auth::reconfirm(&app, client(peer), &body.password, "password").await?;
+    admin::request(&app, &id, json!({ "op": "factory_reset" })).await?;
+    audit(&app, "remote.factory_reset", id).await;
+    Ok(no_store(StatusCode::ACCEPTED))
+}
+
 /// `PUT /peers/{id}/remote/radio/bands/{band}`
 pub async fn radio_band(State(app): State<App>, _: Admin, Path((id, band)): Path<(String, String)>, Json(config): Json<Value>) -> ApiResult<Response> {
     let view = admin::request(&app, &id, json!({ "op": "radio", "band": band, "config": config })).await?;
@@ -161,6 +181,7 @@ static TICKETS: LazyLock<Mutex<HashMap<String, Ticket>>> = LazyLock::new(Default
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TicketBody {
+    #[serde(default)]
     password: String,
 }
 

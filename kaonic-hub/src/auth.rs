@@ -1,5 +1,7 @@
 //! Who is calling, and whether they may.
 //!
+//! - The UI password is optional and off by default: without one, opening the UI starts an
+//!   admin session, and the session and CSRF checks below still apply.
 //! - Passwords: Argon2id PHC strings; one hash at a time ([`App::argon`]), so the
 //!   512 MB board cannot be pushed out of memory by parallel logins.
 //! - Sessions: a 256-bit token in the `__Host-kaonic_session` cookie; the store
@@ -278,6 +280,42 @@ pub fn check_origin(headers: &HeaderMap) -> ApiResult<()> {
     Ok(())
 }
 
+/// Whether a request was addressed to this device: an IP address, one of its own names or
+/// `localhost`. A page that points a name of its own at the device (DNS rebinding) is then
+/// refused, so it cannot read a session, the one started for it without a password included.
+pub fn own_host(app: &App, headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
+    own_host_named(&crate::tls::device_names(app).0, headers, uri)
+}
+
+fn own_host_named(names: &[String], headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
+    // HTTP/2 names the host in the URI.
+    let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()).or_else(|| uri.authority().map(|authority| authority.as_str())) else {
+        return false;
+    };
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').filter(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit())).map_or(host, |(name, _)| name),
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name.parse::<IpAddr>().is_ok() || name == "localhost" || names.iter().any(|own| own.eq_ignore_ascii_case(&name))
+}
+
+/// Refuses API requests addressed to a name that is not this device's.
+pub async fn require_own_host(
+    axum::extract::State(app): axum::extract::State<App>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if own_host(&app, request.headers(), request.uri()) {
+        return next.run(request).await;
+    }
+    axum::response::IntoResponse::into_response(ApiError::new(
+        axum::http::StatusCode::MISDIRECTED_REQUEST,
+        "wrong_host",
+        "Open this device by its address or its own name.",
+    ))
+}
+
 /// An extractor for handlers that need a signed-in caller of at least the given role.
 /// Writes also pass the CSRF and origin checks here.
 pub struct Viewer(pub Caller);
@@ -329,20 +367,19 @@ where
     }
 }
 
-/// Checks the UI password again for a dangerous operation. A wrong one is a field error, never a 401.
+/// Checks the UI password again for a dangerous operation; with no password set there is
+/// nothing to check. A wrong one is a field error, never a 401.
 pub async fn reconfirm(
     app: &App,
     client: IpAddr,
     password: &str,
     field: &'static str,
 ) -> ApiResult<()> {
+    let Some(hash) = app.store.call(|c| kaonic_store::account::password_hash(c)).await? else {
+        return Ok(());
+    };
     let attempt = app.limiter.begin(client)?;
     let _permit = app.argon.try_acquire().map_err(|_| busy())?;
-    let hash = app
-        .store
-        .call(|c| kaonic_store::account::password_hash(c))
-        .await?
-        .ok_or_else(ApiError::internal)?;
     let password = password.to_owned();
     let good = tokio::task::spawn_blocking(move || {
         password.len() <= 256 && verify_password(&password, &hash)
@@ -407,6 +444,26 @@ mod tests {
         let again = limiter.begin(other).unwrap();
         again.succeeded();
         assert!(limiter.clients.lock().unwrap().get(&other).is_none());
+    }
+
+    #[test]
+    fn hosts_that_are_this_device() {
+        let named = |host: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_static(host));
+            headers
+        };
+        let names = ["kaonic-1234".to_owned(), "kaonic-1234.local".to_owned(), "kaonic.local".to_owned()];
+        let own = |host: &'static str| own_host_named(&names, &named(host), &axum::http::Uri::from_static("/api/v1/auth/state"));
+        for host in ["192.168.10.1", "192.168.10.1:443", "[fe80::1]:443", "kaonic.local", "Kaonic-1234.local.", "localhost:8088"] {
+            assert!(own(host), "{host}");
+        }
+        for host in ["evil.example", "kaonic.local.evil.example", "192.168.10.1.nip.io:443"] {
+            assert!(!own(host), "{host}");
+        }
+        // HTTP/2: no Host header, the authority is in the URI.
+        assert!(own_host_named(&names, &HeaderMap::new(), &axum::http::Uri::from_static("https://kaonic.local/api/v1/auth/state")));
+        assert!(!own_host_named(&names, &HeaderMap::new(), &axum::http::Uri::from_static("/api/v1/auth/state")));
     }
 
     #[test]
