@@ -1,6 +1,6 @@
 [package]
 name = "kaonic-hub"
-version = "0.2.0"
+version = "0.3.0"
 description = "The Kaonic hub service: web UI, API, Wi-Fi and trust for a Kaonic device."
 edition.workspace = true
 rust-version.workspace = true
