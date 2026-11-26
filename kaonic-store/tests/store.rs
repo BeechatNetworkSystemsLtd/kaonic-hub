@@ -165,3 +165,17 @@ async fn plugin_stores_are_separate_and_limited() {
     assert_eq!(store.call(|c| plugin_store::put(c, "b", "one-too-many", b"v")).await.unwrap(), Put::Full);
     assert_eq!(store.call(|c| plugin_store::delete_all(c, "b")).await.unwrap(), MAX_KEYS);
 }
+
+#[tokio::test]
+async fn sessions_move_with_a_clock_step() {
+    let store = Store::open_in_memory().unwrap();
+    store.call(|c| sessions::create(c, b"hash-a", "csrf-a", "admin", 1000)).await.unwrap();
+    // The clock jumped three weeks ahead: without the shift the session would be over.
+    let step = 21 * 24 * 3600;
+    assert_eq!(store.call(move |c| sessions::shift(c, step)).await.unwrap(), 1);
+    let found = store.call(move |c| sessions::find_and_touch(c, b"hash-a", 1000 + step + 60)).await.unwrap().unwrap();
+    assert_eq!(found.created_ts, 1000 + step);
+    // And back again: a session made "in the future" is not refused either.
+    store.call(move |c| sessions::shift(c, -step)).await.unwrap();
+    assert!(store.call(|c| sessions::find_and_touch(c, b"hash-a", 1100)).await.unwrap().is_some());
+}

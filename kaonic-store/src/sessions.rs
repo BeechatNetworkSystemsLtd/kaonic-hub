@@ -10,6 +10,7 @@ const SELECT_TIMES: &str = include_str!("../sql/sessions/select_times.sql");
 const DELETE: &str = include_str!("../sql/sessions/delete.sql");
 const DELETE_ALL: &str = include_str!("../sql/sessions/delete_all.sql");
 const PURGE_EXPIRED: &str = include_str!("../sql/sessions/purge_expired.sql");
+const SHIFT: &str = include_str!("../sql/sessions/shift.sql");
 
 /// A session ends after this long without use…
 pub const IDLE_SECS: i64 = 12 * 3600;
@@ -66,6 +67,12 @@ pub fn delete(connection: &Connection, token_hash: &[u8]) -> rusqlite::Result<()
 pub fn delete_all(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute(DELETE_ALL, [])?;
     Ok(())
+}
+
+/// Moves every session by `secs` after the clock was stepped by as much, so a sign-in made
+/// before the device learnt the date neither expires at once nor outlives its limits.
+pub fn shift(connection: &Connection, secs: i64) -> rusqlite::Result<usize> {
+    connection.execute(SHIFT, params![secs])
 }
 
 pub fn purge_expired(connection: &Connection, now: i64) -> rusqlite::Result<usize> {
