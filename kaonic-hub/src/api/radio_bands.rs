@@ -423,9 +423,15 @@ struct Pending {
     switch: Switch,
     at_ts_ms: i64,
     switched_unix: Option<i64>,
+    /// Packets heard on the mesh band when it switched: any more prove a node is on it.
+    rx_at_switch: Option<u64>,
 }
 
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+
+fn rx_packets(app: &App) -> u64 {
+    app.mesh.as_ref().map_or(0, |mesh| mesh.counters().rx_packets)
+}
 
 async fn band_view(app: &App, band: &'static Band) -> Value {
     let config = current(app, band).await;
@@ -650,13 +656,20 @@ async fn apply_here(app: &App, band: &'static Band, now: BandConfig, config: Ban
     }
     // Moving only this node off the mesh band cuts it off from nodes it could hear: like a
     // network switch, it goes back if no node is heard on the new band within a minute.
+    // A change made while the last one is still unconfirmed goes back to the configuration
+    // that last worked, and replaces that watch.
     let is_mesh = mesh_band(app).is_some_and(|mesh| std::ptr::eq(mesh, band));
     let had_peers = app.mesh.as_ref().is_some_and(|mesh| mesh.peers().iter().any(|peer| mesh.is_online(peer)));
+    let watched = PENDING.lock().expect("radio pending lock").as_ref().filter(|pending| std::ptr::eq(pending.band, band) && pending.switched_unix.is_some()).map(|pending| pending.switch.previous);
+    let good = watched.unwrap_or(now);
     apply(app, band, config, filter).await?;
-    if is_mesh && had_peers && config != now {
-        let switch = Switch::applied(now, config, Instant::now());
-        *PENDING.lock().expect("radio pending lock") = Some(Pending { band, switch, at_ts_ms: crate::clock::now_ms(), switched_unix: Some(crate::clock::now()) });
+    if is_mesh && had_peers && config != good {
+        let switch = Switch::applied(good, config, Instant::now());
+        let pending = Pending { band, switch, at_ts_ms: crate::clock::now_ms(), switched_unix: Some(crate::clock::now()), rx_at_switch: Some(rx_packets(app)) };
+        *PENDING.lock().expect("radio pending lock") = Some(pending);
         log::info!("radio: mesh band changed on this node only; going back in a minute unless a node is heard");
+    } else if watched.is_some() {
+        *PENDING.lock().expect("radio pending lock") = None;
     }
     Ok(band_view(app, band).await)
 }
@@ -698,7 +711,7 @@ pub(crate) async fn all_bands(app: &App) -> Vec<Value> {
 fn schedule(band: &'static Band, previous: BandConfig, next: BandConfig) -> i64 {
     let at = Instant::now() + Duration::from_secs(u64::from(SWITCH_IN));
     let at_ts_ms = crate::clock::now_ms() + i64::from(SWITCH_IN) * 1000;
-    *PENDING.lock().expect("radio pending lock") = Some(Pending { band, switch: Switch::new(previous, next, at), at_ts_ms, switched_unix: None });
+    *PENDING.lock().expect("radio pending lock") = Some(Pending { band, switch: Switch::new(previous, next, at), at_ts_ms, switched_unix: None, rx_at_switch: None });
     at_ts_ms
 }
 
@@ -762,7 +775,7 @@ async fn on_message(app: &App, peer: &str, packet: &[u8]) {
         let previous = current(app, band).await;
         let at = Instant::now() + Duration::from_secs(u64::from(in_secs.min(60)));
         let at_ts_ms = crate::clock::now_ms() + i64::from(in_secs.min(60)) * 1000;
-        *PENDING.lock().expect("radio pending lock") = Some(Pending { band, switch: Switch::new(previous, config, at), at_ts_ms, switched_unix: None });
+        *PENDING.lock().expect("radio pending lock") = Some(Pending { band, switch: Switch::new(previous, config, at), at_ts_ms, switched_unix: None, rx_at_switch: None });
         log::info!("radio: the admin changes the mesh band in {in_secs} s");
     }
 }
@@ -771,8 +784,9 @@ async fn step(app: &App) {
     let action = {
         let mut pending = PENDING.lock().expect("radio pending lock");
         let Some(current) = pending.as_mut() else { return };
-        // Heard: any node announced after we switched.
-        let heard = current.switched_unix.is_some_and(|switched| app.mesh.as_ref().is_some_and(|mesh| mesh.peers().iter().any(|peer| peer.last_seen > switched)));
+        // Heard: any packet decoded since we switched, so a node is on the same settings
+        // (announces alone come too seldom to show it within the minute).
+        let heard = current.rx_at_switch.is_some_and(|at_switch| rx_packets(app) > at_switch);
         let step = current.switch.tick(Instant::now(), heard.then(Instant::now));
         if matches!(step, SwitchStep::Apply(_)) {
             current.switched_unix = Some(crate::clock::now());
@@ -796,6 +810,10 @@ async fn step(app: &App) {
             log::info!("radio: switching the mesh band now");
             if let Err(error) = apply(app, band, config, None).await {
                 log::warn!("radio: switching failed: {}", error.message);
+            }
+            let rx = rx_packets(app);
+            if let Some(pending) = PENDING.lock().expect("radio pending lock").as_mut().filter(|pending| std::ptr::eq(pending.band, band)) {
+                pending.rx_at_switch = Some(rx);
             }
         }
         SwitchStep::Revert(config) => {
