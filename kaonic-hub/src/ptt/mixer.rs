@@ -90,9 +90,9 @@ fn api() -> Option<Arc<Api>> {
     .clone()
 }
 
-/// The card behind a configured device, for the mixer (the plugin's `alsa_card_of`):
-/// `hw:1,0` and `plughw:CARD=x` name it; `default` and anything else mean card 0, the
-/// on-board codec on Kaonic hardware.
+/// The card behind a device (`auto` already resolved), for the mixer (the plugin's
+/// `alsa_card_of`): `hw:1,0` and `plughw:CARD=x` name it; `default` and anything else mean
+/// card 0, the on-board codec on Kaonic hardware.
 pub fn card_of(device: &str) -> String {
     let device = device.trim();
     if let Some(rest) = device.strip_prefix("plughw:").or_else(|| device.strip_prefix("hw:")) {
@@ -173,6 +173,10 @@ impl Mixer {
             element
         }
     }
+
+    fn has(&self, name: &str) -> bool {
+        !self.element(name).is_null()
+    }
 }
 
 impl Drop for Mixer {
@@ -194,9 +198,12 @@ pub enum Control {
 /// then scales in software.
 pub fn set(device: &str, control: Control, pct: u8) -> Result<(), String> {
     let mixer = Mixer::open(&card_of(device))?;
+    // The codec's controls first; a USB headset names its own differently.
     let names: &[&str] = match control {
-        Control::Capture => &["Capture"],
-        Control::Playback => &["Speaker", "Headphone"],
+        Control::Capture if mixer.has("Capture") => &["Capture"],
+        Control::Capture => &["Mic"],
+        Control::Playback if mixer.has("Speaker") || mixer.has("Headphone") => &["Speaker", "Headphone"],
+        Control::Playback => &["Headset", "PCM"],
     };
     let mut done = false;
     for name in names {
@@ -232,8 +239,8 @@ pub fn set(device: &str, control: Control, pct: u8) -> Result<(), String> {
 pub fn get(device: &str, control: Control) -> Result<u8, String> {
     let mixer = Mixer::open(&card_of(device))?;
     let name = match control {
-        Control::Capture => "Capture",
-        Control::Playback => "Speaker",
+        Control::Capture => ["Capture", "Mic"].into_iter().find(|name| mixer.has(name)).unwrap_or("Capture"),
+        Control::Playback => ["Speaker", "Headset", "PCM"].into_iter().find(|name| mixer.has(name)).unwrap_or("Speaker"),
     };
     let element = mixer.element(name);
     if element.is_null() {

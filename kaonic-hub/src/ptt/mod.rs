@@ -15,6 +15,7 @@
 //! defaults.
 
 pub mod alsa;
+pub mod cards;
 mod dl;
 pub mod mixer;
 pub mod opus;
@@ -51,6 +52,8 @@ const DEFAULT_TTL: u8 = 4;
 /// The system restores the card's mixer state at boot, possibly after the hub started: the
 /// gain and volume are applied again this long after start (as the plugin did).
 const MIXER_REAPPLY: Duration = Duration::from_secs(15);
+/// How often the sound cards are looked at, for a headset plugged in or out.
+const DEVICE_CHECK: Duration = Duration::from_secs(2);
 /// The armed microphone does not key this soon after the speaker played, so the tail of
 /// what was played is not taken for talk.
 const SPEAKER_TAIL: Duration = Duration::from_millis(150);
@@ -139,6 +142,7 @@ pub struct Settings {
     pub volume: Option<u8>,
     /// % of the card's Capture control, like `volume`.
     pub mic_gain: Option<u8>,
+    /// ALSA devices; `auto` follows a USB headset as it is plugged in and out.
     pub capture_device: String,
     pub playback_device: String,
     pub talk_input: TalkInput,
@@ -179,8 +183,8 @@ impl Default for Settings {
         Self {
             volume: None,
             mic_gain: None,
-            capture_device: "default".into(),
-            playback_device: "default".into(),
+            capture_device: cards::AUTO.into(),
+            playback_device: cards::AUTO.into(),
             talk_input: TalkInput::Device,
             play_on_device: true,
             rx_while_tx: false,
@@ -758,7 +762,7 @@ struct Engine {
     tx: Option<BurstRecord>,
     /// Copies of our END still to send, and when.
     ends: Vec<(Instant, Packet)>,
-    /// The devices open, and their names.
+    /// The devices open, and their ALSA names (`auto` resolved).
     playback: Option<Playback>,
     capture: Option<Capture>,
     devices: (String, String),
@@ -867,29 +871,43 @@ impl Engine {
         counter
     }
 
-    /// Opens the configured capture and playback devices (again, when they changed).
-    fn open_devices(&mut self) {
+    /// Opens the configured capture and playback devices, again when they changed, a headset
+    /// came or went (`auto`), or one was lost. True when a device was opened.
+    fn open_devices(&mut self) -> bool {
         let settings = self.ptt.settings();
         if !alsa::available() {
-            return;
+            return false;
         }
-        if self.devices.0 != settings.capture_device || self.capture.is_none() {
-            self.capture = alsa::capture(&settings.capture_device).inspect_err(|error| log::debug!("ptt: microphone: {error}")).ok();
-            self.devices.0 = settings.capture_device.clone();
+        let cards = cards::present();
+        let capture = cards::resolve(&settings.capture_device, &cards);
+        let playback = cards::resolve(&settings.playback_device, &cards);
+        let mut opened = false;
+        if self.devices.0 != capture || self.capture.is_none() {
+            if self.devices.0 != capture {
+                log::info!("ptt: microphone {capture}");
+            }
+            self.capture = alsa::capture(&capture).inspect_err(|error| log::debug!("ptt: microphone: {error}")).ok();
+            opened |= self.capture.is_some();
+            self.devices.0 = capture;
         }
-        if self.devices.1 != settings.playback_device || self.playback.is_none() {
-            self.playback = alsa::playback(&settings.playback_device).inspect_err(|error| log::debug!("ptt: speaker: {error}")).ok();
-            self.devices.1 = settings.playback_device.clone();
+        if self.devices.1 != playback || self.playback.is_none() {
+            if self.devices.1 != playback {
+                log::info!("ptt: speaker {playback}");
+            }
+            self.playback = alsa::playback(&playback).inspect_err(|error| log::debug!("ptt: speaker: {error}")).ok();
+            opened |= self.playback.is_some();
+            self.devices.1 = playback;
         }
         self.ptt.microphone.store(self.capture.is_some(), Ordering::Relaxed);
         self.ptt.speaker.store(self.playback.is_some(), Ordering::Relaxed);
+        opened
     }
 
     /// Microphone gain and speaker volume on the card's mixer, as the plugin did; a card
     /// without the control gets them in software.
     async fn apply_mixer(&mut self) {
         let settings = self.ptt.settings();
-        let (capture, playback) = (settings.capture_device.clone(), settings.playback_device.clone());
+        let (capture, playback) = self.devices.clone();
         let (gain, volume) = (settings.mic_gain, settings.volume);
         let applied = tokio::task::spawn_blocking(move || {
             let gain = gain.map(|pct| mixer::set(&capture, mixer::Control::Capture, pct).inspect_err(|error| log::debug!("ptt: mic gain in software: {error}")).is_ok());
@@ -942,6 +960,8 @@ impl Engine {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut trust_check = tokio::time::interval(Duration::from_secs(5));
         let mut level_tick = tokio::time::interval(Duration::from_millis(250));
+        let mut device_check = tokio::time::interval(DEVICE_CHECK);
+        device_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
@@ -985,6 +1005,11 @@ impl Engine {
                     }
                 }
                 _ = level_tick.tick() => self.publish_level(),
+                _ = device_check.tick() => {
+                    if self.open_devices() {
+                        self.apply_mixer().await;
+                    }
+                }
             }
         }
     }

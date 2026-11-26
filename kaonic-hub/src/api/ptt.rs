@@ -70,10 +70,13 @@ fn key_error(error: KeyError) -> Response {
     }
 }
 
-/// `GET /ptt/devices`: the sound card's capture and playback devices.
+/// `GET /ptt/devices`: the sound card's capture and playback devices, `auto` first.
 pub async fn devices(State(app): State<App>, _: Viewer) -> ApiResult<Response> {
     ptt(&app)?;
-    let (capture, playback) = tokio::task::spawn_blocking(crate::ptt::mixer::devices).await.unwrap_or_default();
+    let (mut capture, mut playback) = tokio::task::spawn_blocking(crate::ptt::mixer::devices).await.unwrap_or_default();
+    let auto = crate::ptt::mixer::Device { name: crate::ptt::cards::AUTO.into(), description: "A USB headset when one is plugged in, else the board's audio".into() };
+    capture.insert(0, auto.clone());
+    playback.insert(0, auto);
     Ok(no_store(axum::Json(json!({ "capture": capture, "playback": playback }))))
 }
 
