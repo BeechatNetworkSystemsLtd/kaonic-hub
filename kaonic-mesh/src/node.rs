@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reticulum::destination::{DestinationDesc, DestinationName};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
-use reticulum::transport::{NetworkProfile, TimerConfig, Transport, TransportConfig};
+use reticulum::transport::{GroupRelayConfig, GroupRelayStats, NetworkProfile, TimerConfig, Transport, TransportConfig};
 use tokio::sync::broadcast;
 
 use crate::announce::{self, Announced, NodeInfo};
@@ -20,6 +20,17 @@ use crate::traffic::Traffic;
 
 pub const APP_NAME: &str = "kaonic";
 pub const ASPECT: &str = "node";
+/// A node that heard nothing for this long was cut off. It announces soon after it hears
+/// the air again ([`Mesh::announce_soon`]), so peers relink at once.
+const SILENCE: Duration = Duration::from_secs(15);
+/// Announces out of turn are sent at most this often.
+const EARLY_ANNOUNCE_EVERY: Duration = Duration::from_secs(60);
+
+/// GROUP packets are relayed only while they have travelled fewer hops than this (a relay
+/// counts): three relays, so a packet reaches four hops out, as push-to-talk's ttl 4 did.
+pub const GROUP_MAX_HOPS: u8 = 4;
+/// Seconds between updates of the GROUP relay's neighbour count.
+const NEIGHBOURS_EVERY: u64 = 10;
 
 #[derive(Clone, Debug)]
 pub struct MeshConfig {
@@ -39,11 +50,17 @@ pub struct MeshConfig {
     /// At most this many nodes are remembered; past it the longest unheard go first. Every
     /// announce from a new identity adds one, and identities cost an attacker nothing.
     pub max_peers: usize,
+    /// Keepalive interval of each link, sent by the opener and answered by the peer: two
+    /// frames per link and interval when idle.
+    pub keepalive_secs: u64,
+    /// A link that heard nothing from its peer for this long is closed and opened again;
+    /// at least `keepalive_secs` + 4.
+    pub link_dead_secs: u64,
 }
 
 impl Default for MeshConfig {
     fn default() -> Self {
-        Self { radio: "rf09_a".into(), announce_secs: 120, offline_secs: 480, settings: None, forget_secs: 3600, max_peers: 512 }
+        Self { radio: "rf09_a".into(), announce_secs: 120, offline_secs: 480, settings: None, forget_secs: 3600, max_peers: 512, keepalive_secs: 10, link_dead_secs: 20 }
     }
 }
 
@@ -78,20 +95,52 @@ pub struct Mesh {
     info: Arc<Mutex<NodeInfo>>,
     updates: broadcast::Sender<Peer>,
     config: MeshConfig,
+    /// The announcer and the announce listener, stopped by [`Mesh::stop`].
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// This start of the hub, as its announces say ([`announce::Boot`]).
+    boot_id: u32,
+    started: Instant,
+    /// When each peer last announced, on the monotonic clock: the wall clock jumps when the
+    /// hub learns the date.
+    heard: Mutex<HashMap<String, Instant>>,
+    /// Each peer's boot id and when (here) that start of it began.
+    starts: Mutex<HashMap<String, (u32, Instant)>>,
+    /// Wakes the announcer for an announce out of turn, and when it last was.
+    early: Arc<tokio::sync::Notify>,
+    last_early: Mutex<Option<Instant>>,
 }
 
 /// Link timers for a shared, lossy, half-duplex radio. Reticulum's defaults (a keepalive
 /// every 5 s, closed after 15 s without one) cost a frame per link every 5 s and close links
 /// whenever two keepalives in a row are lost.
-fn radio_timers() -> TimerConfig {
+///
+/// With the defaults (10 s, 20 s): a keepalive every 10 s (±10 %); stale after 12 s of
+/// silence, then a probe every 2 s; closed 20 s after the peer was last heard. The other
+/// side closes after 24 s. An unanswered link request is repeated after 3 s, then 6 and 8 s.
+///
+/// Neighbours hear an announce at the same moment, so rebroadcasts wait up to 0.5 s and path
+/// responses up to 1.5 s, and link timers vary by 10 %; otherwise relays that cannot hear
+/// each other collide. A path not refreshed for 10 minutes takes an older announce, from a
+/// node that rebooted with its clock behind.
+fn radio_timers(config: &MeshConfig) -> TimerConfig {
+    let keep = config.keepalive_secs.max(1);
+    let dead = config.link_dead_secs.max(keep + 4);
+    let stale = Duration::from_secs(keep + 2);
+    let close = Duration::from_secs(dead) - stale;
     TimerConfig {
-        out_link_keep: Duration::from_secs(10),
-        // a lost request or proof costs a few seconds, not six (RTT is about 40 ms a hop)
+        out_link_keep: Duration::from_secs(keep),
+        out_link_stale: stale,
+        out_link_close: close,
+        out_link_probe: (close / 4).max(Duration::from_secs(1)),
+        // a lost request costs 3 s, not 6; a peer out of reach one request every 8 s
         out_link_repeat: Duration::from_secs(3),
-        out_link_stale: Duration::from_secs(40),
-        out_link_close: Duration::from_secs(20),
-        in_link_stale: Duration::from_secs(40),
-        in_link_close: Duration::from_secs(20),
+        out_link_repeat_max: Duration::from_secs(8),
+        in_link_stale: Duration::from_secs(dead - 4),
+        in_link_close: Duration::from_secs(8),
+        jitter_percent: 10,
+        rebroadcast_window: Duration::from_millis(500),
+        path_response_window: Duration::from_millis(1500),
+        path_refresh: Some(Duration::from_secs(600)),
         ..TimerConfig::default()
     }
 }
@@ -126,7 +175,13 @@ impl Mesh {
         let mut transport = TransportConfig::new("kaonic-hub", &identity)
             .set_retransmit(true)
             .set_network_profile(NetworkProfile::MultiHop)
-            .set_timer_config(radio_timers())
+            .set_timer_config(radio_timers(&config))
+            // a stale link still carries data, and its path is replaced or asked for again
+            .set_link_recovery(true)
+            // GROUP packets (push-to-talk, plugin broadcasts) reach nodes several hops away:
+            // relayed once by each node after a random wait, unless enough neighbours already did
+            .set_group_forwarding(true)
+            .set_group_relay(GroupRelayConfig::shared_medium(GROUP_MAX_HOPS))
             .build();
         let destination = transport.add_destination(identity, DestinationName::new(APP_NAME, ASPECT)).await;
         let own_destination = destination.lock().await.desc.address_hash;
@@ -153,27 +208,64 @@ impl Mesh {
             info: Arc::new(Mutex::new(info)),
             updates,
             config: config.clone(),
+            tasks: Mutex::default(),
+            boot_id: rand::random(),
+            started: Instant::now(),
+            heard: Mutex::default(),
+            starts: Mutex::default(),
+            early: Arc::new(tokio::sync::Notify::new()),
+            last_early: Mutex::default(),
         });
 
         // Announce now, again after about 5 and 15 s (neighbours learn a restarted node quickly
         // although a frame is lost), then regularly. Jitter keeps neighbours that booted together
-        // from colliding.
+        // from colliding. A node that was cut off announces again soon after it hears the air.
         let announcer = mesh.clone();
-        tokio::spawn(async move {
+        let early = mesh.early.clone();
+        let announcing = tokio::spawn(async move {
             let mut quick = [5, 10].into_iter();
             loop {
-                let data = announce::encode(&announcer.info.lock().expect("info lock"));
+                let boot = announce::Boot { id: announcer.boot_id, uptime_secs: u32::try_from(announcer.started.elapsed().as_secs()).unwrap_or(u32::MAX) };
+                let data = announce::encode_with_boot(&announcer.info.lock().expect("info lock"), Some(boot));
                 announcer.transport.lock().await.send_announce(&destination, Some(&data)).await;
                 let secs = quick.next().unwrap_or(announcer.config.announce_secs).min(announcer.config.announce_secs);
                 let jitter = rand::random::<u64>() % (secs * 250 + 1);
-                tokio::time::sleep(Duration::from_millis(secs * 1000 + jitter)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(secs * 1000 + jitter)) => {}
+                    _ = early.notified() => {
+                        tokio::time::sleep(Duration::from_millis(300 + rand::random::<u64>() % 1200)).await;
+                    }
+                }
+            }
+        });
+        let watcher = mesh.clone();
+        let watching = tokio::spawn(async move {
+            let mut last = (watcher.counters().rx_packets, Instant::now());
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut ticks: u64 = 0;
+            loop {
+                tick.tick().await;
+                if ticks % NEIGHBOURS_EVERY == 0 {
+                    watcher.update_group_neighbours().await;
+                }
+                ticks += 1;
+                let heard = watcher.counters().rx_packets;
+                if heard == last.0 {
+                    continue;
+                }
+                let silent = last.1.elapsed() >= SILENCE;
+                last = (heard, Instant::now());
+                if silent {
+                    log::debug!("mesh: hearing the air again after {} s of silence", SILENCE.as_secs());
+                    watcher.announce_soon();
+                }
             }
         });
 
         // Learn nodes from their announces.
         let listener = mesh.clone();
         let mut announces = mesh.transport.lock().await.recv_announces().await;
-        tokio::spawn(async move {
+        let listening = tokio::spawn(async move {
             loop {
                 let event = match announces.recv().await {
                     Ok(event) => event,
@@ -191,6 +283,10 @@ impl Mesh {
                 };
                 // The name tells a hub from anything else that happens to announce.
                 let announced = announce::decode(event.app_data.as_slice());
+                listener.heard.lock().expect("heard lock").insert(id.clone(), Instant::now());
+                if let Some(boot) = announce::boot_of(event.app_data.as_slice()) {
+                    listener.note_boot(&id, boot);
+                }
                 // The announce is verified now: its first-hand signal moves into the peer table.
                 let heard = neighbours.lock().expect("neighbours lock").remove(&destination).map(|(rssi, _)| rssi);
                 let rssi = (event.hops == 0).then_some(heard).flatten();
@@ -215,16 +311,68 @@ impl Mesh {
                 let _ = listener.updates.send(peer);
             }
         });
+        mesh.tasks.lock().expect("tasks lock").extend([announcing.abort_handle(), listening.abort_handle(), watching.abort_handle()]);
         Ok(mesh)
+    }
+
+    /// Stops announcing and takes the radio off the transport, as if the process ended (tests
+    /// restart nodes in-process).
+    pub async fn stop(&self) {
+        for task in self.tasks.lock().expect("tasks lock").drain(..) {
+            task.abort();
+        }
+        self.transport.lock().await.iface_manager().lock().await.shutdown();
+    }
+
+    /// Announces within a second or two, at most once per `EARLY_ANNOUNCE_EVERY`, so relays
+    /// and peers learn this node's path again.
+    pub fn announce_soon(&self) {
+        let mut last = self.last_early.lock().expect("early lock");
+        if last.is_some_and(|at| at.elapsed() < EARLY_ANNOUNCE_EVERY) {
+            return;
+        }
+        *last = Some(Instant::now());
+        self.early.notify_one();
+    }
+
+    /// When `peer` announced from a new start (or the first time): when that start began here.
+    /// The estimate from an announce that travelled longer is later, so the earliest one of
+    /// a start is kept.
+    fn note_boot(&self, peer: &str, boot: announce::Boot) {
+        let Some(began) = Instant::now().checked_sub(Duration::from_secs(u64::from(boot.uptime_secs))) else { return };
+        let mut starts = self.starts.lock().expect("starts lock");
+        match starts.get_mut(peer) {
+            Some((id, at)) if *id == boot.id => *at = (*at).min(began),
+            Some(known) => {
+                log::info!("mesh: {peer} restarted {} s ago", boot.uptime_secs);
+                *known = (boot.id, began);
+            }
+            None => {
+                starts.insert(peer.to_owned(), (boot.id, began));
+            }
+        }
+    }
+
+    /// When the running start of `peer` began, as far as its announces tell (on this node's
+    /// monotonic clock; None for a hub too old to say).
+    pub fn started_of(&self, peer: &str) -> Option<Instant> {
+        self.starts.lock().expect("starts lock").get(peer).map(|(_, at)| *at)
+    }
+
+    /// How long ago `peer` was last heard announcing.
+    fn unheard_for(&self, peer: &Peer) -> Duration {
+        match self.heard.lock().expect("heard lock").get(&peer.id) {
+            Some(at) => at.elapsed(),
+            None => Duration::from_secs(u64::try_from(now() - peer.last_seen).unwrap_or(0)),
+        }
     }
 
     /// Forgets nodes unheard for `forget_secs`, and the longest unheard past `max_peers`.
     fn prune(&self) {
-        let now = now();
-        let forget = i64::try_from(self.config.forget_secs).unwrap_or(i64::MAX);
+        let forget = Duration::from_secs(self.config.forget_secs);
         let gone: Vec<String> = {
             let mut peers = self.peers.lock().expect("peers lock");
-            let mut gone: Vec<String> = peers.values().filter(|peer| now - peer.last_seen > forget).map(|peer| peer.id.clone()).collect();
+            let mut gone: Vec<String> = peers.values().filter(|peer| self.unheard_for(peer) > forget).map(|peer| peer.id.clone()).collect();
             let excess = (peers.len() - gone.len()).saturating_sub(self.config.max_peers);
             if excess > 0 {
                 let mut remaining: Vec<(&String, i64)> = peers.iter().filter(|(id, _)| !gone.contains(id)).map(|(id, peer)| (id, peer.last_seen)).collect();
@@ -238,8 +386,11 @@ impl Mesh {
         };
         if !gone.is_empty() {
             let mut destinations = self.destinations.lock().expect("destinations lock");
+            let (mut heard, mut starts) = (self.heard.lock().expect("heard lock"), self.starts.lock().expect("starts lock"));
             for id in &gone {
                 destinations.remove(id);
+                heard.remove(id);
+                starts.remove(id);
             }
             log::debug!("mesh: forgot {} nodes", gone.len());
         }
@@ -267,8 +418,20 @@ impl Mesh {
         peers
     }
 
+    /// Tells the GROUP relay how many direct neighbours are online, so a node bridging two
+    /// groups still relays when only one side has the packet already.
+    async fn update_group_neighbours(&self) {
+        let direct = self.peers().iter().filter(|peer| peer.via.is_none() && self.is_online(peer)).count();
+        self.transport.lock().await.set_group_neighbours(u8::try_from(direct).unwrap_or(u8::MAX));
+    }
+
+    /// GROUP packets relayed by this node, and relays cancelled by copies from others.
+    pub async fn group_relay_stats(&self) -> GroupRelayStats {
+        self.transport.lock().await.group_relay_stats()
+    }
+
     pub fn is_online(&self, peer: &Peer) -> bool {
-        now() - peer.last_seen <= self.config.offline_secs as i64
+        self.unheard_for(peer) <= Duration::from_secs(self.config.offline_secs)
     }
 
     /// Each peer as it is heard again.

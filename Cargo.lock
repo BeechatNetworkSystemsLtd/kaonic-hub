@@ -703,6 +703,7 @@ dependencies = [
 [[package]]
 name = "kaonic-crc"
 version = "0.1.0"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio.git?branch=main#3b1a75842a974fc700508205bfb3858428320a2c"
 dependencies = [
  "crc32fast",
  "libc",
@@ -712,6 +713,7 @@ dependencies = [
 [[package]]
 name = "kaonic-frame"
 version = "0.1.0"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio.git?branch=main#3b1a75842a974fc700508205bfb3858428320a2c"
 
 [[package]]
 name = "kaonic-handshake"
@@ -840,6 +842,7 @@ version = "0.1.0"
 [[package]]
 name = "kaonic-net"
 version = "0.1.0"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio.git?branch=main#3b1a75842a974fc700508205bfb3858428320a2c"
 dependencies = [
  "kaonic-crc",
  "kaonic-frame",
@@ -1270,7 +1273,7 @@ dependencies = [
 [[package]]
 name = "reticulum"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#206baa4d0ff4809ee69fad32c5a6c981f0664387"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#212b4fbce9b395118c2d8bb819ea5b55e9ce325e"
 dependencies = [
  "log",
  "rand_core 0.6.4",
@@ -1284,7 +1287,7 @@ dependencies = [
 [[package]]
 name = "reticulum-core"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#206baa4d0ff4809ee69fad32c5a6c981f0664387"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git?branch=fix%2Fradio-mesh#212b4fbce9b395118c2d8bb819ea5b55e9ce325e"
 dependencies = [
  "aes",
  "cbc",

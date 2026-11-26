@@ -1,8 +1,9 @@
 //! A Reticulum GROUP channel: one packet, encrypted with the network's group key, heard by
 //! every neighbour at once. Push-to-talk speaks on it.
 //!
-//! Reticulum never relays GROUP packets (it drops any with hops > 0): what reaches further
-//! nodes is the hubs' own job (PTT re-sends what it hears, with its own suppression).
+//! Reticulum relays GROUP packets (`group_forwarding`, see `node.rs`): each node once, after a
+//! random wait, unless enough neighbours already did, up to `GROUP_MAX_HOPS`. Copies are
+//! dropped by its packet cache, our own echoes included, so each packet arrives here once.
 //!
 //! What goes inside the encrypted packet is `epoch u8 | payload`: the key epoch the sender
 //! used, so a receiver can tell traffic of a node that has not caught up with a rotation. The
@@ -83,6 +84,8 @@ pub struct GroupMessage {
     pub epoch: u8,
     /// The radio's signal for the last frame heard (the radio cannot tell per packet yet).
     pub rssi: Option<i8>,
+    /// Relays it took to reach us (0: from the sender itself).
+    pub hops: u8,
 }
 
 pub struct GroupChannel {
@@ -127,7 +130,7 @@ impl GroupChannel {
                 }
                 let Some((&epoch, payload)) = data.data.as_slice().split_first() else { continue };
                 let rssi = channel.mesh.counters().last_rssi;
-                let _ = channel.messages.send(GroupMessage { payload: Arc::new(payload.to_vec()), epoch, rssi });
+                let _ = channel.messages.send(GroupMessage { payload: Arc::new(payload.to_vec()), epoch, rssi, hops: data.hops });
             }
         });
         log::info!("group: kaonic.{aspect} open, key epoch {}", key.epoch);

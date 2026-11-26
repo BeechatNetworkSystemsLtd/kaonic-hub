@@ -24,17 +24,20 @@ const EDD_US_MAX: u32 = 8064;
 const BACKOFF_US_MAX: u32 = 2000;
 const SPACING_MAX: u32 = 6_375_000;
 /// The TX power register goes to 31; the hub allows less on the modulations that run at high
-/// duty (a safe starting point agreed for the boards' amplifier): OFDM 25, O-QPSK 20.
+/// duty (a safe starting point agreed for the boards' amplifier): OFDM 25, O-QPSK and FSK 20.
 pub const TX_POWER_REGISTER_MAX: u8 = 31;
 pub const TX_POWER_MAX_OFDM: u8 = 25;
 pub const TX_POWER_MAX_QPSK: u8 = 20;
+pub const TX_POWER_MAX_FSK: u8 = 20;
 
 /// The highest TX power register value the hub sets with this modulation.
 pub fn max_tx_power(modulation: Modulation) -> u8 {
     match modulation {
         Modulation::Ofdm { .. } => TX_POWER_MAX_OFDM,
         Modulation::Qpsk { .. } => TX_POWER_MAX_QPSK,
-        Modulation::Fsk { .. } | Modulation::Off => TX_POWER_REGISTER_MAX,
+        Modulation::Fsk { .. } => TX_POWER_MAX_FSK,
+        // Off sends nothing; the register keeps whatever it had.
+        Modulation::Off => TX_POWER_REGISTER_MAX,
     }
 }
 
@@ -421,11 +424,12 @@ mod tests {
         assert!(power(ofdm, 26));
         assert!(!power(qpsk, 20));
         assert!(power(qpsk, 21));
-        assert!(!power(fsk, 31));
-        assert!(power(fsk, 32));
+        assert!(!power(fsk, 20));
+        assert!(power(fsk, 21));
         // Saved before the limits: brought down, not refused.
         assert_eq!(BandConfig { modulation: ofdm, tx_power: 31, ..sample() }.capped().tx_power, 25);
         assert_eq!(BandConfig { modulation: qpsk, tx_power: 31, ..sample() }.capped().tx_power, 20);
+        assert_eq!(BandConfig { modulation: fsk, tx_power: 31, ..sample() }.capped().tx_power, 20);
         assert_eq!(BandConfig { modulation: qpsk, tx_power: 7, ..sample() }.capped().tx_power, 7);
     }
 

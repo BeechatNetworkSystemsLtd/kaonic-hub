@@ -1,5 +1,5 @@
-//! The GROUP channel on the emulated radio (`kaonic-sim-air`): one packet reaches every neighbour
-//! holding the key, nobody further (relaying is the hubs' job), and after a rotation the
+//! The GROUP channel on the emulated radio (`kaonic-sim-air`): one packet reaches every node
+//! holding the key, nodes out of range through a relay, each once; and after a rotation the
 //! previous epoch is still read for the grace period.
 
 use std::sync::Arc;
@@ -31,7 +31,7 @@ async fn deliver(from: &GroupChannel, receiver: &mut broadcast::Receiver<GroupMe
 }
 
 #[tokio::test]
-async fn group_packets_reach_neighbours_only_and_survive_a_rotation() {
+async fn group_packets_are_relayed_once_and_survive_a_rotation() {
     let air = Air::start("127.0.0.1:0".parse().unwrap(), MediumConfig::default(), 11).await.unwrap();
     air.block("a", "c");
     let (a, b, c) = (node(&air, "a").await, node(&air, "b").await, node(&air, "c").await);
@@ -47,9 +47,36 @@ async fn group_packets_reach_neighbours_only_and_survive_a_rotation() {
     let mut at_c = c_group.subscribe();
     let mut at_d = d_group.subscribe();
     let message = deliver(&a_group, &mut at_b, b"over").await.expect("b hears a");
-    assert_eq!((message.payload.as_slice(), message.epoch), (&b"over"[..], 1));
-    assert!(at_c.try_recv().is_err(), "c is out of range: group packets are not relayed");
+    assert_eq!((message.payload.as_slice(), message.epoch, message.hops), (&b"over"[..], 1, 0));
+    // c is out of a's range: b relays it, after its random wait.
+    let relayed = tokio::time::timeout(Duration::from_secs(2), at_c.recv()).await.expect("b relays to c").unwrap();
+    assert_eq!((relayed.payload.as_slice(), relayed.hops), (&b"over"[..], 1));
+    // Each packet reaches c at most once: ten distinct ones, each sent once (the air may lose some).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while at_c.try_recv().is_ok() {}
+    for n in 0..10u8 {
+        assert!(a_group.send(&[b'#', n]).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut heard = Vec::new();
+    while let Ok(message) = at_c.try_recv() {
+        heard.push(message.payload[1]);
+    }
+    let mut unique = heard.clone();
+    unique.dedup();
+    assert_eq!(heard, unique, "a packet reached c twice");
+    assert!(!heard.is_empty(), "b relayed none of them");
     assert!(at_d.try_recv().is_err(), "d has another key");
+    // a's own packet relayed back by b is dropped, not delivered to a.
+    let mut at_a = a_group.subscribe();
+    assert!(deliver(&b_group, &mut at_a, b"back").await.is_some());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while let Ok(echo) = at_a.try_recv() {
+        assert_ne!(echo.payload.as_slice(), b"over", "our own packet came back");
+    }
+
+    while at_b.try_recv().is_ok() {}
 
     // a and b rotate to epoch 2; c has not caught up and still sends with epoch 1.
     let next = GroupKeyMaterial::generate(2);

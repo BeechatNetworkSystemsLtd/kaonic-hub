@@ -8,9 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# kaonic-frame is a local checkout for now; pinned by git rev before the first release.
 reticulum = { workspace = true }
-kaonic-frame = { path = "../../kaonic-radio-ks/kaonic-frame" }
+# kaonic-frame and kaonic-net come from kaonic-radio, pinned by Cargo.lock.
+kaonic-frame = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio.git", branch = "main" }
 kaonic-handshake = { path = "../kaonic-handshake" }
 kaonic-mux = { path = "../kaonic-mux" }
 kaonic-trust = { path = "../kaonic-trust" }
@@ -31,7 +31,7 @@ x25519-dalek = { workspace = true }
 
 # The board's CRC goes through the kernel's crypto API (AF_ALG); elsewhere the same CRC in software.
 [target.'cfg(target_os = "linux")'.dependencies]
-kaonic-net = { path = "../../kaonic-radio-ks/kaonic-net" }
+kaonic-net = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio.git", branch = "main" }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-kaonic-net = { path = "../../kaonic-radio-ks/kaonic-net", default-features = false, features = ["machine-host"] }
+kaonic-net = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio.git", branch = "main", default-features = false, features = ["machine-host"] }

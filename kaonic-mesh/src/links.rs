@@ -6,6 +6,12 @@
 //! carries mux packets ([`kaonic_mux`]) for the services (the VPN). A link that fails
 //! authentication is closed and its peer backed off. Unprovisioned nodes have no
 //! credentials and link nobody; provisioning has its own messages (`KPV1`).
+//!
+//! Links come back by themselves after the radio loses them. Reticulum closes a link that
+//! stops hearing its peer (timers in `node.rs`); the opener then opens a new one at once and
+//! keeps trying while the peer is online, without the backoff used for failed logins. A peer
+//! that restarted (a new boot id) loses its old links at once, and if it is the opener, we
+//! open the link instead. Of two links to one peer, the one the lower hash opened stays.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -22,11 +28,27 @@ use crate::node::{Mesh, hex};
 
 /// How often the manager looks for peers to link and runs handshake timers.
 const TICK: Duration = Duration::from_secs(1);
-/// After a failed attempt, the first wait before trying that peer again; doubled each time.
+/// After a failed authentication, the first wait before trying that peer again; doubled each time.
 const BACKOFF_FIRST: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
-/// Opening a link (Reticulum's request and proof) may take this long on a busy channel.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// An unanswered link request is replaced by a fresh one (new keys) after this long.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Relinking waits a random time up to this, so nodes relinking to one peer do not send at
+/// once.
+const RELINK_SPREAD: Duration = Duration::from_millis(1500);
+/// A peer that started this recently may not know us yet, so we open the link even when it
+/// is the opener, after waiting a few seconds for it to: a link opened from both sides costs
+/// a second setup.
+const TAKEOVER_WINDOW: Duration = Duration::from_secs(60);
+const TAKEOVER_AFTER: Duration = Duration::from_secs(4);
+/// An offline peer we were linked to is still tried for this long, with one short attempt
+/// about every `OFFLINE_RETRY`.
+const REMEMBER_LINKED: Duration = Duration::from_secs(3600);
+const OFFLINE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const OFFLINE_RETRY: Duration = Duration::from_secs(30);
+/// A link authenticated more than this before the peer's current start belongs to its
+/// previous start and is gone. The start time is known to a second or so.
+const RESTART_MARGIN: Duration = Duration::from_secs(3);
 /// Links we opened that are not yet authenticated: announces that merely claim our admin
 /// cannot make us send link requests to more peers than this at once.
 const MAX_OPENING: usize = 16;
@@ -89,6 +111,8 @@ struct Failure {
     retry_at: Option<Instant>,
     detail: String,
     at: Instant,
+    /// The peer did not answer (radio): retried soon, not backed off.
+    unreachable: bool,
 }
 
 #[derive(Default)]
@@ -98,6 +122,10 @@ struct State {
     /// The authenticated link of each peer.
     up: HashMap<String, (LinkId, Instant)>,
     failures: HashMap<String, Failure>,
+    /// Peers not to open a link to before the instant ([`RELINK_SPREAD`]).
+    not_before: HashMap<String, Instant>,
+    /// When each peer last had an authenticated link (it came up, or was lost).
+    last_up: HashMap<String, Instant>,
 }
 
 /// Stores an allowlist a peer handed us (the caller's keystore).
@@ -128,6 +156,7 @@ impl Links {
             let transport = mesh.transport().lock().await;
             (transport.in_link_events(), transport.out_link_events())
         };
+        let mut heard = mesh.subscribe();
         let manager = links.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(TICK);
@@ -147,6 +176,11 @@ impl Links {
                             log::warn!("links: missed {missed} out-link events");
                             manager.reconcile().await;
                         }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
+                    peer = heard.recv() => match peer {
+                        Ok(peer) => manager.on_heard(&peer.id).await,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
                         Err(broadcast::error::RecvError::Closed) => return,
                     },
                     _ = tick.tick() => manager.on_tick().await,
@@ -223,21 +257,27 @@ impl Links {
         }
     }
 
+    /// Sends on exactly this link, also while stale: it has only missed keepalives.
     async fn send_on(&self, id: LinkId, side: Side, payload: &[u8]) -> bool {
         let transport = self.mesh.transport().lock().await;
-        match side {
-            Side::Out(destination) => !transport.send_to_out_links(&destination, payload).await.is_empty(),
-            Side::In => {
-                let Some(link) = transport.find_in_link(&id).await else { return false };
-                let packet = link.lock().await.data_packet(payload);
-                match packet {
-                    Ok(packet) => {
-                        transport.send_packet(packet).await;
-                        true
-                    }
-                    Err(_) => false,
-                }
+        let link = match side {
+            Side::Out(_) => transport.find_out_link(&id).await,
+            Side::In => transport.find_in_link(&id).await,
+        };
+        let Some(link) = link else { return false };
+        let packet = {
+            let link = link.lock().await;
+            if *link.id() != id {
+                return false;
             }
+            link.data_packet(payload)
+        };
+        match packet {
+            Ok(packet) => {
+                transport.send_packet(packet).await;
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -293,25 +333,43 @@ impl Links {
         self.mesh
             .peers()
             .into_iter()
-            .filter(|peer| self.mesh.is_online(peer))
+            .filter(|peer| self.mesh.is_online(peer) || state.last_up.get(&peer.id).is_some_and(|at| at.elapsed() < REMEMBER_LINKED))
             .filter(|peer| matches!(&peer.announced, Announced::Hub(info) if info.admin_id == Some(ours)))
             // The admin blocked it: its AUTH would be refused anyway.
             .filter(|peer| kaonic_trust::IdentityHash::from_hex(&peer.id).is_none_or(|hash| !auth.trust.allowlist().is_blocked(&hash)))
-            // The lower identity hash opens the link.
-            .filter(|peer| me < peer.id.as_str())
+            // The lower identity hash opens the link, unless the other one just started.
+            .filter(|peer| me < peer.id.as_str() || self.mesh.started_of(&peer.id).is_some_and(|at| (TAKEOVER_AFTER..TAKEOVER_WINDOW).contains(&at.elapsed())))
             .filter(|peer| !state.up.contains_key(&peer.id) && !state.links.values().any(|entry| entry.peer.as_deref() == Some(peer.id.as_str())))
             .filter(|peer| state.failures.get(&peer.id).and_then(|failure| failure.retry_at).is_none_or(|at| now >= at))
+            .filter(|peer| state.not_before.get(&peer.id).is_none_or(|at| now >= *at))
             .take(MAX_OPENING.saturating_sub(opening(&state.links)))
             .map(|peer| peer.id)
             .collect()
     }
 
     async fn on_tick(&self) {
+        // Links of a peer's previous start are gone: close them now, not when they time out.
+        let restarted: Vec<(LinkId, String)> = {
+            let state = self.state.lock().expect("links lock");
+            state
+                .up
+                .iter()
+                .filter(|(peer, (_, since))| self.mesh.started_of(peer).is_some_and(|started| *since + RESTART_MARGIN < started))
+                .map(|(peer, (id, _))| (*id, peer.clone()))
+                .collect()
+        };
+        for (id, peer) in restarted {
+            log::info!("links {}: {peer} restarted, its link {} is gone", &self.mesh.identity_hash()[..8], hex(&id));
+            self.close(id, "the peer restarted").await;
+        }
         let wanted = {
             let mut state = self.state.lock().expect("links lock");
             // Peers the mesh forgot are not backed off any more.
             let known: HashSet<String> = self.mesh.peers().into_iter().map(|peer| peer.id).collect();
             state.failures.retain(|peer, _| known.contains(peer));
+            state.last_up.retain(|peer, at| known.contains(peer) && at.elapsed() < REMEMBER_LINKED);
+            let now = Instant::now();
+            state.not_before.retain(|_, at| *at > now);
             self.wanted(&state)
         };
         for peer in wanted {
@@ -321,13 +379,16 @@ impl Links {
         let now = Instant::now();
         let mut actions: Vec<(LinkId, Side, Vec<Event>)> = Vec::new();
         let mut stuck = Vec::new();
+        let online: HashSet<String> = self.mesh.peers().into_iter().filter(|peer| self.mesh.is_online(peer)).map(|peer| peer.id).collect();
         {
             let mut state = self.state.lock().expect("links lock");
             let State { auth, links, .. } = &mut *state;
             for (id, entry) in links.iter_mut() {
+                let offline = entry.peer.as_ref().is_some_and(|peer| !online.contains(peer));
+                let timeout = if offline { OFFLINE_OPEN_TIMEOUT } else { OPEN_TIMEOUT };
                 match (entry.handshake.as_mut(), auth.as_ref()) {
                     (Some(handshake), Some(auth)) => actions.push((*id, entry.side, handshake.tick(&auth.trust, now))),
-                    (None, _) if now.duration_since(entry.opened) > OPEN_TIMEOUT => stuck.push(*id),
+                    (None, _) if now.duration_since(entry.opened) > timeout => stuck.push(*id),
                     _ => {}
                 }
             }
@@ -336,9 +397,48 @@ impl Links {
             self.act(id, side, events).await;
         }
         for id in stuck {
-            self.fail(id, "the link did not come up");
+            self.unreachable(id, "the link did not come up");
             self.close(id, "not activated").await;
         }
+    }
+
+    /// Whether the mesh has not heard `peer` announcing for its offline time.
+    fn is_offline(&self, peer: &str) -> bool {
+        self.mesh.peers().iter().find(|known| known.id == peer).is_none_or(|known| !self.mesh.is_online(known))
+    }
+
+    /// The peer announced: if we were trying to reach it, retry now with a fresh request.
+    async fn on_heard(&self, peer: &str) {
+        let stale_attempt = {
+            let mut state = self.state.lock().expect("links lock");
+            if state.failures.get(peer).is_some_and(|failure| failure.unreachable) {
+                state.failures.remove(peer);
+            }
+            let now = Instant::now();
+            // Heard for the first time or after a while: every node that heard it may link
+            // now, so each waits a random moment.
+            let linked = state.up.contains_key(peer) || state.links.values().any(|entry| entry.peer.as_deref() == Some(peer));
+            if !linked && !state.not_before.contains_key(peer) {
+                let wait = Duration::from_millis(rand::random::<u64>() % (RELINK_SPREAD.as_millis() as u64 + 1));
+                state.not_before.insert(peer.to_owned(), now + wait);
+            }
+            state
+                .links
+                .iter()
+                .find(|(_, entry)| entry.peer.as_deref() == Some(peer) && matches!(entry.side, Side::Out(_)) && entry.handshake.is_none() && now.duration_since(entry.opened) > Duration::from_secs(2))
+                .map(|(id, _)| *id)
+        };
+        if let Some(id) = stale_attempt {
+            log::debug!("links {}: heard {peer} while trying to reach it: a fresh request", &self.mesh.identity_hash()[..8]);
+            self.spread(peer);
+            self.close(id, "the peer announced").await;
+        }
+    }
+
+    /// The next attempt to open a link to `peer` waits a random part of [`RELINK_SPREAD`].
+    fn spread(&self, peer: &str) {
+        let wait = Duration::from_millis(rand::random::<u64>() % (RELINK_SPREAD.as_millis() as u64 + 1));
+        self.state.lock().expect("links lock").not_before.insert(peer.to_owned(), Instant::now() + wait);
     }
 
     async fn open(&self, peer: String) {
@@ -405,27 +505,47 @@ impl Links {
                 self.begin(id).await;
             }
             LinkEvent::Data(payload) => self.on_data(id, payload.as_slice()).await,
-            LinkEvent::Closed => self.on_closed(id),
+            LinkEvent::Closed => self.on_closed(id).await,
             LinkEvent::Proof(_) | LinkEvent::RemoteIdentified(_) => {}
         }
     }
 
     /// Reticulum closed the link.
-    fn on_closed(&self, id: LinkId) {
-        let peer = {
+    async fn on_closed(&self, id: LinkId) {
+        let (peer, was_up, side) = {
             let mut state = self.state.lock().expect("links lock");
             let entry = state.links.remove(&id);
+            let side = entry.as_ref().map(|entry| entry.side);
             let peer = entry.and_then(|entry| entry.peer);
+            let mut was_up = false;
             if let Some(peer) = &peer
                 && state.up.get(peer).is_some_and(|(up, _)| *up == id)
             {
                 state.up.remove(peer);
+                was_up = true;
             }
-            peer
+            (peer, was_up, side)
         };
         if let Some(peer) = peer {
             log::info!("links {}: link to {peer} closed", &self.mesh.identity_hash()[..8]);
+            if was_up {
+                self.lost(&peer, side == Some(Side::In)).await;
+            }
             let _ = self.changes.send(peer);
+        }
+    }
+
+    /// The authenticated link to `peer` is gone: its path is in doubt and a new link is opened
+    /// soon. If the peer opened it through relays (`answered`), we announce so a relay can carry
+    /// the next one.
+    async fn lost(&self, peer: &str, answered: bool) {
+        if answered && self.mesh.peers().iter().any(|known| known.id == peer && known.hops > 0) {
+            self.mesh.announce_soon();
+        }
+        self.spread(peer);
+        self.state.lock().expect("links lock").last_up.insert(peer.to_owned(), Instant::now());
+        if let Some(desc) = self.mesh.destination_of(peer) {
+            self.mesh.transport().lock().await.mark_path_unresponsive(&desc.address_hash).await;
         }
     }
 
@@ -451,7 +571,7 @@ impl Links {
             }
         }
         for id in gone {
-            self.on_closed(id);
+            self.on_closed(id).await;
         }
     }
 
@@ -520,23 +640,34 @@ impl Links {
                 }
                 Event::Established { peer, .. } => {
                     let peer = peer.hash().to_hex();
-                    let duplicate = {
+                    // A second link to a peer means the first is likely dead on its side.
+                    // Both sides keep the same one: the lower hash's, else the newer.
+                    let outcome = {
                         let mut state = self.state.lock().expect("links lock");
-                        let duplicate = state.up.get(&peer).is_some_and(|(up, _)| *up != id);
-                        if !duplicate {
+                        let we_are_lower = self.mesh.identity_hash() < peer.as_str();
+                        let by_lower = |side: Option<Side>| side.is_some_and(|side| matches!(side, Side::Out(_)) == we_are_lower);
+                        let old = state.up.get(&peer).map(|(up, _)| *up).filter(|up| *up != id);
+                        let keep_new = old.is_none_or(|old| by_lower(state.links.get(&id).map(|entry| entry.side)) || !by_lower(state.links.get(&old).map(|entry| entry.side)));
+                        if keep_new {
                             state.up.insert(peer.clone(), (id, Instant::now()));
+                            state.last_up.insert(peer.clone(), Instant::now());
                             state.failures.remove(&peer);
+                            state.not_before.remove(&peer);
                             if let Some(entry) = state.links.get_mut(&id) {
                                 entry.peer = Some(peer.clone());
                             }
                         }
-                        duplicate
+                        (keep_new, old)
                     };
-                    if duplicate {
-                        self.close(id, "a link to this peer is already up").await;
-                    } else {
-                        log::info!("links {}: {peer} authenticated ({})", &self.mesh.identity_hash()[..8], hex(&id));
-                        let _ = self.changes.send(peer);
+                    match outcome {
+                        (false, _) => self.close(id, "a link to this peer is already up").await,
+                        (true, old) => {
+                            log::info!("links {}: {peer} authenticated ({})", &self.mesh.identity_hash()[..8], hex(&id));
+                            if let Some(old) = old {
+                                self.close(old, "replaced by a newer link").await;
+                            }
+                            let _ = self.changes.send(peer);
+                        }
                     }
                 }
                 Event::Close(reason) => {
@@ -545,7 +676,12 @@ impl Links {
                     let was_up = self.state.lock().expect("links lock").up.values().any(|(up, _)| *up == id);
                     let level = if was_up { log::Level::Warn } else { log::Level::Debug };
                     log::log!(level, "links {}: closing {}: {why}", &self.mesh.identity_hash()[..8], hex(&id));
-                    self.fail(id, &why);
+                    // No AUTH in time is the radio, not the peer's credentials.
+                    if matches!(reason, kaonic_handshake::Reason::Timeout) {
+                        self.unreachable(id, &why);
+                    } else {
+                        self.fail(id, &why);
+                    }
                     self.close(id, &why).await;
                 }
             }
@@ -586,7 +722,24 @@ impl Links {
     fn fail(&self, id: LinkId, why: &str) {
         let mut state = self.state.lock().expect("links lock");
         let Some(peer) = state.links.get(&id).and_then(|entry| entry.peer.clone()) else { return };
-        record_failure(&mut state.failures, peer, why, Instant::now());
+        record_failure(&mut state.failures, peer, why, Instant::now(), false);
+    }
+
+    /// The peer did not answer: shown as failed and retried soon (an offline one after
+    /// about [`OFFLINE_RETRY`]).
+    fn unreachable(&self, id: LinkId, why: &str) {
+        let peer = self.state.lock().expect("links lock").links.get(&id).and_then(|entry| entry.peer.clone());
+        let Some(peer) = peer else { return };
+        let offline = self.is_offline(&peer);
+        let now = Instant::now();
+        let mut state = self.state.lock().expect("links lock");
+        record_failure(&mut state.failures, peer.clone(), why, now, true);
+        if offline {
+            let spread = OFFLINE_RETRY.as_millis() as u64 * (80 + rand::random::<u64>() % 41) / 100;
+            if let Some(failure) = state.failures.get_mut(&peer) {
+                failure.retry_at = Some(now + Duration::from_millis(spread));
+            }
+        }
     }
 
     async fn close(&self, id: LinkId, why: &str) {
@@ -608,18 +761,23 @@ impl Links {
     }
 }
 
-/// Counts a failure of `peer` and backs it off, forgetting the oldest failure past
-/// [`MAX_FAILURES`].
-fn record_failure(failures: &mut HashMap<String, Failure>, peer: String, why: &str, now: Instant) {
+/// Counts a failure of `peer` and backs it off (an unreachable one only by up to
+/// [`RELINK_SPREAD`]), forgetting the oldest failure past [`MAX_FAILURES`].
+fn record_failure(failures: &mut HashMap<String, Failure>, peer: String, why: &str, now: Instant, unreachable: bool) {
     if !failures.contains_key(&peer) && failures.len() >= MAX_FAILURES {
         let oldest = failures.iter().min_by_key(|(_, failure)| failure.at).map(|(peer, _)| peer.clone());
         if let Some(oldest) = oldest {
             failures.remove(&oldest);
         }
     }
-    let failure = failures.entry(peer).or_insert(Failure { count: 0, retry_at: None, detail: String::new(), at: now });
+    let failure = failures.entry(peer).or_insert(Failure { count: 0, retry_at: None, detail: String::new(), at: now, unreachable });
     failure.count += 1;
-    let wait = BACKOFF_FIRST.saturating_mul(1 << failure.count.min(6)).min(BACKOFF_MAX);
+    let wait = if unreachable {
+        Duration::from_millis(rand::random::<u64>() % (RELINK_SPREAD.as_millis() as u64 + 1))
+    } else {
+        BACKOFF_FIRST.saturating_mul(1 << failure.count.min(6)).min(BACKOFF_MAX)
+    };
+    failure.unreachable = unreachable;
     failure.retry_at = Some(now + wait);
     failure.detail = why.to_owned();
     failure.at = now;
@@ -660,13 +818,13 @@ mod tests {
     fn failures_are_bounded_and_the_oldest_goes_first() {
         let (mut failures, now) = (HashMap::new(), Instant::now());
         for n in 0..MAX_FAILURES * 3 {
-            record_failure(&mut failures, format!("peer{n}"), "no", now + Duration::from_millis(n as u64));
+            record_failure(&mut failures, format!("peer{n}"), "no", now + Duration::from_millis(n as u64), false);
         }
         assert_eq!(failures.len(), MAX_FAILURES);
         assert!(!failures.contains_key("peer0"));
         assert!(failures.contains_key(&format!("peer{}", MAX_FAILURES * 3 - 1)));
         // A peer failing again is counted, not added.
-        record_failure(&mut failures, format!("peer{}", MAX_FAILURES * 3 - 1), "again", now);
+        record_failure(&mut failures, format!("peer{}", MAX_FAILURES * 3 - 1), "again", now, false);
         assert_eq!(failures.len(), MAX_FAILURES);
         assert_eq!(failures[&format!("peer{}", MAX_FAILURES * 3 - 1)].count, 2);
     }
