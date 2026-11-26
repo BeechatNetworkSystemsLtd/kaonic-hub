@@ -5,8 +5,12 @@
 //! - A burst ends at its END packet, or after 500 ms without packets of its own (other
 //!   talkers' packets do not keep it alive).
 //! - A verified admin burst takes the floor: a member talking here is preempted.
-//! - Of two remote members, the burst that started first keeps the floor. A newer burst of
-//!   the talker holding it replaces the old one at once (the old one's END was lost).
+//! - Bursts that started within [`CONTEND`] of each other: the lower talker id wins on every
+//!   node, and the other talker stops when it hears the winner. Further apart, the earlier
+//!   burst wins. A burst's start comes from its seq, not from when it was heard, so nodes at
+//!   different distances agree.
+//! - A newer burst of the talker holding the floor replaces the old one at once (the old
+//!   one's END was lost).
 
 use std::time::{Duration, Instant};
 
@@ -16,6 +20,9 @@ use crate::packet::Packet;
 pub const CLEAR_FOR: Duration = Duration::from_millis(300);
 /// A remote burst with no packets for this long has ended.
 pub const BURST_TIMEOUT: Duration = Duration::from_millis(500);
+/// Bursts that started closer together than this count as keyed at once: the lower talker
+/// id wins. Well above the time a packet takes to cross the mesh at ttl 4.
+pub const CONTEND: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloorState {
@@ -32,7 +39,18 @@ pub struct Talker {
     pub burst: u16,
     /// A verified admin burst (or our own, keyed as admin).
     pub admin: bool,
+    /// When it was first heard here (our own: when we keyed).
     pub since: Instant,
+    /// When the burst began, on our clock: its first packet's arrival less the frames before it.
+    pub started: Instant,
+}
+
+impl Talker {
+    /// Whether member burst `self` takes the floor from member burst `holder`.
+    fn beats(&self, holder: &Talker) -> bool {
+        let apart = if self.started > holder.started { self.started - holder.started } else { holder.started - self.started };
+        if apart < CONTEND { self.talker < holder.talker } else { self.started < holder.started }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +59,7 @@ pub enum FloorEvent {
     Play,
     /// Not the burst holding the floor (or our own echo): drop it.
     Ignore,
-    /// We were talking and the admin took the floor: stop, and play this packet.
+    /// Someone else took the floor while we talked: stop, send our END, and play this packet.
     Preempted,
     /// The remote burst holding the floor ended.
     Ended(Talker),
@@ -109,10 +127,12 @@ impl Floor {
             return FloorEvent::Ignore;
         }
         self.last_voice = Some(now);
-        let incoming = Talker { talker: packet.talker, burst: packet.burst, admin: admin_verified, since: now };
+        let frames = u32::from(packet.seq) + packet.frames.len() as u32;
+        let started = now.checked_sub(Duration::from_millis(crate::FRAME_MS) * frames).unwrap_or(now);
+        let incoming = Talker { talker: packet.talker, burst: packet.burst, admin: admin_verified, since: now, started };
         let event = match (self.state, self.talker) {
             (FloorState::Talking, Some(ours)) => {
-                if admin_verified && !ours.admin {
+                if (admin_verified && !ours.admin) || (!admin_verified && !ours.admin && incoming.beats(&ours)) {
                     self.state = FloorState::Receiving;
                     self.talker = Some(incoming);
                     FloorEvent::Preempted
@@ -135,7 +155,7 @@ impl Floor {
                 FloorEvent::Play
             }
             (FloorState::Receiving, Some(current)) => {
-                if admin_verified && !current.admin {
+                if (admin_verified && !current.admin) || (!admin_verified && !current.admin && incoming.beats(&current)) {
                     self.talker = Some(incoming);
                     FloorEvent::Play
                 } else {
@@ -173,7 +193,7 @@ impl Floor {
         let burst = self.next_burst;
         self.next_burst = self.next_burst.wrapping_add(1);
         self.state = FloorState::Talking;
-        self.talker = Some(Talker { talker: self.me, burst, admin: as_admin, since: now });
+        self.talker = Some(Talker { talker: self.me, burst, admin: as_admin, since: now, started: now });
         Ok(KeyedBurst { burst, seq: 0 })
     }
 
@@ -278,7 +298,8 @@ mod tests {
         let now = Instant::now();
         let mut floor = Floor::new([9; 4]);
         floor.request(now, false).unwrap();
-        assert_eq!(floor.on_packet(&packet(1, 5, flags::START), false, now + ms(10)), FloorEvent::Ignore);
+        // A member with a higher id keying at the same time does not take it from us.
+        assert_eq!(floor.on_packet(&packet(12, 5, flags::START), false, now + ms(10)), FloorEvent::Ignore);
         assert_eq!(floor.on_packet(&packet(3, 1, flags::START | flags::ADMIN), true, now + ms(20)), FloorEvent::Preempted);
         assert_eq!(floor.state(), FloorState::Receiving);
         // The admin device keys over a member who is talking.
@@ -331,5 +352,147 @@ mod tests {
         // Talker 1 timed out 500 ms after its last packet, while talker 2 was talking.
         assert!(played >= 70, "talker 2 played {played} of 100");
         assert_eq!(floor.talker().map(|talker| talker.talker), Some([2; 4]));
+    }
+
+    #[test]
+    fn a_burst_heard_mid_way_takes_the_floor() {
+        // Its START was lost, or we came into range while it talked.
+        let mut floor = Floor::new([9; 4]);
+        let t = Instant::now();
+        assert_eq!(floor.on_packet(&packet(1, 5, 0), false, t), FloorEvent::Play);
+        assert_eq!(floor.state(), FloorState::Receiving);
+        assert_eq!(floor.talker().map(|talker| (talker.talker, talker.burst)), Some(([1; 4], 5)));
+        // A START of it arriving late changes nothing.
+        assert_eq!(floor.on_packet(&packet(1, 5, flags::START), false, t + ms(20)), FloorEvent::Play);
+        assert_eq!(floor.tick(t + ms(20)), None);
+    }
+
+    #[test]
+    fn a_lone_end_opens_and_closes_the_floor() {
+        // All of a short burst lost but its END.
+        let mut floor = Floor::new([9; 4]);
+        let t = Instant::now();
+        assert_eq!(floor.on_packet(&packet(1, 5, flags::END), false, t), FloorEvent::Play);
+        assert!(matches!(floor.tick(t), Some(FloorEvent::Ended(Talker { burst: 5, .. }))));
+        assert_eq!(floor.state(), FloorState::Idle);
+        // It was voice all the same: 300 ms before we may key.
+        assert!(floor.request(t + ms(100), false).is_err());
+    }
+
+    #[test]
+    fn of_two_members_keying_at_once_the_lower_id_wins_and_the_other_yields() {
+        let t = Instant::now();
+        // We (9) keyed; talker 1 keyed at the same time far away, and its first packet
+        // reaches us 250 ms later: we stop and play it.
+        let mut floor = Floor::new([9; 4]);
+        floor.request(t, false).unwrap();
+        assert_eq!(floor.on_packet(&packet(1, 5, flags::START), false, t + ms(250)), FloorEvent::Preempted);
+        assert_eq!(floor.state(), FloorState::Receiving);
+        assert_eq!(floor.talker().map(|talker| talker.talker), Some([1; 4]));
+        // Talker 1's own floor ignores us, so it keeps talking.
+        let mut winner = Floor::new([1; 4]);
+        winner.request(t, false).unwrap();
+        for n in 0..10 {
+            assert_eq!(winner.on_packet(&packet(9, 7, if n == 0 { flags::START } else { 0 }), false, t + ms(250 + 20 * n)), FloorEvent::Ignore);
+        }
+        assert_eq!(winner.state(), FloorState::Talking);
+    }
+
+    #[test]
+    fn a_member_keying_well_after_the_holder_does_not_take_the_floor_whatever_its_id() {
+        // Talker 9 has talked for 2 s here; talker 1 keys now (it could not hear 9): the
+        // earlier burst keeps the floor, and while we talk, so do we.
+        let t = Instant::now();
+        let mut floor = Floor::new([5; 4]);
+        floor.on_packet(&packet(9, 5, flags::START), false, t);
+        assert_eq!(floor.on_packet(&packet(1, 7, flags::START), false, t + ms(2000)), FloorEvent::Ignore);
+        assert_eq!(floor.talker().map(|talker| talker.talker), Some([9; 4]));
+        let mut talking = Floor::new([5; 4]);
+        talking.request(t, false).unwrap();
+        assert_eq!(talking.on_packet(&packet(1, 7, flags::START), false, t + ms(2000)), FloorEvent::Ignore);
+        assert_eq!(talking.state(), FloorState::Talking);
+    }
+
+    #[test]
+    fn a_burst_heard_mid_way_counts_from_its_start_not_from_when_it_was_heard() {
+        // Talker 9 started 2 s ago (seq 100); we hear it only now, after talker 1, which
+        // started a moment ago: talker 9 started first and takes the floor.
+        let t = Instant::now() + ms(5000);
+        let mut floor = Floor::new([5; 4]);
+        floor.on_packet(&packet(1, 7, flags::START), false, t);
+        let old = Packet { seq: 100, ..packet(9, 5, 0) };
+        assert_eq!(floor.on_packet(&old, false, t + ms(20)), FloorEvent::Play);
+        assert_eq!(floor.talker().map(|talker| talker.talker), Some([9; 4]));
+        // And talker 1, which started later, stays out.
+        assert_eq!(floor.on_packet(&packet(1, 7, 0), false, t + ms(40)), FloorEvent::Ignore);
+    }
+
+    #[test]
+    fn two_starts_heard_in_opposite_order_pick_the_same_talker() {
+        // Two listeners between two talkers hear their first packets in opposite order; both
+        // give the floor to the lower id.
+        let t = Instant::now();
+        let (mut near_1, mut near_2) = (Floor::new([8; 4]), Floor::new([9; 4]));
+        near_1.on_packet(&packet(1, 5, flags::START), false, t);
+        near_1.on_packet(&packet(2, 7, flags::START), false, t + ms(40));
+        assert_eq!(near_2.on_packet(&packet(2, 7, flags::START), false, t), FloorEvent::Play);
+        assert_eq!(near_2.on_packet(&packet(1, 5, flags::START), false, t + ms(40)), FloorEvent::Play);
+        assert_eq!(near_2.on_packet(&packet(2, 7, 0), false, t + ms(60)), FloorEvent::Ignore);
+        assert_eq!(near_1.talker().map(|talker| talker.talker), Some([1; 4]));
+        assert_eq!(near_2.talker().map(|talker| talker.talker), Some([1; 4]));
+    }
+
+    #[test]
+    fn the_end_of_an_ignored_burst_does_not_end_the_holder() {
+        let mut floor = Floor::new([9; 4]);
+        let t = Instant::now();
+        floor.on_packet(&packet(1, 5, flags::START), false, t);
+        assert_eq!(floor.on_packet(&packet(2, 7, flags::START | flags::END), false, t + ms(10)), FloorEvent::Ignore);
+        assert_eq!(floor.tick(t + ms(10)), None);
+        assert_eq!(floor.talker().map(|talker| talker.talker), Some([1; 4]));
+        // Nor do the ignored talker's packets keep the holder alive past its timeout.
+        for n in 1..30 {
+            floor.on_packet(&packet(2, 8, 0), false, t + ms(20 * n));
+        }
+        assert!(matches!(floor.tick(t + ms(600)), Some(FloorEvent::Ended(Talker { talker: [1, 1, 1, 1], .. }))));
+    }
+
+    #[test]
+    fn ended_after_a_rekey_leaves_the_floor_receiving_the_new_burst() {
+        // F3: `Ended` of the old burst comes while the new one holds the floor, so whoever
+        // handles `Ended` must not take it for "the floor is free".
+        let mut floor = Floor::new([9; 4]);
+        let t = Instant::now();
+        floor.on_packet(&packet(1, 5, flags::START), false, t);
+        floor.on_packet(&packet(1, 6, flags::START), false, t + ms(100));
+        assert!(matches!(floor.tick(t + ms(100)), Some(FloorEvent::Ended(Talker { burst: 5, .. }))));
+        assert_eq!(floor.state(), FloorState::Receiving);
+        assert_eq!(floor.talker().map(|talker| talker.burst), Some(6));
+        assert!(floor.request(t + ms(110), false).is_err());
+    }
+
+    #[test]
+    fn a_member_preempted_by_the_admin_takes_the_floor_back_after_the_admin() {
+        // The member's node stops at the admin's first packet, but a listener that heard the
+        // member's tail after the admin's END plays it.
+        let mut floor = Floor::new([9; 4]);
+        let t = Instant::now();
+        floor.on_packet(&packet(1, 5, flags::START), false, t);
+        assert_eq!(floor.on_packet(&packet(3, 1, flags::START | flags::ADMIN), true, t + ms(20)), FloorEvent::Play);
+        assert_eq!(floor.on_packet(&packet(1, 5, 0), false, t + ms(40)), FloorEvent::Ignore);
+        floor.on_packet(&packet(3, 1, flags::END | flags::ADMIN), true, t + ms(200));
+        assert!(matches!(floor.tick(t + ms(200)), Some(FloorEvent::Ended(Talker { admin: true, .. }))));
+        assert_eq!(floor.on_packet(&packet(1, 5, 0), false, t + ms(220)), FloorEvent::Play);
+        assert_eq!(floor.talker().map(|talker| talker.talker), Some([1; 4]));
+    }
+
+    #[test]
+    fn our_burst_ids_wrap() {
+        let mut floor = Floor::new([9; 4]);
+        let t = Instant::now();
+        floor.set_next_burst(u16::MAX);
+        assert_eq!(floor.request(t, false).map(|keyed| keyed.burst), Ok(u16::MAX));
+        floor.release(t);
+        assert_eq!(floor.request(t, false).map(|keyed| keyed.burst), Ok(0));
     }
 }

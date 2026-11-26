@@ -1,8 +1,12 @@
 //! Push-to-talk, native in the hub: one talker at a time speaks to
-//! every node of the network at once over the GROUP channel (`kaonic_mesh::group`), and every
-//! node relays what it hears so voice reaches nodes several hops away.
+//! every node of the network at once over the GROUP channel (`kaonic_mesh::group`). Reticulum
+//! relays it to nodes several hops away (once per node, after a random wait, cancelled when
+//! enough neighbours relayed it already) and drops copies, our own echoes included. What is
+//! the same voice in different packets (the END's repeats, a talker's packets heard over
+//! several paths) is told apart here by `(talker, burst, seq)`, remembered 10 s, so it is
+//! played once.
 //!
-//! One engine task owns the floor, the relay, the jitter buffer, the packer and the codecs.
+//! One engine task owns the floor, the duplicate check, the jitter buffer, the packer and the codecs.
 //! Talk comes in from browsers (`/ptt/audio`), UDP sessions of phone and ATAK clients
 //! (`udp`, the old plugin's `KU` protocol), the device microphone (keyed with `/ptt/key`, or
 //! armed and keyed by the squelch: the Kaonic hardware PTT button only unmutes the
@@ -25,7 +29,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use kaonic_mesh::announce::Announced;
 use kaonic_mesh::group::{GroupChannel, GroupMessage};
-use kaonic_ptt::{Floor, FloorEvent, FloorState, Heard, Jitter, Packer, Packet, Playout, Relay, RelayConfig, Gate, Squelch, Verdict, SquelchConfig, codec};
+use kaonic_ptt::{ArmedKey, Floor, FloorEvent, FloorState, Heard, Jitter, Packer, Packet, Playout, Relay, RelayConfig, Gate, Squelch, Verdict, SquelchConfig, codec};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -41,11 +45,26 @@ const UNKEY_SILENCE: Duration = Duration::from_millis(500);
 const KEY_HOLD: Duration = Duration::from_secs(2);
 /// Bursts kept for `GET /ptt`.
 const RECENT: usize = 20;
-/// The ttl the design starts bursts with: hops = this minus the ttl a packet arrives with.
+/// The ttl bursts carry. Only for older nodes now: Reticulum relays GROUP packets and reports
+/// the hops itself, so neither `ttl` nor `relay` changes anything here.
 const DEFAULT_TTL: u8 = 4;
 /// The system restores the card's mixer state at boot, possibly after the hub started: the
 /// gain and volume are applied again this long after start (as the plugin did).
 const MIXER_REAPPLY: Duration = Duration::from_secs(15);
+/// The armed microphone does not key this soon after the speaker played, so the tail of
+/// what was played is not taken for talk.
+const SPEAKER_TAIL: Duration = Duration::from_millis(150);
+/// Longest over keyed by the armed microphone. It then stays off until its input goes
+/// quiet, so a stuck or hissing input cannot hold the floor.
+const ARMED_OVER_MAX: Duration = Duration::from_secs(60);
+/// A floor request within 300 ms of voice is retried this often, this many times, before
+/// the hub answers "busy".
+const CLEAR_RETRY: Duration = Duration::from_millis(100);
+const CLEAR_RETRIES: usize = 4;
+/// Frames of the previous packet each packet repeats (see `kaonic_ptt::Packer`), so a packet
+/// lost on one hop costs one concealed frame, not an 80 ms gap. On the emulated 10-node mesh
+/// this cut audible gaps one hop out from 31 to 3 a minute, for about 25 % more airtime.
+const REDUNDANT_FRAMES: usize = 3;
 
 /// Where talk comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -335,6 +354,74 @@ struct BurstView {
     hops: Option<u8>,
     /// `released`, `preempted` or `timeout`.
     ended: &'static str,
+    /// Gaps of concealed frames: how many, the longest, and those of 3 frames (60 ms) or more,
+    /// which concealment does not hide. The tail before a timeout does not count.
+    gaps: u64,
+    longest_gap_ms: u64,
+    audible_gaps: u64,
+    /// Jitter buffer depth: average over the first and last second played, and the maximum.
+    /// Received bursts only.
+    depth_ms: Option<DepthView>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct DepthView {
+    start: u64,
+    end: u64,
+    max: u64,
+}
+
+/// How continuous a received burst played: gaps and the jitter buffer's depth.
+#[derive(Default)]
+struct Continuity {
+    /// Concealed frames since the last played one.
+    run: u64,
+    gaps: u64,
+    longest: u64,
+    audible: u64,
+    /// Depth samples (ms), one per frame played: the first second's sum, and the last second.
+    first: Vec<u64>,
+    last: VecDeque<u64>,
+    max: u64,
+}
+
+/// Frames in a second.
+const SECOND_FRAMES: usize = 50;
+
+impl Continuity {
+    fn played(&mut self, depth: Duration) {
+        if self.run > 0 {
+            self.gaps += 1;
+            self.longest = self.longest.max(self.run);
+            if self.run >= 3 {
+                self.audible += 1;
+            }
+            self.run = 0;
+        }
+        self.sample(depth);
+    }
+
+    fn concealed(&mut self, depth: Duration) {
+        self.run += 1;
+        self.sample(depth);
+    }
+
+    fn sample(&mut self, depth: Duration) {
+        let ms = depth.as_millis() as u64;
+        self.max = self.max.max(ms);
+        if self.first.len() < SECOND_FRAMES {
+            self.first.push(ms);
+        }
+        if self.last.len() == SECOND_FRAMES {
+            self.last.pop_front();
+        }
+        self.last.push_back(ms);
+    }
+
+    fn depth(&self) -> Option<DepthView> {
+        let average = |values: &mut dyn Iterator<Item = &u64>, count: usize| values.sum::<u64>() / count.max(1) as u64;
+        (!self.first.is_empty()).then(|| DepthView { start: average(&mut self.first.iter(), self.first.len()), end: average(&mut self.last.iter(), self.last.len()), max: self.max })
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -346,6 +433,10 @@ struct Stats {
     duplicates: u64,
     /// Packets refused: a bad admin signature, unsigned in an admin burst, or a replay.
     refused: u64,
+    /// Frames that came after their turn to play, and frames dropped because the jitter
+    /// queue grew past `jitter_max_ms`.
+    late: u64,
+    shed: u64,
 }
 
 /// What `GET /ptt` shows, kept up to date by the engine.
@@ -514,11 +605,25 @@ impl Ptt {
         answer.await.unwrap_or(Err(KeyError::Unavailable("Push-to-talk is not running.")))
     }
 
+    /// Asks for the floor, waiting out the 300 ms after voice was last heard, so a quick reply
+    /// is not refused and lost. Refused at once while someone holds the floor.
+    async fn ask_when_clear(&self, source: Source) -> Result<(), KeyError> {
+        let mut answer = self.ask(source).await;
+        for _ in 0..CLEAR_RETRIES {
+            if answer != Err(KeyError::Busy(None)) {
+                break;
+            }
+            tokio::time::sleep(CLEAR_RETRY).await;
+            answer = self.ask(source).await;
+        }
+        answer
+    }
+
     /// Asks for the floor for a client `source`: Err(talker) when it is taken.
     pub async fn key(&self, source: Source) -> Result<(), Option<TalkerView>> {
         // Two members keying together rarely collide if each waits a random 0-100 ms first.
         tokio::time::sleep(kaonic_ptt::recheck_delay(roll())).await;
-        self.ask(source).await.map_err(|error| match error {
+        self.ask_when_clear(source).await.map_err(|error| match error {
             KeyError::Busy(talker) => talker,
             KeyError::Unavailable(_) => None,
         })
@@ -530,7 +635,7 @@ impl Ptt {
         if !self.microphone() {
             return Err(KeyError::Unavailable("This device has no microphone the hub can use."));
         }
-        self.ask(Source::Device).await
+        self.ask_when_clear(Source::Device).await
     }
 
     pub async fn unkey(&self, source: Source) {
@@ -611,6 +716,7 @@ struct BurstRecord {
     hops: Option<u8>,
     /// Its END packet arrived (a received burst).
     end_seen: bool,
+    continuity: Continuity,
 }
 
 /// A test transmission in progress.
@@ -627,6 +733,8 @@ struct Engine {
     ptt: Arc<Ptt>,
     me: [u8; 4],
     floor: Floor,
+    /// Recognises packets already heard (and our own) so nothing is played twice. It never
+    /// relays: Reticulum does.
     relay: Relay,
     jitter: Jitter,
     packer: Packer,
@@ -648,13 +756,17 @@ struct Engine {
     hold_until: Option<Instant>,
     rx: Option<BurstRecord>,
     tx: Option<BurstRecord>,
+    /// Copies of our END still to send, and when.
+    ends: Vec<(Instant, Packet)>,
     /// The devices open, and their names.
     playback: Option<Playback>,
     capture: Option<Capture>,
     devices: (String, String),
     squelch: Squelch,
-    /// The squelch opened while the floor was taken: drop its talk until it closes.
-    squelch_blocked: bool,
+    /// The squelch opened while the floor was taken: the over waits for the floor.
+    armed: ArmedKey,
+    /// When the device's speaker last played the group.
+    spoke: Option<Instant>,
     /// The card has the gain / volume control (else they are applied in software).
     hardware_gain: bool,
     hardware_volume: bool,
@@ -674,7 +786,7 @@ impl Engine {
         floor.set_next_burst(u16::from_be_bytes(crate::random::bytes::<2>().unwrap_or([0; 2])));
         let settings = ptt.settings();
         let mut relay = Relay::new(RelayConfig::default(), me);
-        relay.set_enabled(settings.relay);
+        relay.set_enabled(false);
         let mut jitter = Jitter::new(Duration::from_millis(u64::from(settings.jitter_target_ms)));
         jitter.set_limits(Duration::from_millis(u64::from(settings.jitter_target_ms)), Duration::from_millis(u64::from(settings.jitter_max_ms)));
         let mut engine = Self {
@@ -693,11 +805,13 @@ impl Engine {
             hold_until: None,
             rx: None,
             tx: None,
+            ends: Vec::new(),
             playback: None,
             capture: None,
             devices: (String::new(), String::new()),
             squelch: Squelch::new(settings.squelch()),
-            squelch_blocked: false,
+            armed: ArmedKey::default(),
+            spoke: None,
             hardware_gain: false,
             hardware_volume: false,
             mixer_reapply_at: Some(Instant::now() + MIXER_REAPPLY),
@@ -851,6 +965,11 @@ impl Engine {
                     None => {
                         self.capture = None;
                         self.ptt.microphone.store(false, Ordering::Relaxed);
+                        // The microphone is gone and would never close the squelch: let go
+                        // of the floor.
+                        if self.keyed.is_some_and(|(source, _)| matches!(source, Source::Device | Source::Squelch)) {
+                            self.unkey("timeout").await;
+                        }
                     }
                 },
                 _ = tick.tick() => self.on_tick().await,
@@ -859,6 +978,7 @@ impl Engine {
                         self.write_admin_counter(text);
                     }
                     self.refresh_trust().await;
+                    self.read_relay_stats().await;
                     if self.mixer_reapply_at.is_some_and(|at| Instant::now() >= at) {
                         self.mixer_reapply_at = None;
                         self.apply_mixer().await;
@@ -867,6 +987,16 @@ impl Engine {
                 _ = level_tick.tick() => self.publish_level(),
             }
         }
+    }
+
+    /// GROUP packets this node relayed and relays it cancelled (Reticulum's, for every GROUP
+    /// user, plugins' broadcasts included).
+    async fn read_relay_stats(&mut self) {
+        let Some(mesh) = &self.ptt.app.mesh else { return };
+        let relay = mesh.group_relay_stats().await;
+        let mut snapshot = self.ptt.snapshot.lock().expect("ptt snapshot lock");
+        snapshot.stats.relayed = relay.relayed;
+        snapshot.stats.suppressed = relay.suppressed;
     }
 
     fn talker_view(&self, talker: [u8; 4], admin: bool, local: Option<Source>) -> TalkerView {
@@ -922,6 +1052,10 @@ impl Engine {
             lost_frames: record.lost,
             hops: record.hops,
             ended,
+            gaps: record.continuity.gaps,
+            longest_gap_ms: record.continuity.longest * kaonic_ptt::FRAME_MS,
+            audible_gaps: record.continuity.audible,
+            depth_ms: record.continuity.depth(),
         };
         let mut snapshot = self.ptt.snapshot.lock().expect("ptt snapshot lock");
         if snapshot.recent.len() == RECENT {
@@ -979,7 +1113,6 @@ impl Engine {
             }
             Command::Settings => {
                 let settings = self.ptt.settings();
-                self.relay.set_enabled(settings.relay);
                 self.squelch.configure(settings.squelch());
                 self.jitter.set_limits(Duration::from_millis(u64::from(settings.jitter_target_ms)), Duration::from_millis(u64::from(settings.jitter_max_ms)));
                 if !settings.armed() && self.keyed.is_some_and(|(source, _)| source == Source::Squelch) {
@@ -1015,12 +1148,13 @@ impl Engine {
                 self.packer.set_ttl(settings.ttl);
                 self.packer.set_epoch(self.group.as_ref().map_or(0, |group| group.epoch()));
                 self.packer.set_packing(usize::from(settings.packet_frames), usize::from(settings.packet_frames_max), settings.packet_align_ldpc, cap);
+                self.packer.set_redundancy(REDUNDANT_FRAMES);
                 let counter = self.next_counter();
                 self.packer.start(burst.burst, admin, counter);
                 self.encoder = opus::Encoder::with(settings.encoder()).inspect_err(|error| log::warn!("ptt: encoder: {error}")).ok();
                 self.keyed = Some((source, now));
                 let view = self.talker_view(self.me, admin, Some(source));
-                self.tx = Some(BurstRecord { talker: view.clone(), key: (self.me, burst.burst), started_ms: now_ms(), started: Instant::now(), frames: 0, lost: 0, hops: None, end_seen: false });
+                self.tx = Some(BurstRecord { talker: view.clone(), key: (self.me, burst.burst), started_ms: now_ms(), started: Instant::now(), frames: 0, lost: 0, hops: None, end_seen: false, continuity: Continuity::default() });
                 self.set_floor(Some(view));
                 Ok(())
             }
@@ -1036,14 +1170,8 @@ impl Engine {
             self.squelch.reset();
         }
         if let Some(packet) = self.packer.finish() {
-            // The END closes the burst for listeners: a lost one leaves them waiting 500 ms and
-            // logging a timeout. Copies are duplicates to whoever already has it.
-            for copy in 0..3 {
-                if copy > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                }
-                self.send(packet.clone()).await;
-            }
+            self.send(packet.clone()).await;
+            self.queue_end_copies(packet, Instant::now());
         }
         self.floor.release(Instant::now());
         self.encoder = None;
@@ -1052,6 +1180,13 @@ impl Engine {
         }
         let _ = self.ptt.control.send(Control::Unkeyed { source, reason });
         self.set_floor(None);
+    }
+
+    /// Two more copies of the END follow from the tick, 30 ms apart: a lost END leaves
+    /// listeners waiting 500 ms for a timeout.
+    fn queue_end_copies(&mut self, packet: Packet, sent: Instant) {
+        self.ends.push((sent + Duration::from_millis(30), packet.clone()));
+        self.ends.push((sent + Duration::from_millis(60), packet));
     }
 
     async fn talk(&mut self, source: Source, pcm: Vec<i16>, now: Instant) {
@@ -1115,8 +1250,13 @@ impl Engine {
         }
         let event = self.floor.on_packet(&packet, admin, now);
         if event == FloorEvent::Preempted {
-            // Our talk stops at once; the admin is played.
+            // Our talk stops and the winner (the admin, or a member winning the tie) is
+            // played. Our END goes out from the tick, so listeners let go at once.
             if let Some((source, _)) = self.keyed.take() {
+                if let Some(end) = self.packer.finish() {
+                    self.ends.push((now, end.clone()));
+                    self.queue_end_copies(end, now);
+                }
                 self.encoder = None;
                 self.hold_until = None;
                 self.test = None;
@@ -1132,15 +1272,21 @@ impl Engine {
         if !matches!(event, FloorEvent::Play | FloorEvent::Preempted) {
             return;
         }
-        let hops = DEFAULT_TTL.saturating_sub(packet.ttl);
+        let hops = message.hops;
         let fresh = self.rx.as_ref().is_none_or(|record| record.key != key);
         if fresh {
-            // Only an admin burst replaces one being played.
+            // A burst that takes the floor from the one being played: the admin, a member who
+            // wins the tie, or the same talker's next burst (the old one's END was lost).
             if let Some(record) = self.rx.take() {
-                self.finish_burst(record, "preempted");
+                let ended = match () {
+                    _ if record.key.0 != packet.talker => "preempted",
+                    _ if record.end_seen => "released",
+                    _ => "timeout",
+                };
+                self.finish_burst(record, ended);
             }
             let view = self.talker_view(packet.talker, admin, None);
-            self.rx = Some(BurstRecord { talker: view.clone(), key, started_ms: now_ms(), started: now, frames: 0, lost: 0, hops: Some(hops), end_seen: false });
+            self.rx = Some(BurstRecord { talker: view.clone(), key, started_ms: now_ms(), started: now, frames: 0, lost: 0, hops: Some(hops), end_seen: false, continuity: Continuity::default() });
             self.set_floor(Some(view));
         } else if let Some(record) = &mut self.rx {
             record.hops = Some(record.hops.map_or(hops, |known| known.min(hops)));
@@ -1151,13 +1297,13 @@ impl Engine {
             }
         }
         for (index, frame) in packet.frames.iter().enumerate() {
-            self.jitter.push(packet.burst, packet.seq.wrapping_add(index as u16), frame.clone(), now);
+            self.jitter.push(key, packet.seq.wrapping_add(index as u16), frame.clone(), now);
         }
         if packet.is_end() {
             if let Some(record) = &mut self.rx {
                 record.end_seen = true;
             }
-            self.jitter.end(packet.burst, packet.seq.wrapping_add(packet.frames.len() as u16));
+            self.jitter.end(key, packet.seq.wrapping_add(packet.frames.len() as u16));
         }
     }
 
@@ -1180,32 +1326,39 @@ impl Engine {
             Some(Source::Device) => self.talk(Source::Device, frame, now).await,
             Some(Source::Squelch) => {
                 let decision = self.squelch.push(&frame);
-                if decision.closed {
+                if self.tx.as_ref().is_some_and(|record| now.saturating_duration_since(record.started) >= ARMED_OVER_MAX) {
+                    log::warn!("ptt: the microphone kept the radio keyed for {} s: unkeyed until its input goes quiet", ARMED_OVER_MAX.as_secs());
+                    self.unkey("timeout").await;
+                    self.squelch.lock_out();
+                } else if decision.closed {
                     self.unkey("released").await;
                 } else if decision.pass {
                     self.talk(Source::Squelch, frame, now).await;
                 }
             }
             // Someone else here holds the floor: the microphone waits.
-            Some(_) => self.squelch.reset(),
+            Some(_) => {
+                self.squelch.reset();
+                self.armed.reset();
+            }
             None if settings.armed() => {
                 let decision = self.squelch.push(&frame);
-                if decision.closed {
-                    self.squelch_blocked = false;
-                } else if decision.opened && !self.squelch_blocked {
-                    match self.key(Source::Squelch, now) {
-                        Ok(()) => {
-                            for preroll in self.squelch.take_preroll() {
-                                self.talk(Source::Squelch, preroll, now).await;
-                            }
-                            self.talk(Source::Squelch, frame, now).await;
-                        }
-                        // The floor is taken: this over is not sent.
-                        Err(_) => self.squelch_blocked = true,
+                // The pre-roll is the start of the word only on the frame the gate opens.
+                let preroll = if decision.opened { self.squelch.take_preroll() } else { Vec::new() };
+                // The admin may talk over what is playing; a member waits for the speaker,
+                // so its sound does not key the microphone.
+                let speaker_quiet = self.signing.is_some() || self.spoke.is_none_or(|at| now.saturating_duration_since(at) >= SPEAKER_TAIL);
+                // While the floor is taken the over waits and goes out once it is free: the
+                // PTT button gives no "busy", so an early answer would otherwise be lost.
+                if self.armed.wants_floor(&decision, self.squelch.open_dbfs(), speaker_quiet) && self.key(Source::Squelch, now).is_ok() {
+                    self.armed.granted();
+                    for preroll in preroll {
+                        self.talk(Source::Squelch, preroll, now).await;
                     }
+                    self.talk(Source::Squelch, frame, now).await;
                 }
             }
-            None => {}
+            None => self.armed.reset(),
         }
     }
 
@@ -1224,17 +1377,18 @@ impl Engine {
                 scale(&mut local, f32::from(volume) / 100.0);
             }
             let _ = speaker.try_send(local);
+            self.spoke = Some(Instant::now());
         }
         let _ = self.ptt.pcm.send(Arc::new(pcm));
     }
 
     async fn on_tick(&mut self) {
         let now = Instant::now();
-        // Relays that are due.
-        for packet in self.relay.due(now) {
-            if let Some(group) = &self.group {
-                group.send(&packet.encode()).await;
-            }
+        // Our END copies that are due.
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ends).into_iter().partition(|(at, _)| *at <= now);
+        self.ends = later;
+        for (_, packet) in due {
+            self.send(packet).await;
         }
         match self.keyed {
             // A keyed client that went quiet.
@@ -1251,6 +1405,7 @@ impl Engine {
                 Playout::Frame(frame) => {
                     if let Some(record) = &mut self.rx {
                         record.frames += 1;
+                        record.continuity.played(self.jitter.depth());
                     }
                     let pcm = self.decoder.as_mut().map(|decoder| decoder.decode(&frame)).unwrap_or_default();
                     self.level = level(&pcm);
@@ -1261,6 +1416,7 @@ impl Engine {
                 Playout::Lost => {
                     if let Some(record) = &mut self.rx {
                         record.lost += 1;
+                        record.continuity.concealed(self.jitter.depth());
                     }
                     if let Some(pcm) = self.decoder.as_mut().map(|decoder| decoder.conceal(None)) {
                         self.play(pcm);
@@ -1269,12 +1425,18 @@ impl Engine {
                 Playout::End => self.finish_rx(),
             }
         }
-        if let Some(FloorEvent::Ended(_)) = self.floor.tick(now)
+        if let Some(FloorEvent::Ended(ended)) = self.floor.tick(now)
             && self.keyed.is_none()
         {
-            self.finish_rx();
-            self.level = 0.0;
-            self.set_floor(None);
+            // The ended burst may already be replaced by the talker's next one: leave
+            // the floor as it is.
+            if self.rx.as_ref().is_some_and(|record| record.key == (ended.talker, ended.burst)) {
+                self.finish_rx();
+            }
+            if self.floor.state() == FloorState::Idle {
+                self.level = 0.0;
+                self.set_floor(None);
+            }
         }
         // The test tone: 1 s of 1 kHz on the speaker only.
         if let Some(frame) = self.tone {
@@ -1311,10 +1473,10 @@ impl Engine {
             let mut snapshot = self.ptt.snapshot.lock().expect("ptt snapshot lock");
             snapshot.level = if talking { self.level } else { 0.0 };
             snapshot.epoch = self.group.as_ref().map(|group| group.epoch());
-            let relay = self.relay.stats();
-            snapshot.stats.relayed = relay.relayed;
-            snapshot.stats.suppressed = relay.suppressed;
-            snapshot.stats.duplicates = relay.duplicates;
+            snapshot.stats.duplicates = self.relay.stats().duplicates;
+            let jitter = self.jitter.stats();
+            snapshot.stats.late = jitter.late;
+            snapshot.stats.shed = jitter.shed;
         }
         if self.ptt.app.bus.receivers() <= 1 {
             return;

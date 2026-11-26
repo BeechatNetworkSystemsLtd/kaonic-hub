@@ -2,6 +2,11 @@
 //! kaonic-audio-ptt plugin, a packet holds `target` frames (the latency floor) and, with
 //! alignment, keeps taking frames up to `max` while they still fit the LDPC blocks it already
 //! occupies ([`crate::airtime`]); it never grows past one radio frame.
+//!
+//! With redundancy, each packet also repeats the last frames of the one before, so a lost
+//! packet costs a frame or two that concealment hides. The repeat is shorter than the packet
+//! it comes from, so each packet starts at a later seq and `(talker, burst, seq)` stays
+//! unique; older versions take the repeats as duplicates.
 
 use crate::airtime;
 use crate::packet::{Packet, flags};
@@ -33,6 +38,10 @@ pub struct Packer {
     seq: u16,
     pending: Vec<Vec<u8>>,
     started: bool,
+    /// Frames of the previous packet to repeat at the front of the next one, at most.
+    redundancy: usize,
+    /// The new frames of the last packet sent.
+    previous: Vec<Vec<u8>>,
 }
 
 impl Packer {
@@ -54,7 +63,21 @@ impl Packer {
             seq: 0,
             pending: Vec::new(),
             started: false,
+            redundancy: 0,
+            previous: Vec::new(),
         }
+    }
+
+    /// How many of the previous packet's frames each packet repeats (0: none).
+    pub fn set_redundancy(&mut self, frames: usize) {
+        self.redundancy = frames;
+    }
+
+    /// The previous packet's frames the next packet repeats: fewer than that packet had, so
+    /// the next one starts at a later seq.
+    fn repeat(&self) -> &[Vec<u8>] {
+        let count = self.redundancy.min(self.previous.len().saturating_sub(1));
+        &self.previous[self.previous.len() - count..]
     }
 
     /// The plugin's packing settings (`packet_frames`, `packet_frames_max`,
@@ -69,7 +92,7 @@ impl Packer {
     /// What the packet being built would encode to.
     fn pending_len(&self) -> usize {
         let signature = if self.admin { SIGNATURE_BYTES } else { 0 };
-        HEADER_BYTES + signature + self.pending.iter().map(|frame| frame.len().min(255) + 1).sum::<usize>()
+        HEADER_BYTES + signature + self.repeat().iter().chain(&self.pending).map(|frame| frame.len().min(255) + 1).sum::<usize>()
     }
 
     /// A new key epoch for the bursts that follow.
@@ -90,13 +113,19 @@ impl Packer {
         self.admin = admin;
         self.seq = 0;
         self.pending.clear();
+        self.previous.clear();
         self.started = false;
         self.largest = 0;
     }
 
     fn packet(&mut self, end: bool) -> Packet {
-        let frames = std::mem::take(&mut self.pending);
+        let new = std::mem::take(&mut self.pending);
+        let room = crate::packet::MAX_FRAMES.saturating_sub(new.len());
+        let repeat = self.repeat();
+        let mut frames = repeat[repeat.len().saturating_sub(room)..].to_vec();
+        frames.extend(new.iter().cloned());
         let seq = self.seq.wrapping_sub(frames.len() as u16);
+        self.previous = new;
         let mut packet_flags = if self.started { 0 } else { flags::START };
         if end {
             packet_flags |= flags::END;
@@ -135,6 +164,37 @@ impl Packer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_redundancy_each_packet_repeats_the_last_frames_of_the_one_before() {
+        let mut packer = Packer::new([1; 4], 1, 1, 4, 4);
+        packer.set_redundancy(3);
+        packer.start(7, false, 1);
+        let mut packets = Vec::new();
+        for frame in 0..12u8 {
+            packets.extend(packer.push(vec![frame; 30]));
+        }
+        packets.extend(packer.finish());
+        let seqs: Vec<(u16, Vec<u8>)> = packets.iter().map(|packet| (packet.seq, packet.frames.iter().map(|frame| frame[0]).collect())).collect();
+        assert_eq!(
+            seqs,
+            vec![(0, vec![0, 1, 2, 3]), (1, vec![1, 2, 3, 4, 5, 6, 7]), (5, vec![5, 6, 7, 8, 9, 10, 11]), (9, vec![9, 10, 11])],
+            "frames follow from each seq; the END repeats too"
+        );
+        // Every packet starts later than the one before: relays tell them apart by seq.
+        assert!(packets.windows(2).all(|pair| pair[1].seq > pair[0].seq));
+        assert!(packets.last().unwrap().is_end() && packets[0].is_start() && !packets[1].is_start());
+        // A one-frame packet is not repeated, so the next does not share its seq.
+        let mut single = Packer::new([1; 4], 1, 1, 4, 1);
+        single.set_redundancy(3);
+        single.start(1, false, 1);
+        let seqs: Vec<u16> = (0..4u8).flat_map(|frame| single.push(vec![frame; 30])).map(|packet| packet.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3]);
+        // A new burst does not repeat the old one.
+        packer.start(8, false, 2);
+        let first = (0..4u8).flat_map(|frame| packer.push(vec![frame; 30])).next().unwrap();
+        assert_eq!((first.seq, first.frames.len()), (0, 4));
+    }
 
     #[test]
     fn frames_are_packed_three_at_a_time_and_the_burst_ends() {

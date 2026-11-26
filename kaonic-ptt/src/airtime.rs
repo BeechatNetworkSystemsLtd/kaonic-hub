@@ -94,6 +94,22 @@ mod tests {
     }
 
     #[test]
+    fn two_overlapping_talkers_do_not_fit_the_channel() {
+        // F6: one second of talk at the hub's defaults (20 kbit/s Opus: 50-byte frames,
+        // packed 4-8 per packet, LDPC aligned), against the ~185 kbit/s measured on the bench.
+        const CHANNEL_BPS: usize = 185_000;
+        let mut packer = crate::Packer::new([1; 4], 1, crate::codec::OPUS16, 4, 4);
+        packer.set_packing(4, 8, true, max_packet_for_blocks(BLOCKS_PER_FRAME));
+        packer.start(1, false, 1);
+        let mut packets: Vec<crate::Packet> = (0..50).flat_map(|_| packer.push(vec![0; 50])).collect();
+        packets.extend(packer.finish());
+        let stream_bps: usize = packets.iter().map(|packet| air_bytes(packet.encode().len()) * 8).sum();
+        // In one cell a talker and one relay carry a stream twice; two talkers, four times.
+        assert!(2 * stream_bps < CHANNEL_BPS, "one talker: {} bit/s", 2 * stream_bps);
+        assert!(4 * stream_bps > CHANNEL_BPS, "two talkers: {} bit/s", 4 * stream_bps);
+    }
+
+    #[test]
     fn frames_ride_free_until_the_block_is_full() {
         let limit = max_packet_for_blocks(2);
         // Below the floor: keep going; at the cap: flush.

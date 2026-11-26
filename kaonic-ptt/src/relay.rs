@@ -1,8 +1,16 @@
-//! Relaying voice across hops. Reticulum does not forward
-//! GROUP packets, so every node re-sends each new packet once, after a random 10-40 ms
-//! delay, with the ttl lowered. A node that hears the same packet relayed by enough others
+//! Recognising voice packets already heard, and relaying them across hops. The hub only uses
+//! the first now (relaying is off): Reticulum relays GROUP packets itself. When on, every node
+//! re-sends each new packet once, after a random 10-40 ms delay, with the ttl lowered. A node that hears the same packet relayed by enough others
 //! during its delay drops its own copy (counter-based flooding), so in a dense cluster only
 //! a few nodes relay. Packets are told apart by `(talker, burst, seq)`, remembered 10 s.
+//!
+//! Each copy heard comes from a different neighbour, so a relay is cancelled only after as
+//! many copies as the node has direct neighbours ([`Relay::set_neighbours`]), and never fewer
+//! than `suppress_after`. A bridge between two groups therefore still relays to the node only
+//! it reaches.
+//!
+//! An END is never suppressed: the talker's own repeats would otherwise count as relays and
+//! stop it a hop out. It is one LDPC block.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -61,6 +69,8 @@ pub struct Relay {
     config: RelayConfig,
     me: [u8; 4],
     enabled: bool,
+    /// Direct neighbours, when known (0: not known).
+    neighbours: u8,
     seen: HashMap<Key, Seen>,
     /// `seen` keys in the order they came, so forgetting is not a scan of all of them. Holds
     /// stale keys too (forgotten or overwritten), told apart by `first`.
@@ -70,7 +80,7 @@ pub struct Relay {
 
 impl Relay {
     pub fn new(config: RelayConfig, me: [u8; 4]) -> Self {
-        Self { config, me, enabled: true, seen: HashMap::new(), order: VecDeque::new(), stats: RelayStats::default() }
+        Self { config, me, enabled: true, neighbours: 0, seen: HashMap::new(), order: VecDeque::new(), stats: RelayStats::default() }
     }
 
     fn forget_old(&mut self, now: Instant) {
@@ -104,13 +114,14 @@ impl Relay {
     /// after a random delay (`roll` in [0, 1) picks it).
     pub fn on_heard(&mut self, packet: &Packet, now: Instant, roll: f64) -> Heard {
         self.forget_old(now);
+        let threshold = self.threshold();
         if let Some(seen) = self.seen.get_mut(&packet.key()) {
             if seen.own {
                 return Heard::Own;
             }
             seen.copies = seen.copies.saturating_add(1);
             self.stats.duplicates += 1;
-            if seen.copies >= self.config.suppress_after && seen.pending.take().is_some() {
+            if seen.copies >= threshold && !packet.is_end() && seen.pending.take().is_some() {
                 self.stats.suppressed += 1;
             }
             return Heard::Duplicate;
@@ -165,6 +176,16 @@ impl Relay {
     /// When the next relay is due.
     pub fn next_due(&self) -> Option<Instant> {
         self.seen.values().filter_map(|seen| seen.pending.as_ref().map(|(at, _)| *at)).min()
+    }
+
+    /// How many direct neighbours this node has (from the mesh's peer table), 0 if not known.
+    pub fn set_neighbours(&mut self, neighbours: u8) {
+        self.neighbours = neighbours;
+    }
+
+    /// Copies that cancel our relay.
+    fn threshold(&self) -> u8 {
+        self.config.suppress_after.max(self.neighbours)
     }
 
     /// Off: nothing is relayed (scheduled relays are dropped); packets are still recognised.
@@ -233,6 +254,31 @@ mod tests {
     }
 
     #[test]
+    fn a_bridge_relays_until_every_neighbour_was_heard_with_the_packet() {
+        let now = Instant::now();
+        // Four neighbours: the talker and two others of its group, and one only we reach.
+        let mut bridge = Relay::new(RelayConfig::default(), [9; 4]);
+        bridge.set_neighbours(4);
+        bridge.on_heard(&packet(1, 0, 4), now, 0.9);
+        bridge.on_heard(&packet(1, 0, 3), now + Duration::from_millis(5), 0.0);
+        bridge.on_heard(&packet(1, 0, 3), now + Duration::from_millis(8), 0.0);
+        assert_eq!(bridge.due(now + Duration::from_secs(1)).len(), 1, "three copies of four: relayed");
+        // The fourth copy (the far neighbour relaying first) cancels it.
+        bridge.on_heard(&packet(1, 1, 4), now, 0.9);
+        for ms in [5, 8, 9] {
+            bridge.on_heard(&packet(1, 1, 3), now + Duration::from_millis(ms), 0.0);
+        }
+        assert_eq!(bridge.next_due(), None);
+        // Fewer known neighbours than suppress_after: suppress_after still counts.
+        let mut sparse = Relay::new(RelayConfig::default(), [9; 4]);
+        sparse.set_neighbours(1);
+        sparse.on_heard(&packet(1, 0, 4), now, 0.9);
+        assert!(sparse.next_due().is_some(), "one copy is not two");
+        sparse.on_heard(&packet(1, 0, 3), now + Duration::from_millis(5), 0.0);
+        assert_eq!(sparse.next_due(), None);
+    }
+
+    #[test]
     fn a_refused_packet_is_not_relayed_and_does_not_shadow_the_genuine_one() {
         let now = Instant::now();
         let mut relay = Relay::new(RelayConfig::default(), [9; 4]);
@@ -258,6 +304,30 @@ mod tests {
         assert_eq!(relay.next_due(), None);
         assert_eq!(relay.on_heard(&packet(2, 1, 4), now, 0.5), Heard::New);
         assert_eq!(relay.next_due(), None);
+    }
+
+    #[test]
+    fn the_talkers_repeated_end_copies_do_not_cancel_its_relay() {
+        let now = Instant::now();
+        let mut relay = Relay::new(RelayConfig::default(), [9; 4]);
+        let end = Packet { flags: flags::END, ..packet(1, 3, 4) };
+        // Our relay is due at 39 ms; the talker's second copy comes at 30 ms.
+        relay.on_heard(&end, now, 0.99);
+        relay.on_heard(&end, now + Duration::from_millis(30), 0.0);
+        assert!(relay.next_due().is_some(), "the END must still go a hop further");
+        relay.on_heard(&Packet { ttl: 3, ..end.clone() }, now + Duration::from_millis(35), 0.0);
+        assert_eq!(relay.due(now + Duration::from_millis(40)).len(), 1, "relayed once");
+        assert!(relay.due(now + Duration::from_secs(1)).is_empty());
+    }
+
+    #[test]
+    fn a_packet_heard_by_two_paths_is_relayed_once_with_the_first_ttl() {
+        let now = Instant::now();
+        let mut relay = Relay::new(RelayConfig { suppress_after: 10, ..RelayConfig::default() }, [9; 4]);
+        assert_eq!(relay.on_heard(&packet(1, 0, 2), now, 0.0), Heard::New);
+        assert_eq!(relay.on_heard(&packet(1, 0, 4), now + Duration::from_millis(5), 0.0), Heard::Duplicate, "a shorter path, later");
+        let sent = relay.due(now + Duration::from_millis(50));
+        assert_eq!(sent.iter().map(|packet| packet.ttl).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]

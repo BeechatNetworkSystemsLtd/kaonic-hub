@@ -25,15 +25,17 @@ pub mod squelch;
 
 pub use gate::{Gate, Verdict};
 pub use floor::{Busy, Floor, FloorEvent, FloorState, KeyedBurst, Talker, recheck_delay};
-pub use jitter::{Jitter, JitterStats, Playout};
+pub use jitter::{BurstKey, Jitter, JitterStats, Playout};
 pub use packer::Packer;
 pub use packet::{MAX_FRAMES, Packet, VERSION, admin_signed_bytes, codec, flags, sign_admin, verify_admin};
 pub use relay::{Heard, Relay, RelayConfig, RelayStats};
 pub use replay::Replay;
-pub use squelch::{Squelch, SquelchConfig, SquelchDecision, frame_level_dbfs};
+pub use squelch::{ArmedKey, Squelch, SquelchConfig, SquelchDecision, frame_level_dbfs};
 
 /// Audio frame length.
 pub const FRAME_MS: u64 = 20;
 
 #[cfg(test)]
 mod flooding;
+#[cfg(test)]
+mod multihop;

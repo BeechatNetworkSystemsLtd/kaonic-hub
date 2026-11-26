@@ -6,6 +6,10 @@
 //! transmission until the level rises; frames captured while closed are kept as pre-roll
 //! and sent when it opens, so the start of a word is not clipped; it stays open for the
 //! hangover after the level drops, so pauses mid-sentence do not chop the tail off.
+//!
+//! An input that is not muted between overs, such as a USB sound card, hisses steadily. The
+//! gate follows the input's noise floor and opens only well above it, so steady noise stops
+//! keying the radio after a while.
 
 use std::collections::VecDeque;
 
@@ -13,6 +17,15 @@ use crate::FRAME_MS;
 
 /// Level reported for a frame that is digitally silent.
 pub const SILENT_DBFS: f32 = -120.0;
+/// The noise floor is not followed below this: anything quieter counts as silence.
+const NOISE_FLOOR_MIN_DBFS: f32 = -70.0;
+/// The gate opens only on sound this far above the noise floor.
+const NOISE_MARGIN_DB: f32 = 10.0;
+/// The noise floor rises 3 dB a second under steady sound: hiss 35 dB above silence is
+/// learned in about 12 s, while speech, which dips between words, is not.
+const NOISE_RISE_DB_PER_FRAME: f32 = 3.0 * FRAME_MS as f32 / 1000.0;
+/// It falls this fast: a pause brings it down at once, a dropped frame barely moves it.
+const NOISE_FALL_DB_PER_FRAME: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SquelchConfig {
@@ -50,6 +63,10 @@ pub struct Squelch {
     preroll: VecDeque<Vec<i16>>,
     open: bool,
     low_frames: u32,
+    noise_dbfs: f32,
+    /// Closed by [`Squelch::lock_out`]: stays closed until the level drops below the close
+    /// threshold.
+    locked: bool,
 }
 
 fn frames_for(ms: u32) -> u32 {
@@ -66,6 +83,8 @@ impl Squelch {
             preroll: VecDeque::new(),
             open: false,
             low_frames: 0,
+            noise_dbfs: NOISE_FLOOR_MIN_DBFS,
+            locked: false,
         }
     }
 
@@ -88,10 +107,41 @@ impl Squelch {
         self.open
     }
 
+    /// The noise floor the gate follows, in dBFS.
+    pub fn noise_dbfs(&self) -> f32 {
+        self.noise_dbfs
+    }
+
+    /// The level that opens the gate now: the threshold, or more above a noisy input.
+    pub fn open_dbfs(&self) -> f32 {
+        self.open_threshold_dbfs.max(self.noise_dbfs + NOISE_MARGIN_DB)
+    }
+
+    fn close_dbfs(&self) -> f32 {
+        self.open_dbfs() - (self.open_threshold_dbfs - self.close_threshold_dbfs)
+    }
+
+    fn follow_noise(&mut self, level_dbfs: f32) {
+        let level = level_dbfs.max(NOISE_FLOOR_MIN_DBFS);
+        self.noise_dbfs = if level > self.noise_dbfs {
+            (self.noise_dbfs + NOISE_RISE_DB_PER_FRAME).min(level)
+        } else {
+            (self.noise_dbfs - NOISE_FALL_DB_PER_FRAME).max(level)
+        };
+    }
+
     pub fn push(&mut self, frame: &[i16]) -> SquelchDecision {
         let level_dbfs = frame_level_dbfs(frame);
+        self.follow_noise(level_dbfs);
+        if self.locked {
+            if level_dbfs < self.close_dbfs() {
+                self.locked = false;
+            }
+            self.retain_preroll(frame);
+            return SquelchDecision { pass: false, opened: false, closed: false, level_dbfs };
+        }
         if self.open {
-            if level_dbfs < self.close_threshold_dbfs {
+            if level_dbfs < self.close_dbfs() {
                 self.low_frames += 1;
             } else {
                 self.low_frames = 0;
@@ -104,7 +154,7 @@ impl Squelch {
             }
             return SquelchDecision { pass: true, opened: false, closed: false, level_dbfs };
         }
-        if level_dbfs >= self.open_threshold_dbfs {
+        if level_dbfs >= self.open_dbfs() {
             self.open = true;
             self.low_frames = 0;
             return SquelchDecision { pass: true, opened: true, closed: false, level_dbfs };
@@ -125,6 +175,12 @@ impl Squelch {
         self.low_frames = 0;
     }
 
+    /// Close the gate and keep it closed until the input goes quiet (the over ran too long).
+    pub fn lock_out(&mut self) {
+        self.reset();
+        self.locked = true;
+    }
+
     fn retain_preroll(&mut self, frame: &[i16]) {
         if self.preroll_capacity == 0 {
             return;
@@ -133,6 +189,48 @@ impl Squelch {
             self.preroll.pop_front();
         }
         self.preroll.push_back(frame.to_vec());
+    }
+}
+
+/// Keying from the armed microphone. When the gate opens the node asks for the floor; if it
+/// is taken, it asks again on every frame of speech until it gets it or the gate closes, so a
+/// reply that starts early is sent once the floor is free.
+///
+/// It asks only on speech, not during the hangover, and only while the device's own speaker
+/// is quiet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArmedKey {
+    /// An over is in progress that has not got the floor.
+    waiting: bool,
+}
+
+impl ArmedKey {
+    /// Whether to ask for the floor on this frame, while not keyed. `open_dbfs` is the gate's
+    /// open threshold; `speaker_quiet`: the device's speaker is quiet.
+    pub fn wants_floor(&mut self, decision: &SquelchDecision, open_dbfs: f32, speaker_quiet: bool) -> bool {
+        if decision.closed {
+            self.waiting = false;
+            return false;
+        }
+        if decision.opened {
+            self.waiting = true;
+        }
+        self.waiting && decision.pass && decision.level_dbfs >= open_dbfs && speaker_quiet
+    }
+
+    /// The floor was given: the over is being sent.
+    pub fn granted(&mut self) {
+        self.waiting = false;
+    }
+
+    /// The gate was closed another way ([`Squelch::reset`]).
+    pub fn reset(&mut self) {
+        self.waiting = false;
+    }
+
+    /// An over waits for the floor.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting
     }
 }
 
@@ -229,6 +327,138 @@ mod tests {
         assert!(!squelch.push(&marginal).pass, "must not open on its own");
         assert!(squelch.push(&tone(8_000)).opened);
         assert!(squelch.push(&marginal).pass, "stays open once speech started");
+    }
+
+    /// The armed microphone of a node whose floor is `floor`, fed `frame` at `now`: whether
+    /// it keyed. As the hub does it.
+    fn armed_frame(squelch: &mut Squelch, armed: &mut ArmedKey, floor: &mut crate::Floor, frame: &[i16], now: std::time::Instant) -> bool {
+        let decision = squelch.push(frame);
+        if !armed.wants_floor(&decision, config().open_dbfs, true) {
+            return false;
+        }
+        let keyed = floor.request(now, false).is_ok();
+        if keyed {
+            armed.granted();
+        }
+        keyed
+    }
+
+    #[test]
+    fn an_over_begun_while_someone_talks_is_sent_once_the_floor_is_free() {
+        use crate::packet::{Packet, codec, flags};
+        use std::time::{Duration, Instant};
+        let packet = |flags: u8, seq: u16| Packet { flags, ttl: 4, epoch: 1, talker: [1; 4], burst: 5, seq, counter: 1, codec: codec::OPUS16, frames: vec![vec![1]], signature: None };
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let (mut squelch, mut armed, mut floor) = (Squelch::new(config()), ArmedKey::default(), crate::Floor::new([9; 4]));
+        // Talker 1 talks from 0 to 1 s, a packet every 100 ms; its END arrives at 1000 ms.
+        for ms in (0..600).step_by(100) {
+            floor.on_packet(&packet(if ms == 0 { flags::START } else { 0 }, ms as u16 / 20), false, at(ms));
+        }
+        // We answer from 600 ms on, and keep talking: while talker 1 has the floor, and for
+        // the 300 ms after its END, we are refused.
+        let mut keyed_at = None;
+        for ms in (600..2000).step_by(20) {
+            if ms == 1000 {
+                floor.on_packet(&packet(flags::END, 50), false, at(ms));
+            } else if ms < 1000 && ms % 100 == 0 {
+                floor.on_packet(&packet(0, ms as u16 / 20), false, at(ms));
+            }
+            floor.tick(at(ms));
+            if armed_frame(&mut squelch, &mut armed, &mut floor, &tone(8_000), at(ms)) {
+                keyed_at = Some(ms);
+                break;
+            }
+            assert!(armed.is_waiting(), "at {ms} ms the over waits for the floor");
+        }
+        // The over is not lost: it goes out as soon as the floor is free.
+        assert_eq!(keyed_at, Some(1300), "keyed 300 ms after the END");
+        assert_eq!(floor.state(), crate::FloorState::Talking);
+        assert!(!armed.is_waiting());
+    }
+
+    #[test]
+    fn a_waiting_over_keys_on_speech_only_and_ends_with_the_gate() {
+        let loud = |armed: &mut ArmedKey, squelch: &mut Squelch, quiet_speaker: bool| {
+            let decision = squelch.push(&tone(8_000));
+            armed.wants_floor(&decision, config().open_dbfs, quiet_speaker)
+        };
+        let (mut squelch, mut armed) = (Squelch::new(config()), ArmedKey::default());
+        // The gate opens while the speaker plays the group: no key, the over waits.
+        assert!(!loud(&mut armed, &mut squelch, false));
+        assert!(armed.is_waiting());
+        // The speaker is quiet, but so are we (the hangover holds the gate open): no key on
+        // what is not speech.
+        let decision = squelch.push(&[0i16; SAMPLES]);
+        assert!(decision.pass && !armed.wants_floor(&decision, config().open_dbfs, true));
+        // Speech again: ask.
+        assert!(loud(&mut armed, &mut squelch, true));
+        // Refused (nobody called `granted`): asked again on the next frame of speech.
+        assert!(loud(&mut armed, &mut squelch, true));
+        // The gate closes: the over is finished, and the hangover after it asks for nothing.
+        let closed = (0..=5).map(|_| squelch.push(&[0i16; SAMPLES])).find(|decision| decision.closed).expect("closes after the hangover");
+        assert!(!armed.wants_floor(&closed, config().open_dbfs, true));
+        assert!(!armed.is_waiting());
+        // Once given the floor it asks no more; a reset forgets a waiting over.
+        assert!(loud(&mut armed, &mut squelch, true));
+        armed.granted();
+        let decision = squelch.push(&tone(8_000));
+        assert!(!armed.wants_floor(&decision, config().open_dbfs, true));
+        squelch.reset();
+        assert!(!loud(&mut armed, &mut squelch, false) && armed.is_waiting());
+        armed.reset();
+        assert!(!armed.is_waiting());
+    }
+
+    /// Steady hiss of `amplitude` with a little variation, like an unmuted USB sound card.
+    fn hiss(amplitude: i16, frame: usize) -> Vec<i16> {
+        tone(amplitude + (frame % 7) as i16 * amplitude / 40)
+    }
+
+    #[test]
+    fn steady_hiss_above_the_threshold_does_not_hold_the_gate_open() {
+        let mut squelch = Squelch::new(SquelchConfig { hangover_ms: 600, ..config() });
+        assert!(frame_level_dbfs(&hiss(1_000, 0)) > -32.0, "well above the -45 dBFS threshold");
+        assert!(squelch.push(&hiss(1_000, 0)).opened, "it keys the radio at first");
+        // 30 s of it: the gate learns it is noise and closes, once.
+        let closed_at = (1..1_500).find(|frame| squelch.push(&hiss(1_000, *frame)).closed).expect("the gate closes on steady hiss");
+        assert!(closed_at < 20 * 50, "closed after {} s", closed_at / 50);
+        for frame in 1_500..3_000 {
+            let decision = squelch.push(&hiss(1_000, frame));
+            assert!(!decision.pass && !decision.opened, "the hiss keys nothing more");
+        }
+        // Talk over the hiss still opens it.
+        assert!(squelch.push(&tone(12_000)).opened, "speech above the hiss opens the gate");
+    }
+
+    #[test]
+    fn speech_with_pauses_keeps_the_gate_open_for_a_long_over() {
+        let mut squelch = Squelch::new(SquelchConfig { hangover_ms: 600, ..config() });
+        let room = tone(20);
+        for _ in 0..50 {
+            squelch.push(&room);
+        }
+        let word = tone(4_000);
+        // A minute of words (400 ms) and gaps (100 ms at room level).
+        for frame in 0..3_000 {
+            let decision = squelch.push(if frame % 25 < 20 { &word } else { &room });
+            assert!(decision.pass && !decision.closed, "frame {frame}: the over is cut");
+        }
+    }
+
+    #[test]
+    fn a_locked_out_gate_waits_for_quiet() {
+        let mut squelch = Squelch::new(config());
+        assert!(squelch.push(&tone(8_000)).opened);
+        squelch.lock_out();
+        for _ in 0..50 {
+            assert!(!squelch.push(&tone(8_000)).pass, "stays shut while the input stays loud");
+        }
+        // Quiet long enough for the floor to come down, then speech opens it again.
+        for _ in 0..100 {
+            squelch.push(&[0i16; SAMPLES]);
+        }
+        assert!(squelch.push(&tone(8_000)).opened);
     }
 
     #[test]
