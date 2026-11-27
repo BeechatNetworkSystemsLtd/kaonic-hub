@@ -614,6 +614,91 @@ paths:
         '202': { $ref: '#/components/responses/JobAccepted' }
         '409': { description: Nothing uploaded, or an install is already running. }
         '422': { $ref: '#/components/responses/Validation' }
+  /system/os:
+    get:
+      tags: [system]
+      operationId: getOs
+      summary: The running system image, and an uploaded update if there is one.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: [string, 'null'], description: The Kaonic image version (/etc/kaonic/image.version); null on older images. }
+                  os: { type: string }
+                  machine: { type: [string, 'null'] }
+                  slot: { type: [string, 'null'], enum: [a, b, null] }
+                  update:
+                    type: [object, 'null']
+                    properties:
+                      state: { type: string, enum: [uploading, checking, ready, invalid, installing, installed] }
+                      size: { type: integer }
+                      uploaded_ts: { type: integer }
+                      job_id: { type: [string, 'null'], description: The check or install job while one runs. }
+                      version: { type: [string, 'null'] }
+                      built: { type: [string, 'null'] }
+                      compared: { type: [string, 'null'], enum: [newer, same, older, null] }
+                      error: { type: [string, 'null'], description: Why the image was refused. }
+                      slot: { type: [string, 'null'], enum: [a, b, null] }
+  /system/os/upload:
+    post:
+      tags: [system]
+      operationId: uploadOs
+      summary: Upload a release bundle (image-<machine>-v<version>-emmc.tar.gz) as the raw body (a check job).
+      description: >-
+        Stored on userfs (Content-Length required, at most 1 GiB, refused with 507 when storage is
+        short), then checked: the manifest's machine must be this device's, it must be the eMMC
+        bundle with a bootfs and a rootfs image, and every file must match its SHA-256. A refused
+        bundle is deleted and the job fails with `invalid_image`.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/gzip:
+            schema: { type: string, format: binary }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '409': { description: An update is already being uploaded, checked or installed. }
+        '411': { description: No Content-Length. }
+        '413': { description: Larger than 1 GiB. }
+        '507': { description: Not enough free storage. }
+    delete:
+      tags: [system]
+      operationId: discardOs
+      summary: Drop the uploaded bundle, unless it is being installed.
+      x-role: admin
+      responses:
+        '204': { description: Dropped. }
+        '409': { description: It is being installed. }
+  /system/os/install:
+    post:
+      tags: [system]
+      operationId: installOs
+      summary: Install the checked bundle into the slot that is not running (a job).
+      description: >-
+        Writes the bootfs and rootfs images into the other slot, checks each SHA-256 while writing
+        and again by reading the partitions back, grows the root file system to its partition, and
+        makes that slot boot from the next restart on. U-Boot falls back to the running slot if the
+        new one does not start. The bootloaders, vendorfs and userfs are not written. The job's
+        result is `{slot, version}`.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                password: { type: string, description: Needed when a password is set. }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '409': { description: No checked bundle, or a kernel or system install is already running. }
+        '422': { $ref: '#/components/responses/Validation' }
   /ui/pages:
     get:
       tags: [system]
@@ -3138,6 +3223,7 @@ components:
           properties:
             hub: { type: string }
             os: { type: string }
+            image: { type: [string, 'null'], description: The Kaonic system image version; null on images that do not record it. }
             webui: { type: [string, 'null'] }
             commd: { type: [string, 'null'] }
             installer: { type: [string, 'null'] }

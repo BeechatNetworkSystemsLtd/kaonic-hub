@@ -62,7 +62,8 @@ impl Slot {
         }
     }
 
-    fn partition(self, kind: &str) -> String {
+    /// The slot's `bootfs` or `rootfs` block device.
+    pub fn partition(self, kind: &str) -> String {
         format!("{PARTLABELS}/{kind}_{}", self.lower())
     }
 }
@@ -150,6 +151,10 @@ impl Board for DryRun {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        // Slot A seems to run, so the slot flows can be tried off a board.
+        if path == Path::new("/proc/cmdline") {
+            return Ok(b"root=PARTLABEL=rootfs_a kaonic.slot=a".to_vec());
+        }
         Err(io::Error::new(io::ErrorKind::NotFound, format!("dry run: {}", path.display())))
     }
 

@@ -68,6 +68,11 @@ impl Device {
             .unwrap_or_else(|| "unknown".into())
     }
 
+    /// The Kaonic system image version, written into the image when it is built.
+    pub fn image_version(&self) -> Option<String> {
+        self.read("/etc/kaonic/image.version")
+    }
+
     /// The OS's own name for itself (`PRETTY_NAME` in `/etc/os-release`).
     pub fn os_name(&self) -> Option<String> {
         let release = self.read("/etc/os-release")?;

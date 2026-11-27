@@ -24,6 +24,8 @@ pub const API_VERSION: &str = "1.0";
 struct Versions {
     hub: &'static str,
     os: String,
+    /// The Kaonic system image, when the image records its version.
+    image: Option<String>,
     webui: Option<String>,
 }
 
@@ -74,6 +76,7 @@ async fn device_view(app: &App) -> ApiResult<DeviceView> {
         versions: Versions {
             hub: env!("CARGO_PKG_VERSION"),
             os: app.device.os_version(),
+            image: app.device.image_version(),
             webui: app.config.webui.version(),
         },
         uptime_secs: app.device.uptime_secs(),

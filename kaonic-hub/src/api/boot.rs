@@ -104,8 +104,17 @@ pub(crate) async fn read_status(app: &App, refresh: bool) -> ApiResult<BootState
     Ok(state)
 }
 
-fn forget_status() {
+pub(crate) fn forget_status() {
     with_store(|store| store.status = None);
+}
+
+/// Claims the slot writer (kernel and OS installs take turns); false if it is taken.
+pub(crate) fn claim_install() -> bool {
+    with_store(|store| !std::mem::replace(&mut store.installing, true))
+}
+
+pub(crate) fn release_install() {
+    with_store(|store| store.installing = false);
 }
 
 #[derive(Deserialize)]

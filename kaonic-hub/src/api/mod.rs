@@ -8,6 +8,7 @@ mod forward;
 mod jobs;
 mod links;
 mod network;
+mod os;
 mod peers;
 mod core_icons;
 mod report;
@@ -82,6 +83,10 @@ pub fn router(app: App) -> Router {
         )
         .route("/system/boot/kernel/staged", get(boot::staged).delete(boot::discard))
         .route("/system/boot/kernel/install", post(boot::install))
+        // OS updates from a release bundle, streamed to a file within its own limit
+        .route("/system/os", get(os::get))
+        .route("/system/os/upload", post(os::upload).delete(os::discard))
+        .route("/system/os/install", post(os::install))
         // network and Wi-Fi
         .route(
             "/network",

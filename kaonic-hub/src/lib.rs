@@ -10,6 +10,7 @@ pub mod events;
 pub mod group_key;
 pub mod identity;
 pub mod mnemonic;
+pub mod osupdate;
 pub mod plugin_api;
 pub mod plugins;
 pub mod provision;
