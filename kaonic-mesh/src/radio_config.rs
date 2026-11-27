@@ -437,6 +437,17 @@ mod tests {
     fn defaults_are_valid_and_out_of_band_is_refused() {
         assert!(sample().validate(&SUB_GHZ_RANGES).is_empty());
         assert!(BandConfig::default_for(false).validate(&G24_RANGES).is_empty());
+    }
+
+    #[test]
+    fn a_kaonic_1x_starts_in_the_433_mhz_band() {
+        let fallback = RadioSettings::sub_ghz_default_for(Some("stm32mp1-kaonic1x-r09"));
+        let x = BandConfig { frequency_hz: fallback.frequency_hz, channel: fallback.channel, ..BandConfig::default_for(true) };
+        assert_eq!(x.centre_hz(), 433_920_000);
+        assert!(x.validate(&SUB_GHZ_RANGES).is_empty(), "{:?}", x.validate(&SUB_GHZ_RANGES));
+        let mesh = RadioSettings::sub_ghz_default_for(Some("stm32mp1-kaonic1x-r09"));
+        assert_eq!((mesh.centre_hz(), mesh.ofdm_mcs, mesh.tx_power), (433_920_000, 6, 10));
+        assert_eq!(RadioSettings::sub_ghz_default_for(Some("stm32mp1-kaonic1s-r30")), RadioSettings::sub_ghz_default());
         let mut wrong = sample();
         wrong.frequency_hz = 600_000_000;
         let problems = wrong.validate(&SUB_GHZ_RANGES);

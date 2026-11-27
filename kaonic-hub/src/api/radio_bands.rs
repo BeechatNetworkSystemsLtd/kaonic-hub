@@ -17,6 +17,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use kaonic_mesh::radio_config::{self, BandConfig, Cca, Frontend, Modulation, Switch, SwitchStep, G24_RANGES, SUB_GHZ_RANGES};
+use kaonic_mesh::settings::RadioSettings;
 use kaonic_mux::{Kind, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -107,6 +108,28 @@ async fn stored(app: &App, band: &Band) -> Option<BandConfig> {
     Some(capped)
 }
 
+/// A module's sub-GHz settings before anyone chose them: commd's default for the board, else
+/// the hub's own table for the machine (a commd without the message). `tries` asks commd again
+/// a second apart, for start-up while commd is still coming up.
+pub async fn sub_ghz_default(app: &App, module: usize, tries: u32) -> RadioSettings {
+    let fallback = RadioSettings::sub_ghz_default_for(app.device.machine().as_deref());
+    let Some(commd) = app.commd.as_ref() else { return fallback };
+    for attempt in 0..tries.max(1) {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        match commd.default_config(module).await {
+            Ok(config) => {
+                return RadioSettings { frequency_hz: config.freq_hz, channel: config.channel, channel_spacing_hz: config.spacing_hz, ..fallback };
+            }
+            Err(kaonic_mesh::commd::Error::Unreachable) => continue,
+            Err(_) => break,
+        }
+    }
+    log::debug!("radio module {module}: no default from commd, using the hub's for this board");
+    fallback
+}
+
 /// What the band runs now: the driver's view, or (emulator) what was stored. The TX power is
 /// capped to the hub's limit, so a change kept or gone back to is one the hub will apply.
 async fn current(app: &App, band: &Band) -> BandConfig {
@@ -115,7 +138,15 @@ async fn current(app: &App, band: &Band) -> BandConfig {
     {
         return config.capped();
     }
-    stored(app, band).await.unwrap_or_else(|| BandConfig::default_for(band.sub_ghz))
+    if let Some(config) = stored(app, band).await {
+        return config;
+    }
+    let config = BandConfig::default_for(band.sub_ghz);
+    if !band.sub_ghz {
+        return config;
+    }
+    let default = sub_ghz_default(app, usize::from(band.module), 1).await;
+    BandConfig { frequency_hz: default.frequency_hz, channel: default.channel, channel_spacing_hz: u32::try_from(default.channel_spacing_hz).unwrap_or(config.channel_spacing_hz), ..config }
 }
 
 fn ip_link(interface: &str, up: bool) -> std::io::Result<()> {

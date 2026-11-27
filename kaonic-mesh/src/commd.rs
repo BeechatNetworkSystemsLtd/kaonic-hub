@@ -1,4 +1,5 @@
-//! A small client for commd: read and set each radio's sub-GHz filter.
+//! A small client for commd: read and set each radio's sub-GHz filter, and read each
+//! module's default frequency settings for the board.
 //!
 //! Speaks commd's control protocol over UDP (`127.0.0.1:9090`), written here so the hub does
 //! not build commd's crates.
@@ -44,6 +45,15 @@ pub struct Filters {
     pub active: Option<u8>,
     pub sub_ghz: Option<(u32, u32)>,
     pub band_24: Option<(u32, u32)>,
+}
+
+/// A module's frequency settings until it is given others, as commd has them for the board:
+/// centre = `freq_hz + channel × spacing_hz`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefaultConfig {
+    pub freq_hz: u64,
+    pub spacing_hz: u64,
+    pub channel: u16,
 }
 
 #[derive(Debug)]
@@ -140,7 +150,43 @@ impl Commd {
         }
     }
 
+    /// The module's default frequency settings for this board. An older commd does not know
+    /// the message; its silence does not stop the other requests.
+    pub async fn default_config(&self, module: usize) -> Result<DefaultConfig, Error> {
+        // GetDefaultRadioConfigRequest { module }
+        let mut request = Vec::new();
+        variant(&mut request, "GetDefaultRadioConfigRequest");
+        array(&mut request, 1);
+        uint(&mut request, module as u64);
+        let reply = self.request_with(&request, false).await?;
+        let mut reader = Reader(&reply);
+        let (name, value) = reader.variant()?;
+        match (name.as_str(), value) {
+            ("GetDefaultRadioConfigResponse", true) => {
+                // GetDefaultRadioConfigResponse { module, config: RadioConfig { freq, channel_spacing, channel, bandwidth_filter } }
+                if reader.array()? != 2 {
+                    return Err(Error::Protocol);
+                }
+                reader.uint()?;
+                if reader.array()? != 4 {
+                    return Err(Error::Protocol);
+                }
+                let freq_hz = reader.uint()?;
+                let spacing_hz = reader.uint()?;
+                let channel = u16::try_from(reader.uint()?).map_err(|_| Error::Protocol)?;
+                Ok(DefaultConfig { freq_hz, spacing_hz, channel })
+            }
+            ("Error", false) => Err(Error::Refused),
+            _ => Err(Error::Protocol),
+        }
+    }
+
     async fn request(&self, payload: &[u8]) -> Result<Vec<u8>, Error> {
+        self.request_with(payload, true).await
+    }
+
+    /// `quiet`: whether silence makes the client stop asking for a while.
+    async fn request_with(&self, payload: &[u8], quiet: bool) -> Result<Vec<u8>, Error> {
         if self.quiet_until.lock().expect("commd lock").is_some_and(|until| Instant::now() < until) {
             return Err(Error::Unreachable);
         }
@@ -149,12 +195,16 @@ impl Commd {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(error)) => {
                 log::debug!("commd {}: {error}", self.addr);
-                self.go_quiet();
+                if quiet {
+                    self.go_quiet();
+                }
                 Err(Error::Unreachable)
             }
             Err(_) => {
                 log::debug!("commd {}: no answer", self.addr);
-                self.go_quiet();
+                if quiet {
+                    self.go_quiet();
+                }
                 Err(Error::Unreachable)
             }
         }
@@ -425,6 +475,23 @@ impl FakeCommd {
                     uint(&mut reply, u64::from(max));
                 }
             }
+            Ok((name, true)) if name == "GetDefaultRadioConfigRequest" => {
+                let module = reader.array().and_then(|_| reader.uint()).ok().map(|module| module as usize);
+                match module.filter(|module| *module < selected.len()) {
+                    Some(module) => {
+                        variant(&mut reply, "GetDefaultRadioConfigResponse");
+                        array(&mut reply, 2);
+                        uint(&mut reply, module as u64);
+                        array(&mut reply, 4);
+                        // The fake is a Kaonic 1X: 433.92 MHz, channel 0.
+                        uint(&mut reply, 433_920_000);
+                        uint(&mut reply, 200_000);
+                        uint(&mut reply, 0);
+                        string(&mut reply, "Narrow");
+                    }
+                    None => string(&mut reply, "Error"),
+                }
+            }
             Ok((name, true)) if name == "SetFilterRequest" => {
                 let request = reader.array().and_then(|_| Ok((reader.uint()? as usize, reader.option_u8()?)));
                 match request {
@@ -531,6 +598,8 @@ mod tests {
         assert!(matches!(commd.filters(5).await, Err(Error::Refused)));
         commd.set_filter(1, None).await.unwrap();
         assert_eq!(fake.selected.lock().unwrap()[1], None);
+        assert_eq!(commd.default_config(0).await.unwrap(), DefaultConfig { freq_hz: 433_920_000, spacing_hz: 200_000, channel: 0 });
+        assert!(matches!(commd.default_config(5).await, Err(Error::Refused)));
 
         // Nobody there: unreachable, and not asked again for a while.
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -539,5 +608,23 @@ mod tests {
         assert!(matches!(nobody.filters(0).await, Err(Error::Unreachable)));
         assert!(matches!(nobody.filters(0).await, Err(Error::Unreachable)));
         assert!(started.elapsed() < Duration::from_millis(600));
+
+        // An older commd that ignores the default request does not silence the rest.
+        let older = Commd::new(silent.local_addr().unwrap());
+        assert!(matches!(older.default_config(0).await, Err(Error::Unreachable)));
+        assert!(older.quiet_until.lock().unwrap().is_none());
+    }
+
+    /// kaonic-ctrl pins `GetDefaultRadioConfigRequest { module: 1 }` to these bytes.
+    #[test]
+    fn the_default_request_is_encoded_as_commd_expects() {
+        let mut get = Vec::new();
+        variant(&mut get, "GetDefaultRadioConfigRequest");
+        array(&mut get, 1);
+        uint(&mut get, 1);
+        let mut expected = vec![0x81, 0xbc];
+        expected.extend_from_slice(b"GetDefaultRadioConfigRequest");
+        expected.extend_from_slice(&[0x91, 0x01]);
+        assert_eq!(get, expected);
     }
 }

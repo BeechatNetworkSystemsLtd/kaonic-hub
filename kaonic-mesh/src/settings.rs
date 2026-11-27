@@ -26,6 +26,16 @@ impl RadioSettings {
         Self { frequency_hz: 869_535_000, channel: 11, channel_spacing_hz: 200_000, ofdm_mcs: 6, ofdm_opt: 0, tx_power: 10 }
     }
 
+    /// The sub-GHz default for a board, by its Yocto machine (`stm32mp1-kaonic1x-r09`): the
+    /// Kaonic 1X runs in the 433 MHz band, centred on 433.92 MHz; other boards as above.
+    pub fn sub_ghz_default_for(machine: Option<&str>) -> Self {
+        if is_kaonic1x(machine) {
+            Self { frequency_hz: 433_920_000, channel: 0, ..Self::sub_ghz_default() }
+        } else {
+            Self::sub_ghz_default()
+        }
+    }
+
     fn attributes(&self) -> [(&'static str, String); 7] {
         [
             ("frequency", self.frequency_hz.to_string()),
@@ -37,6 +47,11 @@ impl RadioSettings {
             ("frontend/tx_power", self.tx_power.to_string()),
         ]
     }
+}
+
+/// Whether a Yocto machine name is a Kaonic 1X board.
+pub fn is_kaonic1x(machine: Option<&str>) -> bool {
+    machine.is_some_and(|machine| machine.contains("kaonic1x"))
 }
 
 /// IEEE 802.15.4g MR-OFDM PHY bit rates in kbit/s, by option (the driver's `opt`, 0 = option 1) and MCS.

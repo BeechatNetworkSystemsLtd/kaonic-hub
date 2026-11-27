@@ -419,7 +419,8 @@ async fn start_mesh(app: App, identity: kaonic_hub::identity::NodeIdentity, args
 }
 
 /// The mesh radio's settings: as saved (`radio.<iface>` = frequency,channel,spacing,mcs,opt,power),
-/// else the fielded defaults, which are then saved so they survive whatever reconfigures the driver.
+/// else the fielded defaults for this board, which are then saved so they survive whatever
+/// reconfigures the driver.
 async fn radio_settings(app: &App, iface: &str) -> kaonic_mesh::settings::RadioSettings {
     let key = format!("radio.{iface}");
     let stored_key = key.clone();
@@ -455,7 +456,11 @@ async fn radio_settings(app: &App, iface: &str) -> kaonic_mesh::settings::RadioS
             tx_power: u8::try_from(tx_power).ok()?.min(kaonic_mesh::radio_config::TX_POWER_MAX_OFDM),
         })
     });
-    let settings = parsed.unwrap_or_else(kaonic_mesh::settings::RadioSettings::sub_ghz_default);
+    let settings = match parsed {
+        Some(settings) => settings,
+        // commd may still be starting with the hub: asked for a few seconds.
+        None => kaonic_hub::api::radio_bands::sub_ghz_default(app, usize::from(iface.ends_with("_b")), 5).await,
+    };
     let text = format!(
         "{},{},{},{},{},{}",
         settings.frequency_hz,
