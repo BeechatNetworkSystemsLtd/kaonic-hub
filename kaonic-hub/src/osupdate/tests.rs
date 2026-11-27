@@ -55,7 +55,7 @@ fn reads_the_manifest_of_a_release_bundle() {
     assert_eq!(manifest.version, "0.3.4");
     assert_eq!(manifest.files.len(), 2);
     assert_eq!(manifest.files[1], FileEntry { path: ROOTFS.into(), size: 4, sha256: sha(b"root") });
-    let checked = compatible(&manifest, Some(MACHINE)).unwrap();
+    let checked = compatible(&manifest, Some(MACHINE), "emmc").unwrap();
     assert_eq!(checked.bootfs.path, BOOTFS);
     assert_eq!(checked.rootfs.path, ROOTFS);
 }
@@ -64,12 +64,15 @@ fn reads_the_manifest_of_a_release_bundle() {
 fn a_bundle_for_another_board_or_boot_device_is_refused() {
     let files: &[(&str, &[u8])] = &[(BOOTFS, b"boot"), (ROOTFS, b"root")];
     let other = parse_manifest(&manifest_for(files, "stm32mp1-kaonic1s-r24", "emmc")).unwrap();
-    assert!(compatible(&other, Some(MACHINE)).unwrap_err().contains("kaonic1s-r24"));
+    assert!(compatible(&other, Some(MACHINE), "emmc").unwrap_err().contains("kaonic1s-r24"));
     let sdcard = parse_manifest(&manifest_for(files, MACHINE, "sdcard")).unwrap();
-    assert!(compatible(&sdcard, Some(MACHINE)).unwrap_err().contains("eMMC"));
+    assert!(compatible(&sdcard, Some(MACHINE), "emmc").unwrap_err().contains("-emmc.tar.gz"));
+    assert!(compatible(&sdcard, Some(MACHINE), "sdcard").is_ok(), "an SD card board takes the SD card bundle");
+    let emmc = parse_manifest(&manifest_for(files, MACHINE, "emmc")).unwrap();
+    assert!(compatible(&emmc, Some(MACHINE), "sdcard").unwrap_err().contains("-sdcard-usb.tar.gz"));
     let no_rootfs = parse_manifest(&manifest_for(&[(BOOTFS, b"boot")], MACHINE, "emmc")).unwrap();
-    assert!(compatible(&no_rootfs, Some(MACHINE)).unwrap_err().contains("rootfs"));
-    assert!(compatible(&other, None).is_err(), "an unknown machine takes nothing");
+    assert!(compatible(&no_rootfs, Some(MACHINE), "emmc").unwrap_err().contains("rootfs"));
+    assert!(compatible(&other, None, "emmc").is_err(), "an unknown machine takes nothing");
 }
 
 #[test]
@@ -84,7 +87,7 @@ fn versions_compare_by_number() {
 fn a_good_bundle_checks_and_its_images_are_written_and_read_back() {
     let dir = scratch();
     let (path, bootfs, rootfs) = sample(&dir);
-    let checked = check(&path, Some(MACHINE), &|_| {}).unwrap();
+    let checked = check(&path, Some(MACHINE), "emmc", &|_| {}).unwrap();
     assert_eq!(checked.version, "0.3.4");
     // Partitions larger than their images, with old data past the end.
     let (boot_dev, root_dev) = (dir.join("bootfs_b"), dir.join("rootfs_b"));
@@ -103,7 +106,7 @@ fn a_good_bundle_checks_and_its_images_are_written_and_read_back() {
 fn a_partition_too_small_is_refused_before_anything_is_written() {
     let dir = scratch();
     let (path, _, _) = sample(&dir);
-    let checked = check(&path, Some(MACHINE), &|_| {}).unwrap();
+    let checked = check(&path, Some(MACHINE), "emmc", &|_| {}).unwrap();
     let (boot_dev, root_dev) = (dir.join("bootfs_b"), dir.join("rootfs_b"));
     std::fs::write(&boot_dev, vec![0xAA; 400_000]).unwrap();
     std::fs::write(&root_dev, vec![0xAA; 1000]).unwrap();
@@ -121,15 +124,25 @@ fn a_damaged_or_foreign_file_is_refused() {
     // The manifest promises other content than the bundle has.
     let manifest = manifest_for(&[(BOOTFS, &bootfs), (ROOTFS, b"something else")], MACHINE, "emmc");
     let path = bundle(&dir, &[(BOOTFS, bootfs), (ROOTFS, rootfs)], &manifest);
-    assert!(check(&path, Some(MACHINE), &|_| {}).unwrap_err().contains("damaged"));
+    assert!(check(&path, Some(MACHINE), "emmc", &|_| {}).unwrap_err().contains("damaged"));
 
     let truncated = dir.join("truncated.tar.gz");
     let data = std::fs::read(&path).unwrap();
     std::fs::write(&truncated, &data[..data.len() / 2]).unwrap();
-    assert!(check(&truncated, Some(MACHINE), &|_| {}).is_err());
+    assert!(check(&truncated, Some(MACHINE), "emmc", &|_| {}).is_err());
 
     let text = dir.join("notes.tar.gz");
     std::fs::write(&text, b"hello").unwrap();
-    assert!(check(&text, Some(MACHINE), &|_| {}).unwrap_err().contains("not a Kaonic image bundle"));
+    assert!(check(&text, Some(MACHINE), "emmc", &|_| {}).unwrap_err().contains("not a Kaonic image bundle"));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_boot_storage_is_read_from_the_disk() {
+    assert_eq!(disk_of("mmcblk0p11"), "mmcblk0");
+    assert_eq!(disk_of("mmcblk1p3"), "mmcblk1");
+    assert_eq!(disk_of("mmcblk1"), "mmcblk1");
+    assert_eq!(storage_name("SD\n"), Some("sdcard"));
+    assert_eq!(storage_name("MMC"), Some("emmc"));
+    assert_eq!(storage_name("SDIO"), None);
 }

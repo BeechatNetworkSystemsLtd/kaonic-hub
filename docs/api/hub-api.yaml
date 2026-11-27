@@ -631,6 +631,7 @@ paths:
                   version: { type: [string, 'null'], description: The Kaonic image version (/etc/kaonic/image.version); null on older images. }
                   os: { type: string }
                   machine: { type: [string, 'null'] }
+                  storage: { type: string, enum: [emmc, sdcard], description: What the device boots from; it takes the bundle made for that. }
                   slot: { type: [string, 'null'], enum: [a, b, null] }
                   update:
                     type: [object, 'null']
@@ -651,8 +652,8 @@ paths:
       summary: Upload a release bundle (image-<machine>-v<version>-emmc.tar.gz) as the raw body (a check job).
       description: >-
         Stored on userfs (Content-Length required, at most 1 GiB, refused with 507 when storage is
-        short), then checked: the manifest's machine must be this device's, it must be the eMMC
-        bundle with a bootfs and a rootfs image, and every file must match its SHA-256. A refused
+        short), then checked: the manifest's machine and storage (eMMC or SD card) must be this
+        device's, it must have a bootfs and a rootfs image, and every file must match its SHA-256. A refused
         bundle is deleted and the job fails with `invalid_image`.
       x-role: admin
       requestBody:

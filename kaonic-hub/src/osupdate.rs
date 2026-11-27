@@ -102,9 +102,33 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     Ok(manifest)
 }
 
-/// Whether the bundle suits a device of `machine`: the same machine, an eMMC bundle, and a
-/// bootfs and a rootfs image in it.
-pub fn compatible(manifest: &Manifest, machine: Option<&str>) -> Result<Checked, String> {
+/// Where a device boots from, as manifests name it.
+pub fn storage_name(kind: &str) -> Option<&'static str> {
+    match kind.trim() {
+        "SD" => Some("sdcard"),
+        "MMC" => Some("emmc"),
+        _ => None,
+    }
+}
+
+/// The disk a partition is on: `mmcblk0p11` → `mmcblk0`.
+pub fn disk_of(partition: &str) -> &str {
+    match partition.rfind('p') {
+        Some(at) if at > 0 && partition[at + 1..].bytes().all(|byte| byte.is_ascii_digit()) && at + 1 < partition.len() => &partition[..at],
+        _ => partition,
+    }
+}
+
+/// What the device boots from (`sdcard` or `emmc`): the storage that holds `partition`.
+pub fn boot_device(partition: &str) -> Option<&'static str> {
+    let device = std::fs::canonicalize(partition).ok()?;
+    let disk = disk_of(device.file_name()?.to_str()?).to_owned();
+    storage_name(&std::fs::read_to_string(format!("/sys/block/{disk}/device/type")).ok()?)
+}
+
+/// Whether the bundle suits a device of `machine` booting from `boot_device`: the same
+/// machine and storage, and a bootfs and a rootfs image in it.
+pub fn compatible(manifest: &Manifest, machine: Option<&str>, boot_device: &str) -> Result<Checked, String> {
     if manifest.schema != SCHEMA {
         return Err(format!("the bundle's manifest is format {}, and this hub reads format {SCHEMA}", manifest.schema));
     }
@@ -115,8 +139,9 @@ pub fn compatible(manifest: &Manifest, machine: Option<&str>) -> Result<Checked,
     if manifest.machine != machine {
         return Err(format!("this image is for {}, and this device is {machine}", manifest.machine));
     }
-    if manifest.boot_device != "emmc" {
-        return Err(format!("this is the {} bundle; use the eMMC one (…-emmc.tar.gz)", if manifest.boot_device.is_empty() { "wrong" } else { &manifest.boot_device }));
+    if manifest.boot_device != boot_device {
+        let wanted = if boot_device == "emmc" { "the eMMC one (…-emmc.tar.gz)" } else { "the SD card one (…-sdcard-usb.tar.gz)" };
+        return Err(format!("this bundle is for {} storage, and this device boots from {}; use {wanted}", label(&manifest.boot_device), label(boot_device)));
     }
     let image = |kind: &str| {
         let suffix = format!("-{kind}.ext4");
@@ -128,6 +153,15 @@ pub fn compatible(manifest: &Manifest, machine: Option<&str>) -> Result<Checked,
         }
     };
     Ok(Checked { version: manifest.version.clone(), machine: manifest.machine.clone(), built: manifest.built.clone(), bootfs: image("bootfs")?, rootfs: image("rootfs")? })
+}
+
+fn label(storage: &str) -> &str {
+    match storage {
+        "emmc" => "eMMC",
+        "sdcard" => "SD card",
+        "" => "unknown",
+        other => other,
+    }
 }
 
 /// Compares dotted versions number by number (`0.10.0` is newer than `0.9.3`).
@@ -296,7 +330,7 @@ fn copy_hashed(from: &mut dyn Read, to: &mut dyn Write, progress: &mut dyn FnMut
 
 /// Reads the whole bundle once: every file's SHA-256 must match the manifest, and the
 /// bundle must suit `machine`. `progress` gets the share of the file read so far.
-pub fn check(path: &Path, machine: Option<&str>, progress: &dyn Fn(f32)) -> Result<Checked, String> {
+pub fn check(path: &Path, machine: Option<&str>, boot_device: &str, progress: &dyn Fn(f32)) -> Result<Checked, String> {
     let length = std::fs::metadata(path).map_err(|error| format!("the upload is gone: {error}"))?.len().max(1);
     let read = Arc::new(AtomicU64::new(0));
     let mut gunzip = Gunzip::open(path, read.clone()).map_err(|error| format!("cannot unpack the file: {error}"))?;
@@ -331,7 +365,7 @@ pub fn check(path: &Path, machine: Option<&str>, progress: &dyn Fn(f32)) -> Resu
         Err(error) => return Err(format!("this is not a Kaonic image bundle ({error})")),
     }
     let manifest = parse_manifest(&manifest_text.ok_or("this is not a Kaonic image bundle: it has no manifest.toml")?)?;
-    let checked = compatible(&manifest, machine)?;
+    let checked = compatible(&manifest, machine, boot_device)?;
     for file in &manifest.files {
         match seen.get(&file.path) {
             None => return Err(format!("the bundle is incomplete: {} is missing", file.path)),

@@ -100,8 +100,16 @@ struct OsView {
     version: Option<String>,
     os: String,
     machine: Option<String>,
+    /// What it boots from, so the right bundle is asked for: `emmc` or `sdcard`.
+    storage: &'static str,
     slot: Option<Slot>,
     update: Option<UpdateView>,
+}
+
+/// What the device boots from; off a board (development) it counts as eMMC.
+fn storage() -> &'static str {
+    let found = if boot::dry_run() { None } else { osupdate::boot_device(&Slot::A.partition("rootfs")) };
+    found.unwrap_or("emmc")
 }
 
 fn compared(new: &str, running: Option<&str>) -> Option<&'static str> {
@@ -150,7 +158,7 @@ async fn view(app: &App) -> OsView {
         }
         view
     });
-    OsView { version, os: app.device.os_version(), machine: app.device.machine(), slot, update }
+    OsView { version, os: app.device.os_version(), machine: app.device.machine(), storage: storage(), slot, update }
 }
 
 /// `GET /system/os`
@@ -241,6 +249,7 @@ pub async fn upload(State(app): State<App>, _: Admin, headers: HeaderMap, mut bo
     with_store(|store| store.upload = Some(Upload { stage: Stage::Checking { job: job.id.clone() }, size: length, uploaded_ts: clock::now() }));
     log::info!("os: an update of {length} bytes was uploaded; checking it");
     let (worker_app, running, machine) = (app.clone(), job.clone(), app.device.machine());
+    let storage = storage();
     tokio::spawn(async move {
         let (progress_app, progress_job) = (worker_app.clone(), running.clone());
         let handle = tokio::runtime::Handle::current();
@@ -250,7 +259,7 @@ pub async fn upload(State(app): State<App>, _: Admin, headers: HeaderMap, mut bo
                 let (app, job) = (progress_app.clone(), progress_job.clone());
                 handle.spawn(async move { jobs::progress(&app, &job, done, "Checking the image") });
             };
-            osupdate::check(&path, machine.as_deref(), &report)
+            osupdate::check(&path, machine.as_deref(), storage, &report)
         })
         .await
         .unwrap_or_else(|_| Err("the check stopped unexpectedly".into()));
@@ -389,6 +398,11 @@ fn install_into(path: &Path, run_dir: &Path, state: &boot::BootState, checked: &
     }
     progress(0.0, "Preparing");
     let (bootfs, rootfs) = (target.partition("bootfs"), target.partition("rootfs"));
+    if !boot::dry_run() {
+        for partition in [&bootfs, &rootfs] {
+            release(board, partition)?;
+        }
+    }
     let (boot_target, root_target) = if boot::dry_run() { (Target::DryRun, Target::DryRun) } else { (Target::Device(&bootfs), Target::Device(&rootfs)) };
     osupdate::write_images(path, checked, boot_target, root_target, progress)?;
     progress(0.98, "Finishing");
@@ -399,6 +413,7 @@ fn install_into(path: &Path, run_dir: &Path, state: &boot::BootState, checked: &
         {
             log::warn!("os: the new system was not grown to its partition: {error}");
         }
+        mark_resized(board, run_dir, &rootfs)?;
     }
     if boot::dry_run() {
         log::info!("os (dry run): slot {} would boot next", target.letter());
@@ -406,6 +421,35 @@ fn install_into(path: &Path, run_dir: &Path, state: &boot::BootState, checked: &
     }
     let fresh = boot::status(board, run_dir).map_err(|error| format!("cannot read the boot slots: {error}"))?;
     boot::set_next(board, &fresh, target, Mode::Permanent)
+}
+
+/// Unmounts a partition of the slot being replaced wherever it is mounted: nothing of the
+/// running system is on it, and writing under a mounted file system would corrupt both.
+fn release(board: &dyn boot::Board, partition: &str) -> Result<(), String> {
+    let device = std::fs::canonicalize(partition).map_err(|error| format!("cannot find {partition}: {error}"))?;
+    let device = device.to_string_lossy().into_owned();
+    // findmnt fails when the partition is not mounted, which is the usual case.
+    let points = board.run("findmnt", &["-n", "-o", "TARGET", "--source", &device]).unwrap_or_default();
+    for point in points.lines().map(str::trim).filter(|point| !point.is_empty()) {
+        log::warn!("os: unmounting {point}: it holds {partition}, which is about to be replaced");
+        board.run("umount", &[point]).map_err(|error| format!("{partition} is in use at {point} and cannot be replaced: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Marks the new system as already sized. Without the mark its first boot repeats the
+/// factory's first boot: a bad-block read of every partition, half an hour on a large card.
+fn mark_resized(board: &dyn boot::Board, run_dir: &Path, rootfs: &str) -> Result<(), String> {
+    let point = run_dir.join("slot").join("new-root");
+    board.create_dir(&point).map_err(|error| format!("cannot prepare the new system: {error}"))?;
+    let point_text = point.to_string_lossy().into_owned();
+    board.run("mount", &[rootfs, &point_text]).map_err(|error| format!("cannot open the new system: {error}"))?;
+    let marked = board.write_atomic(&point.join("etc/.resized"), b"");
+    let _ = board.run("sync", &[]);
+    let unmounted = board.run("umount", &[&point_text]);
+    marked.map_err(|error| format!("cannot finish the new system: {error}"))?;
+    unmounted.map_err(|error| format!("cannot close the new system: {error}"))?;
+    Ok(())
 }
 
 async fn audit(app: &App, action: &'static str, detail: String) {
