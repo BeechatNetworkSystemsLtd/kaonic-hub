@@ -107,6 +107,8 @@ pub struct TalkerView {
     pub is_admin: bool,
     pub local: bool,
     pub source: Option<&'static str>,
+    /// Relays the talk comes through (0: straight from the talker); none for our own.
+    pub hops: Option<u8>,
 }
 
 /// What sources are told.
@@ -1039,7 +1041,14 @@ impl Engine {
             })
         });
         let (id, codename) = peer.unwrap_or_else(|| (format!("{prefix:0<32}"), String::new()));
-        TalkerView { id, codename, is_admin: admin, local: local.is_some(), source: local.map(Source::name) }
+        TalkerView { id, codename, is_admin: admin, local: local.is_some(), source: local.map(Source::name), hops: None }
+    }
+
+    /// The same talker with new details; the floor and its start stay.
+    fn update_talker(&self, talker: TalkerView) {
+        self.ptt.snapshot.lock().expect("ptt snapshot lock").talker = Some(talker.clone());
+        let _ = self.ptt.control.send(Control::Talker(Some(talker)));
+        self.ptt.publish_state();
     }
 
     fn set_floor(&self, talker: Option<TalkerView>) {
@@ -1310,11 +1319,20 @@ impl Engine {
                 };
                 self.finish_burst(record, ended);
             }
-            let view = self.talker_view(packet.talker, admin, None);
+            let view = TalkerView { hops: Some(hops), ..self.talker_view(packet.talker, admin, None) };
             self.rx = Some(BurstRecord { talker: view.clone(), key, started_ms: now_ms(), started: now, frames: 0, lost: 0, hops: Some(hops), end_seen: false, continuity: Continuity::default() });
             self.set_floor(Some(view));
         } else if let Some(record) = &mut self.rx {
             record.hops = Some(record.hops.map_or(hops, |known| known.min(hops)));
+            // A shorter way in: the talker is nearer than it looked.
+            let nearer = (record.talker.hops > record.hops).then(|| {
+                record.talker.hops = record.hops;
+                record.talker.clone()
+            });
+            if let Some(view) = nearer {
+                self.update_talker(view);
+            }
+            let Some(record) = &mut self.rx else { return };
             if admin && !record.talker.is_admin {
                 record.talker.is_admin = true;
                 let view = record.talker.clone();

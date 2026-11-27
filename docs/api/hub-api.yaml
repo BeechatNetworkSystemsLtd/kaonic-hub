@@ -4519,6 +4519,7 @@ components:
         is_admin: { type: boolean, description: A signed admin burst (has priority). }
         local: { type: boolean, description: This device is talking. }
         source: { type: [string, 'null'], enum: [device, browser, udp, squelch, test, null], description: 'Where local talk comes from (squelch: the device microphone keyed by sound, e.g. the hardware PTT button); null for a remote talker.' }
+        hops: { type: [integer, 'null'], description: 'Relays the talk comes through (0: heard straight from the talker); null for our own talk.' }
     PttBurst:
       type: object
       required: [talker, started_ts_ms, duration_ms, frames, lost_frames, hops, ended]
