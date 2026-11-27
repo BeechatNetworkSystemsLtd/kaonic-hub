@@ -735,8 +735,15 @@ impl Installer {
     fn write_unit(&self, manifest: &Manifest, uid: u32) -> Result<(), Error> {
         crate::manifest::validate(manifest)?;
         let path = self.paths.systemd.join(unit::name(&manifest.id));
-        if path.exists() && !is_ours(&path) {
-            return Err(Error::conflict(format!("{} exists and was not written by the installer", path.display())));
+        if fs::symlink_metadata(&path).is_ok() && !is_ours(&path) {
+            if self.records.get(&manifest.id).is_none() {
+                return Err(Error::conflict(format!("{} exists and was not written by the installer", path.display())));
+            }
+            // An installed plugin's unit without our marker is damaged: set it aside and write it again.
+            let broken = path.with_extension("service.broken");
+            let _ = fs::remove_file(&broken);
+            fs::rename(&path, &broken).or_else(|_| fs::remove_dir_all(&path)).map_err(Error::io("moving a damaged unit aside"))?;
+            log::warn!("installer: {}: the unit was damaged; kept it as {} and wrote it again", manifest.id, broken.display());
         }
         fs::create_dir_all(&self.paths.systemd).map_err(Error::io("making the unit directory"))?;
         crate::write_atomic(&path, unit::render(manifest, uid, &self.paths).as_bytes(), 0o644).map_err(Error::io("writing the unit"))
@@ -1114,5 +1121,26 @@ mod tests {
         bench.installer.control("sample", Action::Start).unwrap();
         bench.installer.restore().unwrap();
         assert!(bench.running());
+    }
+
+    #[test]
+    fn restore_replaces_a_damaged_unit() {
+        let bench = bench();
+        bench.install("1.0.0", "").unwrap();
+        let path = bench.root.join("systemd/kaonic-plugin-sample.service");
+        fs::write(&path, b"\0\0\0\0").unwrap();
+        bench.installer.restore().unwrap();
+        assert!(bench.unit().starts_with(unit::MARKER));
+        assert_eq!(fs::read(path.with_extension("service.broken")).unwrap(), b"\0\0\0\0");
+        assert!(bench.running());
+    }
+
+    #[test]
+    fn a_foreign_unit_still_blocks_a_new_plugin() {
+        let bench = bench();
+        fs::create_dir_all(bench.root.join("systemd")).unwrap();
+        fs::write(bench.root.join("systemd/kaonic-plugin-sample.service"), "[Unit]\n").unwrap();
+        assert!(bench.install("1.0.0", "").is_err());
+        assert_eq!(bench.unit(), "[Unit]\n");
     }
 }
