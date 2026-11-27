@@ -18,6 +18,7 @@ pub mod radio;
 pub mod radio_bands;
 mod radio_test;
 mod remote;
+mod ui;
 pub mod vpn;
 mod wifi;
 
@@ -71,6 +72,7 @@ pub fn router(app: App) -> Router {
         .route("/system/time", get(device::time).put(device::set_time))
         .route("/system/services", get(device::services))
         .route("/system/report", get(report::get))
+        .route("/ui/pages", get(ui::pages).put(ui::set_pages))
         // A/B boot slots and kernel install
         .route("/system/boot", get(boot::get))
         .route("/system/boot/next", put(boot::set_next))

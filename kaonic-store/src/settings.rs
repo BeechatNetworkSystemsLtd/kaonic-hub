@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 const SELECT: &str = include_str!("../sql/settings/select.sql");
 const UPSERT: &str = include_str!("../sql/settings/upsert.sql");
+const DELETE: &str = include_str!("../sql/settings/delete.sql");
 
 pub fn get(connection: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
     connection.query_row(SELECT, params![key], |row| row.get(0)).optional()
@@ -11,6 +12,12 @@ pub fn get(connection: &Connection, key: &str) -> rusqlite::Result<Option<String
 
 pub fn set(connection: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
     connection.execute(UPSERT, params![key, value])?;
+    Ok(())
+}
+
+/// Forgets the key; nothing happens if it was not set.
+pub fn delete(connection: &Connection, key: &str) -> rusqlite::Result<()> {
+    connection.execute(DELETE, params![key])?;
     Ok(())
 }
 

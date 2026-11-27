@@ -614,6 +614,38 @@ paths:
         '202': { $ref: '#/components/responses/JobAccepted' }
         '409': { description: Nothing uploaded, or an install is already running. }
         '422': { $ref: '#/components/responses/Validation' }
+  /ui/pages:
+    get:
+      tags: [system]
+      operationId: getUiPages
+      summary: The pages the web UI's menu shows on this device.
+      x-role: viewer
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shown: { type: [array, 'null'], items: { type: string }, description: Page ids; null until the admin chooses (the UI's defaults). }
+    put:
+      tags: [system]
+      operationId: setUiPages
+      summary: Saves the menu's pages for every browser; null goes back to the UI's defaults.
+      x-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                shown: { type: [array, 'null'], maxItems: 32, items: { type: string, pattern: '^[a-z0-9-]{1,32}$' } }
+      responses:
+        '200': { description: The saved choice, as GET answers. }
+        '422': { $ref: '#/components/responses/Validation' }
   /system/report:
     get:
       tags: [system]
