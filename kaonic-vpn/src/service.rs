@@ -28,6 +28,9 @@ const STREAM_CONTROL: u8 = 2;
 const HELLO_EVERY: Duration = Duration::from_secs(30);
 /// A gateway not heard from for this long is dropped.
 const GATEWAY_STALE: Duration = Duration::from_secs(100);
+/// A client network whose route goes away is kept this long, so a moment without it (networkd
+/// reconfiguring the interface) does not stop DHCP or move the node's subnet.
+const LAN_HOLD: Duration = Duration::from_secs(20);
 /// Max packets read from the TUN device per flush, so they can share link packets.
 const BATCH: usize = 64;
 /// Size of the packet log for the API.
@@ -191,6 +194,8 @@ struct Share {
     lans: Vec<LanNet>,
     /// Mapping attempts per client subnet (bumped on a clash with another node).
     attempts: HashMap<Cidr, u32>,
+    /// Client subnets per interface, with when their connected route was last seen.
+    seen: HashMap<(String, Cidr), Instant>,
     /// Gateways heard, with their destinations and when.
     gateways: HashMap<String, (Vec<Cidr>, Instant)>,
     gateway: GatewayStatus,
@@ -335,6 +340,7 @@ impl Vpn {
             settings: config.share.clone(),
             lans: Vec::new(),
             attempts: HashMap::new(),
+            seen: HashMap::new(),
             gateways: HashMap::new(),
             gateway: GatewayStatus { settings: config.share.gateway.clone(), active: false, egress: None, available_interfaces: Vec::new(), detail: None },
             uplink: UplinkStatus { settings: config.share.uplink.clone(), active: false, peer: None, routes: Vec::new(), detail: None },
@@ -750,40 +756,48 @@ impl Vpn {
         let mut state = self.state.lock().expect("vpn lock");
         let settings = share.settings.clone();
 
-        // Client networks: connected routes on the client interfaces.
+        // Client networks: connected routes on the client interfaces, held for a moment after
+        // they go away.
+        let now = Instant::now();
+        let live: Vec<(String, Cidr)> = routes
+            .iter()
+            .filter(|route| route.connected && route.prefix.prefix_len() > 0 && settings.lan_interfaces.contains(&route.interface))
+            .map(|route| (route.interface.clone(), route.prefix))
+            .collect();
+        let held = held_lans(&mut share.seen, &live, now);
         let mut lans: Vec<LanNet> = Vec::new();
         if settings.share_lans {
             // The node's own pool subnet is served by the hub's DHCP.
             let routed = settings.route_lans && settings.push_routes;
             for interface in &settings.lan_interfaces {
                 let mut own = false;
-                for route in routes.iter().filter(|route| &route.interface == interface && route.connected && route.prefix.prefix_len() > 0) {
+                for prefix in held.iter().filter(|(name, _)| name == interface).map(|(_, prefix)| *prefix) {
                     // Skip subnets the hub added itself.
-                    if routed && settings.mapping_pool.overlaps(&route.prefix) {
+                    if routed && settings.mapping_pool.overlaps(&prefix) {
                         continue;
                     }
                     let mapped = loop {
-                        let attempt = share.attempts.get(&route.prefix).copied().unwrap_or(0);
+                        let attempt = share.attempts.get(&prefix).copied().unwrap_or(0);
                         if !(settings.map_lans || routed) || attempt >= share::MAX_ATTEMPTS {
-                            break route.prefix;
+                            break prefix;
                         }
-                        let mapped = share::mapped_subnet(&self.identity, &route.prefix, &settings.mapping_pool, attempt);
+                        let mapped = share::mapped_subnet(&self.identity, &prefix, &settings.mapping_pool, attempt);
                         // Clash with another node: the higher identity picks again.
                         if state.table.advertisers_overlapping(&mapped).iter().any(|peer| peer.as_str() < self.identity.as_str()) {
-                            share.attempts.insert(route.prefix, attempt + 1);
+                            share.attempts.insert(prefix, attempt + 1);
                             continue;
                         }
                         break mapped;
                     };
                     // The interface's first /24 is replaced by the node's own subnet.
-                    if routed && !own && mapped != route.prefix && mapped.prefix_len() == 24 {
+                    if routed && !own && mapped != prefix && mapped.prefix_len() == 24 {
                         own = true;
-                        lans.push(LanNet { interface: interface.clone(), subnet: mapped, mapped, address: Some(mapped.host(1)), base: Some(route.prefix) });
+                        lans.push(LanNet { interface: interface.clone(), subnet: mapped, mapped, address: Some(mapped.host(1)), base: Some(prefix) });
                         continue;
                     }
-                    let mapped = if settings.map_lans { mapped } else { route.prefix };
-                    let address = addresses.iter().find(|(name, address)| name == interface && route.prefix.contains(*address)).map(|(_, address)| *address);
-                    lans.push(LanNet { interface: interface.clone(), subnet: route.prefix, mapped, address, base: None });
+                    let mapped = if settings.map_lans { mapped } else { prefix };
+                    let address = addresses.iter().find(|(name, address)| name == interface && prefix.contains(*address)).map(|(_, address)| *address);
+                    lans.push(LanNet { interface: interface.clone(), subnet: prefix, mapped, address, base: None });
                 }
             }
         }
@@ -844,7 +858,7 @@ impl Vpn {
         state.table.set_uplink(uplink.as_ref().map(|uplink| (uplink.peer.clone(), uplink.routes.clone())));
 
         // Clash counts of client subnets that are gone.
-        share.attempts.retain(|prefix, _| routes.iter().any(|route| route.prefix == *prefix && route.connected && settings.lan_interfaces.contains(&route.interface)));
+        share.attempts.retain(|prefix, _| held.iter().any(|(_, held)| held == prefix));
 
         let remote_sources: Vec<Cidr> = state.table.installed().into_iter().collect();
         let plan = share::plan(&PlanInput {
@@ -934,6 +948,20 @@ impl Vpn {
     pub fn packets(&self, limit: usize) -> Vec<PacketLog> {
         self.state.lock().expect("vpn lock").log.iter().take(limit).copied().collect()
     }
+}
+
+/// The client subnets to share: the live ones in their kernel order, then any seen within
+/// [`LAN_HOLD`]. Updates `seen`.
+fn held_lans(seen: &mut HashMap<(String, Cidr), Instant>, live: &[(String, Cidr)], now: Instant) -> Vec<(String, Cidr)> {
+    for key in live {
+        seen.insert(key.clone(), now);
+    }
+    seen.retain(|_, at| now.saturating_duration_since(*at) < LAN_HOLD);
+    let mut held: Vec<(String, Cidr)> = live.to_vec();
+    let mut extra: Vec<(String, Cidr)> = seen.keys().filter(|key| !live.contains(key)).cloned().collect();
+    extra.sort();
+    held.extend(extra);
+    held
 }
 
 /// Applies the newest sharing plan on its own thread, since the tools it runs are slow.
@@ -1050,5 +1078,16 @@ mod tests {
         }
         let (remove, add) = route_changes(&set(&["192.168.21.0/24"]), &latest.take(Duration::ZERO).unwrap());
         assert!(remove.is_empty() && add.is_empty());
+    }
+
+    #[test]
+    fn a_client_network_that_blinks_out_is_held_for_a_moment() {
+        let lan = ("br0".to_owned(), "192.168.10.0/24".parse::<Cidr>().unwrap());
+        let mut seen = HashMap::new();
+        let start = Instant::now();
+        assert_eq!(held_lans(&mut seen, std::slice::from_ref(&lan), start), vec![lan.clone()]);
+        assert_eq!(held_lans(&mut seen, &[], start + Duration::from_secs(2)), vec![lan.clone()], "held while networkd reconfigures");
+        assert!(held_lans(&mut seen, &[], start + LAN_HOLD).is_empty(), "gone for good");
+        assert!(seen.is_empty());
     }
 }

@@ -49,6 +49,9 @@ const CHAIN_FWD: &str = "KAONIC_VPN_FWD";
 const UPLINK_METRIC: &str = "50";
 /// Short DHCP leases, so clients pick up new routes within minutes.
 pub const LEASE: &str = "10m";
+/// A node address that is no longer wanted stays this long (longer than [`LEASE`]), so
+/// clients still leased on it can renew, be refused by dnsmasq and lease again.
+const ADDRESS_KEEP: std::time::Duration = std::time::Duration::from_secs(12 * 60);
 /// First DHCP host offset and number of addresses.
 const POOL_OFFSET: u32 = 10;
 const POOL_SIZE: u32 = 100;
@@ -547,6 +550,8 @@ struct Dnsmasq {
     exits: u32,
     /// Not started again before this, after it exited by itself.
     retry_at: Option<std::time::Instant>,
+    /// The old node addresses last written into the networkd drop-in.
+    kept: Vec<(String, Ipv4Addr, u8)>,
 }
 
 impl Dnsmasq {
@@ -566,11 +571,14 @@ impl Dnsmasq {
         log::warn!("vpn: dnsmasq exited ({status}); starting it again in {}s", wait.as_secs());
     }
 
-    fn apply(&mut self, wanted: Option<&Dhcp>, previous: Option<&Dhcp>, all_interfaces: &[String]) -> io::Result<()> {
+    /// `kept`: old node addresses that networkd must keep while they wind down.
+    fn apply(&mut self, wanted: Option<&Dhcp>, previous: Option<&Dhcp>, kept: &[(String, Ipv4Addr, u8)], all_interfaces: &[String]) -> io::Result<()> {
         let now = std::time::Instant::now();
         self.reap(now);
         let backing_off = self.retry_at.is_some_and(|at| now < at);
-        if wanted == previous && (wanted.is_none() || systemd_dnsmasq() || self.child.is_some() || backing_off) {
+        let kept_changed = kept != self.kept.as_slice();
+        self.kept = kept.to_vec();
+        if wanted == previous && !kept_changed && (wanted.is_none() || systemd_dnsmasq() || self.child.is_some() || backing_off) {
             return Ok(());
         }
         std::fs::create_dir_all(RUN_DIR)?;
@@ -587,7 +595,8 @@ impl Dnsmasq {
             let interfaces: Vec<String> = wanted.map(|dhcp| dhcp.nets.iter().map(|net| net.interface.clone()).collect()).unwrap_or_default();
             let mut networkd_changed = Vec::new();
             for interface in all_interfaces {
-                let own: Vec<(Ipv4Addr, u8)> = wanted.iter().flat_map(|dhcp| &dhcp.nets).filter(|net| &net.interface == interface && net.on_link.is_some()).map(|net| (net.address, net.subnet.prefix_len())).collect();
+                let mut own: Vec<(Ipv4Addr, u8)> = wanted.iter().flat_map(|dhcp| &dhcp.nets).filter(|net| &net.interface == interface && net.on_link.is_some()).map(|net| (net.address, net.subnet.prefix_len())).collect();
+                own.extend(kept.iter().filter(|(name, _, _)| name == interface).map(|(_, address, length)| (*address, *length)));
                 if networkd_dropin(interface, interfaces.contains(interface).then_some(own.as_slice()))? {
                     networkd_changed.push(interface.clone());
                 }
@@ -690,17 +699,45 @@ impl Dnsmasq {
 pub struct Applier {
     applied: Plan,
     dnsmasq: Dnsmasq,
+    /// Node addresses no longer wanted, kept until then ([`ADDRESS_KEEP`]).
+    retired: Vec<(String, Ipv4Addr, u8, std::time::Instant)>,
 }
 
 impl Applier {
     /// Between plans: restarts our own dnsmasq if it exited by itself.
+    /// Also lets go of old node addresses once their time is up.
     pub fn tend(&mut self, lan_interfaces: &[String]) -> io::Result<()> {
-        self.dnsmasq.reap(std::time::Instant::now());
-        if self.dnsmasq.child.is_some() || self.dnsmasq.retry_at.is_none() {
+        let now = std::time::Instant::now();
+        self.dnsmasq.reap(now);
+        let before = self.retired.len();
+        self.retired.retain(|(_, _, _, until)| now < *until);
+        let expired = self.retired.len() != before;
+        if expired {
+            let plan = self.applied.clone();
+            self.addresses(&plan, lan_interfaces)?;
+        }
+        if !expired && (self.dnsmasq.child.is_some() || self.dnsmasq.retry_at.is_none()) {
             return Ok(());
         }
         let dhcp = self.applied.dhcp.clone();
-        self.dnsmasq.apply(dhcp.as_ref(), dhcp.as_ref(), lan_interfaces)
+        let kept = self.kept();
+        self.dnsmasq.apply(dhcp.as_ref(), dhcp.as_ref(), &kept, lan_interfaces)
+    }
+
+    fn kept(&self) -> Vec<(String, Ipv4Addr, u8)> {
+        self.retired.iter().map(|(interface, address, length, _)| (interface.clone(), *address, *length)).collect()
+    }
+
+    /// Keeps addresses the last plan had and this one drops; forgets kept ones wanted again.
+    fn retire(&mut self, plan: &Plan, now: std::time::Instant) {
+        for (interface, address, length) in &self.applied.addresses {
+            let wanted = plan.addresses.iter().any(|(name, wanted, _)| name == interface && wanted == address);
+            if !wanted && !self.retired.iter().any(|(name, kept, _, _)| name == interface && kept == address) {
+                log::info!("vpn: keeping {address} on {interface} until clients leased on it have moved");
+                self.retired.push((interface.clone(), *address, *length, now + ADDRESS_KEEP));
+            }
+        }
+        self.retired.retain(|(name, kept, _, _)| !plan.addresses.iter().any(|(interface, address, _)| interface == name && address == kept));
     }
 
     /// Adds the wanted pool addresses on client interfaces and removes other pool addresses.
@@ -712,7 +749,8 @@ impl Applier {
         interfaces.sort();
         interfaces.dedup();
         for (interface, address) in present.iter().filter(|(interface, address)| interfaces.contains(&interface) && pool.contains(*address)) {
-            if !plan.addresses.iter().any(|(wanted_on, wanted, _)| wanted_on == interface && wanted == address) {
+            let kept = self.retired.iter().any(|(name, kept, _, _)| name == interface && kept == address);
+            if !kept && !plan.addresses.iter().any(|(wanted_on, wanted, _)| wanted_on == interface && wanted == address) {
                 // Prefix length unknown: try each.
                 for length in [24u8, 25, 26, 27, 28, 29, 30] {
                     if run(&ip, &args(&["addr", "del", &format!("{address}/{length}"), "dev", interface]))? {
@@ -741,6 +779,7 @@ impl Applier {
         fill_chain(&iptables, "mangle", "FORWARD", CHAIN_MSS, &[], &plan.mss)?;
         fill_chain(&iptables, "filter", "FORWARD", CHAIN_FWD, &[], &plan.forward)?;
 
+        self.retire(plan, std::time::Instant::now());
         self.addresses(plan, lan_interfaces)?;
 
         if self.applied.uplink != plan.uplink {
@@ -755,7 +794,8 @@ impl Applier {
                 }
             }
         }
-        self.dnsmasq.apply(plan.dhcp.as_ref(), self.applied.dhcp.as_ref(), lan_interfaces)?;
+        let kept = self.kept();
+        self.dnsmasq.apply(plan.dhcp.as_ref(), self.applied.dhcp.as_ref(), &kept, lan_interfaces)?;
         self.applied = plan.clone();
         Ok(())
     }
@@ -936,4 +976,20 @@ mod tests {
         dnsmasq.reap(later);
         assert_eq!((dnsmasq.exits, dnsmasq.retry_at), (1, Some(later + DNSMASQ_BACKOFF_FIRST)));
     }
+
+    #[test]
+    fn a_dropped_node_address_is_kept_until_its_leases_have_run_out() {
+        let old = ("br0".to_owned(), Ipv4Addr::new(10, 78, 7, 1), 24u8);
+        let new = ("br0".to_owned(), Ipv4Addr::new(10, 78, 33, 1), 24u8);
+        let mut applier = Applier { applied: Plan { addresses: vec![old.clone()], ..Plan::default() }, ..Applier::default() };
+        let now = std::time::Instant::now();
+        let moved = Plan { addresses: vec![new.clone()], ..Plan::default() };
+        applier.retire(&moved, now);
+        assert_eq!(applier.kept(), vec![old.clone()]);
+        assert!(applier.retired[0].3 >= now + std::time::Duration::from_secs(10 * 60), "outlives a lease");
+        applier.applied = moved;
+        applier.retire(&Plan { addresses: vec![old.clone()], ..Plan::default() }, now);
+        assert_eq!(applier.kept(), vec![new], "the old one is wanted again, the new one winds down");
+    }
 }
+
